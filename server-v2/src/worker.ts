@@ -1,0 +1,587 @@
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { Worker, Job } from 'bullmq';
+import Redis from 'ioredis';
+import { getEnv } from '@/config/env';
+import { getDb } from '@/db';
+import { withWorkspace } from '@/db/rls';
+import { LINKEDIN_DRIVER, EMAIL_DRIVER } from '@/modules/drivers/driver.tokens';
+import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
+import { connectWithNoteFallback } from '@/modules/drivers/connect-with-fallback';
+import {
+  LinkedInDriver,
+  LinkedInActionResult,
+  SKIP_OUTCOMES,
+  ACCOUNT_HALT_OUTCOMES,
+  TERMINAL_FAIL_OUTCOMES,
+} from '@/modules/drivers/linkedin-driver.interface';
+import { EmailDriver } from '@/modules/drivers/email-driver.interface';
+import { SecretsService } from '@/modules/vault/secrets.service';
+import { PacingService } from '@/modules/engine/pacing.service';
+import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
+import { SchedulerService } from '@/modules/engine/scheduler.service';
+import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
+import pino from 'pino';
+
+const logger = pino({ name: 'worker' });
+const nowIso = () => new Date().toISOString();
+const localDate = () => new Date().toLocaleDateString('en-US');
+
+/** Human-readable activity label per LinkedIn action type. */
+const ACTION_LABEL: Record<string, string> = {
+  connect_request: 'Connection request sent',
+  linkedin_message: 'Message sent',
+  inmail: 'InMail sent',
+  follow: 'Followed profile',
+  visit_profile: 'Profile viewed',
+  like_post: 'Post liked',
+  endorse_skill: 'Skill endorsed',
+};
+
+async function bootstrap() {
+  logger.info('Starting ReachPilot background worker fleet...');
+
+  const app = await NestFactory.createApplicationContext(AppModule);
+  const env = getEnv();
+
+  const linkedinDriver = app.get<LinkedInDriver>(LINKEDIN_DRIVER);
+  const emailDriver = app.get<EmailDriver>(EMAIL_DRIVER);
+  const sessions = app.get(LinkedInSessionService);
+  const secrets = app.get(SecretsService);
+  const pacing = app.get(PacingService);
+  const gmailInbox = app.get(GmailInboxService);
+  const scheduler = app.get(SchedulerService);
+  const linkedinSync = app.get(LinkedInSyncService);
+
+  logger.info({ linkedin: env.LINKEDIN_DRIVER, email: env.EMAIL_DRIVER }, 'Drivers selected');
+
+  // Safety visibility: real LinkedIn automation with no proxy means every
+  // account egresses from this machine's IP — a ban risk if you run more than
+  // one account or move off a residential IP. Expandi's core safety layer is a
+  // dedicated geo-IP per account; surface loudly when that's absent.
+  if (env.LINKEDIN_DRIVER === 'playwright' && !env.PROXY_SERVER) {
+    logger.warn(
+      'LINKEDIN_DRIVER=playwright but PROXY_SERVER is empty — real automation will egress from this machine\'s local IP (no dedicated per-account proxy). OK for a single test account; risky for production.',
+    );
+  }
+
+  const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
+
+  /* ---------- shared helpers ---------- */
+
+  const advanceEnrollment = async (
+    db: any,
+    enrollmentId: string | null,
+    stepId: string | null,
+  ) => {
+    if (!enrollmentId || !stepId) return;
+    const step = await db
+      .selectFrom('campaign_steps')
+      .select('next_step_id')
+      .where('id', '=', stepId)
+      .executeTakeFirst();
+    const nextStepId = step?.next_step_id || null;
+    await db
+      .updateTable('enrollments')
+      .set({
+        current_step_id: nextStepId,
+        status: nextStepId ? 'active' : 'finished',
+        finished_at: nextStepId ? null : nowIso(),
+      })
+      .where('id', '=', enrollmentId)
+      .execute();
+  };
+
+  const bumpSendStats = async (
+    db: any,
+    workspaceId: string,
+    linkedinAccountId: string,
+    kind: 'invite' | 'email',
+  ) => {
+    // daily_stats is keyed by linkedin_account_id (uuid) — skip when there's
+    // no LinkedIn account (e.g. an email-only workspace). hourly_stats isn't.
+    if (linkedinAccountId) {
+      await db
+        .insertInto('daily_stats')
+        .values({
+          workspace_id: workspaceId,
+          linkedin_account_id: linkedinAccountId,
+          day: localDate() as any,
+          invites_sent: kind === 'invite' ? 1 : 0,
+          emails_sent: kind === 'email' ? 1 : 0,
+          accepted: 0,
+          replies: 0,
+        })
+        .onConflict((oc: any) =>
+          oc.columns(['workspace_id', 'linkedin_account_id', 'day']).doUpdateSet({
+            invites_sent: (eb: any) =>
+              eb('daily_stats.invites_sent', '+', kind === 'invite' ? 1 : 0),
+            emails_sent: (eb: any) =>
+              eb('daily_stats.emails_sent', '+', kind === 'email' ? 1 : 0),
+          }),
+        )
+        .execute();
+    }
+
+    await db
+      .insertInto('hourly_stats')
+      .values({
+        workspace_id: workspaceId,
+        day: localDate() as any,
+        hour: new Date().getHours(),
+        sends: 1,
+        replies: 0,
+      })
+      .onConflict((oc: any) =>
+        oc.columns(['workspace_id', 'day', 'hour']).doUpdateSet({
+          sends: (eb: any) => eb('hourly_stats.sends', '+', 1),
+        }),
+      )
+      .execute();
+  };
+
+  /** Pause an entire account (checkpoint / limit) and alert the user. */
+  const haltAccount = async (
+    db: any,
+    workspaceId: string,
+    accountId: string | null,
+    outcome: string,
+    leadName: string,
+  ) => {
+    if (accountId) {
+      await db
+        .updateTable('linkedin_accounts')
+        .set({ status: outcome === 'checkpoint' ? 'checkpoint' : 'paused' })
+        .where('id', '=', accountId)
+        .execute();
+    }
+    await db
+      .insertInto('notifications')
+      .values({
+        workspace_id: workspaceId,
+        kind: outcome === 'checkpoint' ? 'account_checkpoint' : 'account_paused',
+        text:
+          outcome === 'checkpoint'
+            ? 'LinkedIn security checkpoint detected — automation paused. Please verify your account.'
+            : 'LinkedIn sending limit reached — account paused until it resets.',
+      })
+      .execute();
+  };
+
+  /* ---------- 1. LinkedIn Actions Worker ---------- */
+
+  const linkedinWorker = new Worker(
+    'linkedin-actions',
+    async (job: Job) => {
+      const { jobId, workspaceId, leadId, payload } = job.data;
+      logger.info({ jobId, leadId }, 'Processing LinkedIn job');
+      const jobRow = await withWorkspace(workspaceId, (db) =>
+        db.selectFrom('jobs').selectAll().where('id', '=', jobId).executeTakeFirst(),
+      );
+      // Skip if gone, canceled, or already sent (idempotent on retry).
+      if (!jobRow || jobRow.status === 'canceled' || jobRow.status === 'sent') {
+        logger.warn({ jobId }, 'Job already canceled/sent or missing');
+        return;
+      }
+
+      const accountId = jobRow.linkedin_account_id || '';
+
+      // Pacing / caps / working hours. If blocked, reschedule and return CLEANLY
+      // — the scheduler tick is the retry path now. Throwing here would burn all
+      // three BullMQ attempts inside the same blocked window and lose the job.
+      const isInvite = jobRow.action === 'connect_request';
+      const paceResult = await pacing.checkPacingAndRegister(accountId, 'linkedin', workspaceId, isInvite);
+      if (!paceResult.allowed) {
+        const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: nextRun }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ next_run_at: nextRun, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.info({ jobId, nextRun }, 'Pacing limit hit — deferred to scheduler');
+        return;
+      }
+
+      // Human jitter (outside any transaction).
+      const jitterMs = pacing.getRandomJitterMs();
+      logger.info({ jobId, jitterMs }, 'Applying jitter before execution');
+      await new Promise((r) => setTimeout(r, jitterMs));
+
+      await withWorkspace(workspaceId, (db) =>
+        db.updateTable('jobs').set({ status: 'running' }).where('id', '=', jobId).execute(),
+      );
+
+      // Build the per-account session (cookie + proxy + fingerprint). Returns
+      // null when the account is unusable (checkpoint/paused/disconnected) — in
+      // that case hold the job for the scheduler rather than failing it, so it
+      // resumes automatically once the account recovers. Don't count the pacing
+      // slot we just registered against a send that never happened.
+      const ctx = await sessions.buildActionContext(accountId, workspaceId);
+      if (accountId && !ctx) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
+        const retryAt = new Date(Date.now() + 3600000).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: 'account_unavailable' }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ next_run_at: retryAt, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.info({ jobId, accountId }, 'Account not sendable — deferred to scheduler');
+        return;
+      }
+
+      // Dispatch to the driver method for THIS action. Previously this was a
+      // binary connect/message branch, so inmail/follow/like/visit/endorse jobs
+      // silently ran as connection requests.
+      const drv = ctx || undefined;
+      const t = payload.target;
+      let res: LinkedInActionResult;
+      try {
+        switch (jobRow.action) {
+          case 'linkedin_message':
+            res = await linkedinDriver.sendMessage(t, payload.message, drv);
+            break;
+          case 'inmail':
+            res = await linkedinDriver.sendInMail(t, payload.subject || '', payload.message, drv);
+            break;
+          case 'follow':
+            res = await linkedinDriver.follow(t, drv);
+            break;
+          case 'visit_profile':
+            res = await linkedinDriver.visitProfile(t, drv);
+            break;
+          case 'like_post':
+            res = await linkedinDriver.likeRecentPost(t, drv);
+            break;
+          case 'endorse_skill':
+            res = await linkedinDriver.endorseSkill(t, drv);
+            break;
+          case 'connect_request':
+            // Connect WITH the note, auto-falling back to a note-less connect when
+            // the account's personalized-note quota is spent (free-tier limit).
+            res = await connectWithNoteFallback(linkedinDriver, t, payload.message, drv, logger);
+            break;
+          default:
+            logger.warn({ jobId, action: jobRow.action }, 'Unknown LinkedIn action — treating as connect');
+            res = await connectWithNoteFallback(linkedinDriver, t, payload.message, drv, logger);
+        }
+      } catch (err: any) {
+        res = { status: 'failed', error: String(err?.message || err) };
+      }
+
+      logger.info({ jobId, outcome: res.status }, 'LinkedIn action outcome');
+
+      /* ----- classify the outcome (each block commits before any throw) ----- */
+
+      // Success — commit "sent" first, then best-effort bookkeeping.
+      if (res.status === 'sent') {
+        await withWorkspace(workspaceId, (db) =>
+          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso() }).where('id', '=', jobId).execute(),
+        );
+        try {
+          await withWorkspace(workspaceId, async (db) => {
+            const isConnect = jobRow.action === 'connect_request';
+            const label = ACTION_LABEL[jobRow.action] || 'Action completed';
+            if (leadId && isConnect) {
+              // Only a connection request moves the lead to "invited".
+              await db.updateTable('leads').set({ status: 'invited', last_activity: 'Invite sent' }).where('id', '=', leadId).execute();
+            } else if (leadId) {
+              await db.updateTable('leads').set({ last_activity: label }).where('id', '=', leadId).execute();
+            }
+            await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+            await db.insertInto('activity').values({ workspace_id: workspaceId, text: `${label} — ${payload.name}`, tone: 'success' }).execute();
+            // Only connection requests consume an "invite" against the caps/stats.
+            if (isConnect) await bumpSendStats(db, workspaceId, accountId, 'invite');
+          });
+        } catch (e: any) {
+          logger.warn({ jobId, err: e.message }, 'Post-send bookkeeping failed (action already done)');
+        }
+        return;
+      }
+
+      // Skip — already connected / pending. Advance without counting as a send.
+      if (SKIP_OUTCOMES.includes(res.status)) {
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso(), last_error: res.status }).where('id', '=', jobId).execute();
+          if (leadId && res.status === 'already_connected') {
+            await db.updateTable('leads').set({ status: 'accepted', last_activity: 'Already connected' }).where('id', '=', leadId).execute();
+          }
+          await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+          await db.insertInto('activity').values({ workspace_id: workspaceId, text: `${payload.name}: ${res.status.replace('_', ' ')} — skipped`, tone: 'muted' }).execute();
+        });
+        return;
+      }
+
+      // Account-level halt — checkpoint or limit. Pause the whole account.
+      if (ACCOUNT_HALT_OUTCOMES.includes(res.status)) {
+        await withWorkspace(workspaceId, async (db) => {
+          await haltAccount(db, workspaceId, accountId, res.status, payload.name);
+          if (res.status === 'limit_reached') {
+            const tomorrow = new Date(Date.now() + 86400000).toISOString();
+            await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: tomorrow, last_error: 'limit_reached' }).where('id', '=', jobId).execute();
+            if (jobRow.enrollment_id) {
+              await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: tomorrow }).where('id', '=', jobRow.enrollment_id).execute();
+            }
+          } else {
+            await db.updateTable('jobs').set({ status: 'failed', last_error: 'checkpoint' }).where('id', '=', jobId).execute();
+            if (jobRow.enrollment_id) {
+              await db.updateTable('enrollments').set({ status: 'paused' }).where('id', '=', jobRow.enrollment_id).execute();
+            }
+          }
+        });
+        // Do NOT throw — avoid a retry storm against a paused account.
+        return;
+      }
+
+      // Terminal per-lead failures — mark failed, no retry. No invite left our
+      // account, so give the pacing slot back.
+      if (TERMINAL_FAIL_OUTCOMES.includes(res.status)) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
+        // Prefer the driver's specific reason (e.g. 'email_required') over the
+        // coarse outcome name, so the UI explains WHY a lead was skipped.
+        const reason = res.error || res.status;
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'failed', last_error: reason }).where('id', '=', jobId).execute();
+          if (leadId && res.status === 'profile_gone') {
+            await db.updateTable('leads').set({ status: 'unqualified', last_activity: 'Profile unavailable' }).where('id', '=', leadId).execute();
+          }
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+          await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} skipped: ${reason.replace(/_/g, ' ')}` }).execute();
+        });
+        return;
+      }
+
+      // Generic transient failure — release the slot (the retry will re-register
+      // it) then mark failed and throw so BullMQ retries with backoff.
+      await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
+      await withWorkspace(workspaceId, async (db) => {
+        await db.updateTable('jobs').set({ status: 'failed', last_error: res.error || 'failed' }).where('id', '=', jobId).execute();
+        if (jobRow.enrollment_id) {
+          await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+        }
+        await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} failed: ${res.error || 'unknown error'}` }).execute();
+      });
+      throw new Error(res.error || 'LinkedIn driver failed');
+    },
+    { connection: connection as any, concurrency: 1 },
+  );
+
+  /* ---------- 2. LinkedIn Login Worker (cookie capture) ---------- */
+
+  const loginWorker = new Worker(
+    'linkedin-login',
+    async (job: Job) => {
+      const { accountId, workspaceId } = job.data;
+      logger.info({ accountId }, 'Processing LinkedIn login');
+
+      const loginCtx = await sessions.buildLoginContext(accountId, workspaceId);
+      if (!loginCtx) {
+        logger.warn({ accountId }, 'No login context (missing credentials)');
+        return;
+      }
+
+      const res = await linkedinDriver.login(loginCtx);
+      logger.info({ accountId, status: res.status }, 'Login outcome');
+
+      if (res.status === 'connected' && res.li_at) {
+        // Store the captured session cookie encrypted; the password stays put but
+        // is no longer needed for actions — the cookie IS the login now.
+        const sessionSecretId = await secrets.encrypt(res.li_at, 'linkedin_session', { workspaceId });
+        await withWorkspace(workspaceId, async (db) => {
+          await db
+            .updateTable('linkedin_accounts')
+            .set({ session_secret_id: sessionSecretId, status: 'warming_up', last_sync_at: nowIso() })
+            .where('id', '=', accountId)
+            .execute();
+          await db.insertInto('activity').values({ workspace_id: workspaceId, text: 'LinkedIn account connected — session secured', tone: 'success' }).execute();
+          await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_connected', text: 'Your LinkedIn account is connected and warming up.' }).execute();
+        });
+        return;
+      }
+
+      if (res.status === 'checkpoint') {
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('linkedin_accounts').set({ status: 'checkpoint' }).where('id', '=', accountId).execute();
+          await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_checkpoint', text: 'LinkedIn asked for extra verification during login. Please complete it to finish connecting.' }).execute();
+        });
+        return;
+      }
+
+      // Failed — bad credentials or unreachable.
+      await withWorkspace(workspaceId, async (db) => {
+        await db.updateTable('linkedin_accounts').set({ status: 'disconnected' }).where('id', '=', accountId).execute();
+        await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_failed', text: `Could not connect LinkedIn: ${res.error || 'login failed'}. Please reconnect.` }).execute();
+      });
+    },
+    { connection: connection as any, concurrency: 2 },
+  );
+
+  /* ---------- 3. Email Actions Worker ---------- */
+
+  const emailWorker = new Worker(
+    'email-send',
+    async (job: Job) => {
+      const { jobId, workspaceId, leadId, payload } = job.data;
+      logger.info({ jobId, leadId }, 'Processing Email job');
+
+      // Each DB block runs under the workspace's RLS context and commits before
+      // any throw (so status writes aren't rolled back on failure).
+      const jobRow = await withWorkspace(workspaceId, (db) =>
+        db.selectFrom('jobs').selectAll().where('id', '=', jobId).executeTakeFirst(),
+      );
+      // Skip if gone, canceled, or already sent (idempotent on retry — never double-send).
+      if (!jobRow || jobRow.status === 'canceled' || jobRow.status === 'sent') return;
+
+      const paceResult = await pacing.checkPacingAndRegister(
+        jobRow.email_account_id || '',
+        'email',
+        workspaceId,
+      );
+      if (!paceResult.allowed) {
+        const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: nextRun }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ next_run_at: nextRun, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.info({ jobId, nextRun }, 'Email pacing limit hit — deferred to scheduler');
+        return;
+      }
+
+      await withWorkspace(workspaceId, (db) =>
+        db.updateTable('jobs').set({ status: 'running' }).where('id', '=', jobId).execute(),
+      );
+
+      let res: { status: 'sent' | 'failed'; externalId?: string; error?: string };
+      try {
+        res = await emailDriver.sendEmail(payload.target, payload.subject, payload.message, {
+          emailAccountId: jobRow.email_account_id || undefined,
+          workspaceId,
+        });
+      } catch (err: any) {
+        res = { status: 'failed', error: String(err?.message || err) };
+      }
+      logger.info({ jobId, outcome: res.status }, 'Email action outcome');
+
+      if (res.status === 'sent') {
+        // Commit "sent" FIRST in its own transaction — so if any ancillary
+        // write below fails, the idempotency guard prevents a re-send on retry.
+        await withWorkspace(workspaceId, (db) =>
+          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso() }).where('id', '=', jobId).execute(),
+        );
+        // Ancillary bookkeeping — best-effort, never causes a re-send.
+        try {
+          await withWorkspace(workspaceId, async (db) => {
+            if (leadId) {
+              await db.updateTable('leads').set({ status: 'invited', last_activity: 'Email sent' }).where('id', '=', leadId).execute();
+            }
+            await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+            await db.insertInto('activity').values({ workspace_id: workspaceId, text: `Email sent to ${payload.name}`, tone: 'success' }).execute();
+            await bumpSendStats(db, workspaceId, jobRow.linkedin_account_id || '', 'email');
+          });
+        } catch (e: any) {
+          logger.warn({ jobId, err: e.message }, 'Post-send bookkeeping failed (email already sent)');
+        }
+        return;
+      }
+
+      // Failed — record and throw so BullMQ retries with backoff.
+      logger.error({ jobId, err: res.error }, 'Email job failed');
+      await withWorkspace(workspaceId, async (db) => {
+        await db.updateTable('jobs').set({ status: 'failed', last_error: res.error || 'failed' }).where('id', '=', jobId).execute();
+        if (jobRow.enrollment_id) {
+          await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+        }
+        await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Email to ${payload.name} failed: ${res.error || 'unknown error'}` }).execute();
+      });
+      throw new Error(res.error || 'Email driver failed');
+    },
+    { connection: connection as any, concurrency: 5 },
+  );
+
+  /* ---------- lifecycle logging ---------- */
+
+  linkedinWorker.on('completed', (job) => logger.info({ jobId: job.id }, 'LinkedIn job completed'));
+  linkedinWorker.on('failed', (job, err) => logger.error({ jobId: job?.id, err: err.message }, 'LinkedIn job failed'));
+  loginWorker.on('completed', (job) => logger.info({ jobId: job.id }, 'Login job completed'));
+  loginWorker.on('failed', (job, err) => logger.error({ jobId: job?.id, err: err.message }, 'Login job failed'));
+  emailWorker.on('completed', (job) => logger.info({ jobId: job.id }, 'Email job completed'));
+  emailWorker.on('failed', (job, err) => logger.error({ jobId: job?.id, err: err.message }, 'Email job failed'));
+
+  /* ---------- 4. Gmail inbox sync (reply detection) ---------- */
+
+  // Poll connected mailboxes for replies → auto-pause sequence + inbox thread.
+  const INBOX_SYNC_MS = 3 * 60 * 1000;
+  const runInboxSync = async () => {
+    try {
+      await gmailInbox.syncAll();
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Gmail inbox sync tick failed');
+    }
+  };
+  if (env.GMAIL_SYNC_ENABLED) {
+    setTimeout(runInboxSync, 30_000); // first pass shortly after boot
+    setInterval(runInboxSync, INBOX_SYNC_MS);
+  } else {
+    logger.warn('Gmail inbox sync DISABLED (GMAIL_SYNC_ENABLED=false) — email replies will not be detected.');
+  }
+
+  /* ---------- 5. Scheduler: drain due `scheduled` jobs into the queues ---------- */
+
+  // This is what makes multi-day sequences actually advance. Every tick it finds
+  // jobs whose `scheduled_for` has passed, gates them (account health +
+  // suppression), and enqueues them. Without it, only day-one sends ever fire.
+  const runSchedulerTick = async () => {
+    try {
+      await scheduler.tick();
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Scheduler tick failed');
+    }
+  };
+  if (env.SCHEDULER_ENABLED) {
+    setTimeout(runSchedulerTick, 5_000); // first drain shortly after boot
+    setInterval(runSchedulerTick, env.SCHEDULER_TICK_MS);
+  } else {
+    logger.warn(
+      'Scheduler DISABLED (SCHEDULER_ENABLED=false) — `scheduled` jobs (multi-day steps, pacing-deferred retries) will NOT advance. Immediate day-0 sends still run.',
+    );
+  }
+
+  /* ---------- 6. LinkedIn sync: acceptance + reply detection (B4) ---------- */
+
+  // The LinkedIn counterpart to the Gmail inbox sync, extracted into
+  // LinkedInSyncService so its apply-logic is independently testable. For every
+  // sendable account it reads recent connections + unread messages via the
+  // driver (read-only), applies invited→accepted / accepted→replied (+ inbox
+  // thread, auto-pause), and withdraws stale pending invites.
+  const runLinkedInSync = async () => {
+    try {
+      await linkedinSync.syncAll();
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'LinkedIn sync tick failed');
+    }
+  };
+  const LINKEDIN_SYNC_MS = 5 * 60 * 1000;
+  if (env.LINKEDIN_SYNC_ENABLED) {
+    setTimeout(runLinkedInSync, 45_000); // first pass a bit after boot
+    setInterval(runLinkedInSync, LINKEDIN_SYNC_MS);
+  } else {
+    logger.warn(
+      'LinkedIn sync DISABLED (LINKEDIN_SYNC_ENABLED=false) — no browser will open on a timer, but accepted invites / replies will NOT be detected and stale invites will NOT be withdrawn.',
+    );
+  }
+
+  logger.info(
+    { schedulerTickMs: env.SCHEDULER_TICK_MS },
+    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync',
+  );
+}
+
+bootstrap().catch((err) => {
+  logger.fatal({ err }, 'Worker fleet bootstrap crashed');
+  process.exit(1);
+});

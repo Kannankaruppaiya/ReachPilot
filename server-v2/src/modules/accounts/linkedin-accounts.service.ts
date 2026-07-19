@@ -1,0 +1,287 @@
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import { Queue } from 'bullmq';
+import Redis from 'ioredis';
+import { withWorkspace } from '@/db/rls';
+import { getEnv } from '@/config/env';
+import { SecretsService } from '@/modules/vault/secrets.service';
+import { ProxiesService } from './proxies.service';
+import { WorkspacesService } from '@/modules/workspaces/workspaces.service';
+import { computeWarmup } from '@/modules/engine/warmup';
+
+let loginQueue: Queue | null = null;
+let loginRedis: Redis | null = null;
+function getLoginQueue(): Queue {
+  if (loginQueue) return loginQueue;
+  if (!loginRedis) loginRedis = new Redis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
+  loginQueue = new Queue('linkedin-login', { connection: loginRedis as any });
+  return loginQueue;
+}
+function getLoginRedis(): Redis {
+  if (!loginRedis) loginRedis = new Redis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
+  return loginRedis;
+}
+
+/** Repeated automated logins are the #1 ban trigger — cool down between attempts. */
+const LOGIN_COOLDOWN_SECONDS = 6 * 3600;
+
+@Injectable()
+export class LinkedinAccountsService {
+  private readonly logger = new Logger(LinkedinAccountsService.name);
+
+  constructor(
+    private readonly secrets: SecretsService,
+    private readonly proxies: ProxiesService,
+    private readonly workspaces: WorkspacesService,
+  ) {}
+
+  /**
+   * Enqueue the one-time login job that logs in through the account's proxy
+   * and captures + stores the li_at session cookie. Runs after credentials
+   * (password + optional 2FA) are in place.
+   */
+  private async enqueueLogin(workspaceId: string): Promise<void> {
+    const account = await withWorkspace(workspaceId, (db) =>
+      db.selectFrom('linkedin_accounts').select(['id', 'session_secret_id']).limit(1).executeTakeFirst(),
+    );
+    if (!account) return;
+
+    // Already logged in → the cookie IS the session; never re-login for it.
+    if (account.session_secret_id) {
+      this.logger.log(`Account ${account.id} already has a session — skipping login`);
+      return;
+    }
+
+    // Login cooldown: SET NX with TTL. If the key already exists, a login was
+    // attempted within the cooldown window — don't hammer LinkedIn again.
+    const cdKey = `login:cooldown:${account.id}`;
+    const fresh = await getLoginRedis()
+      .set(cdKey, String(Date.now()), 'EX', LOGIN_COOLDOWN_SECONDS, 'NX')
+      .catch(() => 'OK'); // Redis down → don't block the connect flow
+    if (fresh === null) {
+      this.logger.warn(`Login cooldown active for ${account.id} — skipping re-login`);
+      return;
+    }
+
+    await getLoginQueue().add(
+      'login',
+      { accountId: account.id, workspaceId },
+      { attempts: 2, backoff: { type: 'exponential', delay: 10000 }, removeOnComplete: true },
+    );
+    this.logger.log(`Enqueued LinkedIn login for account ${account.id}`);
+  }
+
+  async connect(
+    workspaceId: string,
+    userId: string,
+    email: string,
+    password: string,
+    country: string,
+  ): Promise<{ dedicatedIp: string; country: string }> {
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email || '')) {
+      throw new BadRequestException('Enter a valid LinkedIn email address.');
+    }
+    if (!password || password.length < 6) {
+      throw new BadRequestException('LinkedIn password must be at least 6 characters.');
+    }
+    if (!country) {
+      throw new BadRequestException('Select a country for your dedicated IP.');
+    }
+
+    const passwordSecretId = await this.secrets.encrypt(password, 'linkedin_password', {
+      workspaceId,
+    });
+
+    const proxy = await this.proxies.assignProxy(country);
+
+    await withWorkspace(workspaceId, async (db) => {
+      const existing = await db
+        .selectFrom('linkedin_accounts')
+        .select('id')
+        .where('email', '=', email.toLowerCase())
+        .executeTakeFirst();
+
+      if (existing) {
+        await db
+          .updateTable('linkedin_accounts')
+          .set({
+            country,
+            proxy_id: proxy?.id || null,
+            password_secret_id: passwordSecretId,
+            status: 'connecting',
+            connected_at: new Date().toISOString(),
+          })
+          .where('id', '=', existing.id)
+          .execute();
+      } else {
+        await db
+          .insertInto('linkedin_accounts')
+          .values({
+            workspace_id: workspaceId,
+            owner_user_id: userId,
+            email: email.toLowerCase(),
+            country,
+            proxy_id: proxy?.id || null,
+            password_secret_id: passwordSecretId,
+            status: 'warming_up',
+            connected_at: new Date().toISOString(),
+          })
+          .execute();
+      }
+    });
+
+    await this.workspaces.updateOnboardingStep(workspaceId, 2);
+
+    return {
+      dedicatedIp: proxy?.ip || '0.0.0.0',
+      country,
+    };
+  }
+
+  async verifyTwoFa(workspaceId: string, secret: string): Promise<{ status: string }> {
+    const cleaned = (secret || '').replace(/\s/g, '').toUpperCase();
+    if (!/^[A-Z2-7]{16,}$/.test(cleaned)) {
+      throw new BadRequestException(
+        "That doesn't look like a valid authenticator secret (base32, 16+ characters).",
+      );
+    }
+
+    const secretId = await this.secrets.encrypt(cleaned, 'linkedin_totp', { workspaceId });
+
+    await withWorkspace(workspaceId, (db) =>
+      db
+        .updateTable('linkedin_accounts')
+        .set({ twofa: 'verified', totp_secret_id: secretId })
+        .execute(),
+    );
+
+    await this.workspaces.updateOnboardingStep(workspaceId, 3);
+
+    // Credentials + 2FA in place → capture the session cookie.
+    await this.enqueueLogin(workspaceId).catch((e) =>
+      this.logger.error(`Failed to enqueue login: ${e.message}`),
+    );
+
+    return { status: 'verified' };
+  }
+
+  async skipTwoFa(workspaceId: string): Promise<{ status: string }> {
+    await withWorkspace(workspaceId, (db) =>
+      db
+        .updateTable('linkedin_accounts')
+        .set({ twofa: 'skipped' })
+        .execute(),
+    );
+
+    await this.workspaces.updateOnboardingStep(workspaceId, 3);
+
+    // No 2FA, but password is in place → attempt login / cookie capture.
+    await this.enqueueLogin(workspaceId).catch((e) =>
+      this.logger.error(`Failed to enqueue login: ${e.message}`),
+    );
+
+    return { status: 'skipped' };
+  }
+
+  /**
+   * Live account state for the app shell: connection status, whether a session
+   * cookie is actually captured, and the REAL computed warm-up numbers (same
+   * curve the pacing engine enforces). Returns connected:false when no account
+   * exists so the UI can hide the warm-up widget/badge instead of faking data.
+   */
+  async getAccountState(workspaceId: string): Promise<{
+    connected: boolean;
+    loggedIn: boolean;
+    status: string;
+    email: string | null;
+    dailyLimit: number | null;
+    weeklyInviteCap: number | null;
+    warmup: ReturnType<typeof computeWarmup> | null;
+  }> {
+    const acct = await withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('linkedin_accounts')
+        .select([
+          'email',
+          'status',
+          'warmup_daily_limit',
+          'warmup_target',
+          'weekly_invite_cap',
+          'connected_at',
+          'created_at',
+          'session_secret_id',
+        ])
+        .limit(1)
+        .executeTakeFirst(),
+    );
+
+    if (!acct) {
+      return { connected: false, loggedIn: false, status: 'none', email: null, dailyLimit: null, weeklyInviteCap: null, warmup: null };
+    }
+
+    return {
+      connected: true,
+      loggedIn: !!acct.session_secret_id,
+      status: acct.status,
+      email: acct.email,
+      dailyLimit: acct.warmup_daily_limit,
+      weeklyInviteCap: acct.weekly_invite_cap,
+      warmup: computeWarmup(acct.connected_at || acct.created_at, acct.warmup_daily_limit, acct.warmup_target),
+    };
+  }
+
+  /**
+   * The ONE place limits are changed — Settings → LinkedIn limits. Persists the
+   * user's daily ceiling (warmup_daily_limit) and weekly invite cap; the pacing
+   * engine reads these same columns, so what's saved here is what's enforced.
+   */
+  async updateLimits(
+    workspaceId: string,
+    dailyLimit: number,
+    weeklyInviteCap: number,
+  ): Promise<ReturnType<LinkedinAccountsService['getAccountState']>> {
+    const daily = Math.trunc(Number(dailyLimit));
+    const weekly = Math.trunc(Number(weeklyInviteCap));
+    if (!Number.isFinite(daily) || daily < 1 || daily > 100) {
+      throw new BadRequestException('Daily connection requests must be between 1 and 100.');
+    }
+    if (!Number.isFinite(weekly) || weekly < 1 || weekly > 200) {
+      throw new BadRequestException('Weekly invite cap must be between 1 and 200.');
+    }
+
+    const updated = await withWorkspace(workspaceId, (db) =>
+      db
+        .updateTable('linkedin_accounts')
+        .set({ warmup_daily_limit: daily, weekly_invite_cap: weekly })
+        .returning('id')
+        .execute(),
+    );
+    if (updated.length === 0) {
+      throw new BadRequestException('Connect a LinkedIn account before setting limits.');
+    }
+
+    return this.getAccountState(workspaceId);
+  }
+
+  async getForWorkspace(workspaceId: string): Promise<any> {
+    return withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('linkedin_accounts')
+        .leftJoin('proxies', 'proxies.id', 'linkedin_accounts.proxy_id')
+        .select([
+          'linkedin_accounts.email',
+          'linkedin_accounts.country',
+          'linkedin_accounts.twofa',
+          'linkedin_accounts.status',
+          'linkedin_accounts.warmup_daily_limit',
+          'linkedin_accounts.warmup_target',
+          'linkedin_accounts.weekly_invite_cap',
+          'linkedin_accounts.hours_start',
+          'linkedin_accounts.hours_end',
+          'linkedin_accounts.send_weekends',
+          'linkedin_accounts.id',
+          'proxies.ip as proxy_ip',
+        ])
+        .executeTakeFirst(),
+    );
+  }
+}

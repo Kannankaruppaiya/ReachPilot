@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg: #f8fafc;
+  --fg: #020617;
+  --card: #ffffff;
+  --mutedbg: #e8ecf1;
+  --line: #e2e8f0;
+  --sub: #64748b;
+}
+.dark {
+  --bg: #0b1220;
+  --fg: #e2e8f0;
+  --card: #101b2e;
+  --mutedbg: #1e293b;
+  --line: #24334a;
+  --sub: #94a3b8;
+}
+
+@theme inline {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: var(--bg);
+  --color-fg: var(--fg);
+  --color-card: var(--card);
+  --color-mutedbg: var(--mutedbg);
+  --color-line: var(--line);
+  --color-sub: var(--sub);
+  --color-navy: #0f172a;
+  --color-accent: #0369a1;
+  --color-accentsoft: #e0f2fe;
+  --color-success: #16a34a;
+  --color-warn: #d97706;
+  --color-warnsoft: #fef3c7;
+  --color-danger: #dc2626;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+[role="button"] {
+  cursor: pointer;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+*:focus-visible {
+  outline: 2px solid #0369a1;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.toast-in {
+  animation: toast-in 200ms ease-out;
+}

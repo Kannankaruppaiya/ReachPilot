@@ -1,0 +1,17 @@
+# Dependencies & build output
+node_modules
+dist
+
+# Secrets — NEVER commit. Holds MASTER_KEY, Redis password, Google + Gemini keys.
+.env
+.env.*
+!.env.example
+
+# Logs & local Playwright profiles
+*.log
+reachpilot-profiles/
+
+# OS / editor
+.DS_Store
+.idea
+.vscode

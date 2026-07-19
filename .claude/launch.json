@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "reachpilot-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "web"],
+      "port": 5173
+    },
+    {
+      "name": "reachpilot-api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "server-v2", "run", "start:api"],
+      "port": 4000
+    }
+  ]
+}
