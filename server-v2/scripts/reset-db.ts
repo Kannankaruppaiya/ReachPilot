@@ -14,7 +14,7 @@
 import { getDb } from '../src/db';
 import { withWorkspace } from '../src/db/rls';
 
-const KEEP = new Set(['plans', 'proxies', 'migrations_log']);
+const _KEEP = new Set(['plans', 'proxies', 'migrations_log']);
 
 // Tenant tables (FORCE RLS) — deleted per workspace.
 const RLS_TABLES = [

@@ -1,6 +1,6 @@
 // Template rendering helpers. These operate on REAL leads from the API —
 // previously they lived in data.ts and iterated a hardcoded sample list.
-import type { LeadRow } from "./api"
+import type { LeadRow } from "@/types"
 
 /** Fill {{token}} / {{token|fallback}} placeholders from a lead. */
 export function renderTemplate(tpl: string, lead: LeadRow): string {

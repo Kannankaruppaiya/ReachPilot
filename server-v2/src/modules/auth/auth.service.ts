@@ -170,7 +170,6 @@ export class AuthService {
     meta: { userAgent?: string; ip?: string },
   ): Promise<{ accessToken: string; refreshToken: string }> {
     const db = getDb();
-    const env = getEnv();
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
     const session = await db

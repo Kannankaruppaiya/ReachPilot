@@ -4,6 +4,7 @@ import { PlaywrightLinkedInDriver } from './playwright-linkedin.driver';
 import { GmailDriver } from './gmail.driver';
 import { LinkedInSessionService } from './linkedin-session.service';
 import { LinkedInSyncService } from './linkedin-sync.service';
+import { EmailWarmupService } from './email-warmup.service';
 import { LINKEDIN_DRIVER, EMAIL_DRIVER } from './driver.tokens';
 import { getEnv } from '@/config/env';
 import { VaultModule } from '@/modules/vault/vault.module';
@@ -22,6 +23,7 @@ import { IntegrationsModule } from '@/modules/integrations/integrations.module';
     GmailDriver,
     LinkedInSessionService,
     LinkedInSyncService,
+    EmailWarmupService,
     {
       provide: LINKEDIN_DRIVER,
       useFactory: (sim: SimulatorDriver, pw: PlaywrightLinkedInDriver) =>
@@ -40,6 +42,7 @@ import { IntegrationsModule } from '@/modules/integrations/integrations.module';
     EMAIL_DRIVER,
     LinkedInSessionService,
     LinkedInSyncService,
+    EmailWarmupService,
     SimulatorDriver,
     PlaywrightLinkedInDriver,
     GmailDriver,

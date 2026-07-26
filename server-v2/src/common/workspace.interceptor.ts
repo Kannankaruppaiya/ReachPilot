@@ -4,9 +4,8 @@ import {
   ExecutionContext,
   CallHandler,
 } from '@nestjs/common';
-import { Observable, from, switchMap } from 'rxjs';
+import { Observable } from 'rxjs';
 import { JwtPayload } from './auth.guard';
-import { withWorkspace } from '@/db/rls';
 
 /**
  * Interceptor that:

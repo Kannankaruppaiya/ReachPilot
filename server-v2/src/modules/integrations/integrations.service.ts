@@ -1,6 +1,5 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import * as jwt from 'jsonwebtoken';
-import { getDb } from '@/db';
 import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
 import { SecretsService } from '@/modules/vault/secrets.service';
@@ -112,11 +111,16 @@ export class IntegrationsService {
   /** Integrations page data: mailbox connection + generic integrations. */
   async list(workspaceId: string): Promise<any> {
     return withWorkspace(workspaceId, async (db) => {
-      const gmail = await db
+      // All Gmail mailboxes — the email warm-up loop pairs them, so the page
+      // must show and allow connecting more than one. Active rows first.
+      const accounts = await db
         .selectFrom('email_accounts')
         .select(['email', 'provider', 'daily_limit', 'status', 'connected_at', 'spf_status', 'dkim_status', 'dmarc_status'])
         .where('provider', '=', 'gmail')
-        .executeTakeFirst();
+        .orderBy((eb) => eb.case().when('status', '=', 'active').then(0).else(1).end())
+        .orderBy('connected_at', 'desc')
+        .execute();
+      const gmail = accounts[0];
 
       const others = await db
         .selectFrom('integrations')
@@ -133,6 +137,12 @@ export class IntegrationsService {
               connectedAt: gmail.connected_at,
             }
           : { connected: false },
+        gmailAccounts: accounts.map((a) => ({
+          email: a.email,
+          connected: a.status === 'active',
+          status: a.status,
+          connectedAt: a.connected_at,
+        })),
         integrations: others,
       };
     });

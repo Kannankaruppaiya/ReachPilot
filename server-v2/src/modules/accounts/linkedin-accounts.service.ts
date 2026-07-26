@@ -196,6 +196,10 @@ export class LinkedinAccountsService {
     dailyLimit: number | null;
     weeklyInviteCap: number | null;
     warmup: ReturnType<typeof computeWarmup> | null;
+    hoursStart: string | null;
+    hoursEnd: string | null;
+    timezone: string | null;
+    sendWeekends: boolean | null;
   }> {
     const acct = await withWorkspace(workspaceId, (db) =>
       db
@@ -209,13 +213,21 @@ export class LinkedinAccountsService {
           'connected_at',
           'created_at',
           'session_secret_id',
+          'hours_start',
+          'hours_end',
+          'timezone',
+          'send_weekends',
         ])
         .limit(1)
         .executeTakeFirst(),
     );
 
     if (!acct) {
-      return { connected: false, loggedIn: false, status: 'none', email: null, dailyLimit: null, weeklyInviteCap: null, warmup: null };
+      return {
+        connected: false, loggedIn: false, status: 'none', email: null,
+        dailyLimit: null, weeklyInviteCap: null, warmup: null,
+        hoursStart: null, hoursEnd: null, timezone: null, sendWeekends: null,
+      };
     }
 
     return {
@@ -226,6 +238,11 @@ export class LinkedinAccountsService {
       dailyLimit: acct.warmup_daily_limit,
       weeklyInviteCap: acct.weekly_invite_cap,
       warmup: computeWarmup(acct.connected_at || acct.created_at, acct.warmup_daily_limit, acct.warmup_target),
+      // Postgres `time` comes back as "HH:MM:SS" — trim to "HH:MM" for <input type="time">.
+      hoursStart: acct.hours_start ? String(acct.hours_start).slice(0, 5) : '09:00',
+      hoursEnd: acct.hours_end ? String(acct.hours_end).slice(0, 5) : '18:00',
+      timezone: acct.timezone || 'UTC',
+      sendWeekends: !!acct.send_weekends,
     };
   }
 
@@ -238,6 +255,8 @@ export class LinkedinAccountsService {
     workspaceId: string,
     dailyLimit: number,
     weeklyInviteCap: number,
+    warmupTarget?: number,
+    schedule?: { hoursStart?: string; hoursEnd?: string; timezone?: string; sendWeekends?: boolean },
   ): Promise<ReturnType<LinkedinAccountsService['getAccountState']>> {
     const daily = Math.trunc(Number(dailyLimit));
     const weekly = Math.trunc(Number(weeklyInviteCap));
@@ -248,10 +267,61 @@ export class LinkedinAccountsService {
       throw new BadRequestException('Weekly invite cap must be between 1 and 200.');
     }
 
+    // Warm-up target = the daily ceiling the ramp climbs toward. Optional; only
+    // updated when supplied. Kept conservative (real safe limits vary per account).
+    const fields: {
+      warmup_daily_limit: number;
+      weekly_invite_cap: number;
+      warmup_target?: number;
+      hours_start?: string;
+      hours_end?: string;
+      timezone?: string;
+      send_weekends?: boolean;
+    } = {
+      warmup_daily_limit: daily,
+      weekly_invite_cap: weekly,
+    };
+    if (warmupTarget !== undefined && warmupTarget !== null) {
+      const targetVal = Math.trunc(Number(warmupTarget));
+      if (!Number.isFinite(targetVal) || targetVal < 5 || targetVal > 100) {
+        throw new BadRequestException('Warm-up target must be between 5 and 100.');
+      }
+      fields.warmup_target = targetVal;
+    }
+
+    // Working hours / timezone / weekends. All optional; overnight windows
+    // (end before start) are allowed — the pacing engine wraps past midnight.
+    if (schedule) {
+      const timeRe = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (schedule.hoursStart !== undefined) {
+        if (!timeRe.test(schedule.hoursStart)) {
+          throw new BadRequestException('Start time must be in HH:MM (24-hour) format.');
+        }
+        fields.hours_start = schedule.hoursStart;
+      }
+      if (schedule.hoursEnd !== undefined) {
+        if (!timeRe.test(schedule.hoursEnd)) {
+          throw new BadRequestException('End time must be in HH:MM (24-hour) format.');
+        }
+        fields.hours_end = schedule.hoursEnd;
+      }
+      if (schedule.timezone !== undefined) {
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: schedule.timezone });
+        } catch {
+          throw new BadRequestException('Invalid timezone.');
+        }
+        fields.timezone = schedule.timezone;
+      }
+      if (schedule.sendWeekends !== undefined) {
+        fields.send_weekends = !!schedule.sendWeekends;
+      }
+    }
+
     const updated = await withWorkspace(workspaceId, (db) =>
       db
         .updateTable('linkedin_accounts')
-        .set({ warmup_daily_limit: daily, weekly_invite_cap: weekly })
+        .set(fields)
         .returning('id')
         .execute(),
     );

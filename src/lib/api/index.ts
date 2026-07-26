@@ -1,42 +1,45 @@
 // Thin client for the ReachPilot backend. Every call returns parsed JSON or
 // throws an Error whose message is safe to show the user.
 
-export type OnboardingState = {
-  workspace: { name: string; goal: string } | null
-  linkedin: { email: string; country: string; dedicatedIp: string } | null
-  twofa: { status: "not_set" | "verified" | "skipped" }
-  gmail: { email: string; dailyLimit: number } | null
-  warmup: { dailyLimit: number; hoursStart: string; hoursEnd: string; weekends: boolean } | null
-  leadCount: number
-  leadSource: string | null
-  completedStep: number
-  onboardingDone: boolean
-}
+import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY } from "@/constants"
+import type {
+  CampaignRow,
+  ConnectionsData,
+  DailyStat,
+  DashboardData,
+  HourlyStat,
+  IntegrationsState,
+  InboxThread,
+  LeadRow,
+  LinkedInAccountState,
+  Me,
+  NotificationItem,
+  OnboardingState,
+  SendJob,
+  TemplateRow,
+} from "@/types"
 
 // ── Auth tokens (persisted so a refresh keeps you logged in) ──────────
-const ACCESS_KEY = "rp_access"
-const REFRESH_KEY = "rp_refresh"
-
 export const auth = {
-  isAuthed: () => !!localStorage.getItem(ACCESS_KEY),
+  isAuthed: () => !!localStorage.getItem(ACCESS_TOKEN_KEY),
   set(access: string, refresh?: string) {
-    localStorage.setItem(ACCESS_KEY, access)
-    if (refresh) localStorage.setItem(REFRESH_KEY, refresh)
+    localStorage.setItem(ACCESS_TOKEN_KEY, access)
+    if (refresh) localStorage.setItem(REFRESH_TOKEN_KEY, refresh)
   },
   clear() {
-    localStorage.removeItem(ACCESS_KEY)
-    localStorage.removeItem(REFRESH_KEY)
+    localStorage.removeItem(ACCESS_TOKEN_KEY)
+    localStorage.removeItem(REFRESH_TOKEN_KEY)
   },
 }
 
 async function tryRefresh(): Promise<boolean> {
-  const rt = localStorage.getItem(REFRESH_KEY)
-  if (!rt) return false
+  const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
+  if (!refreshToken) return false
   try {
     const res = await fetch("/api/auth/refresh", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refreshToken: rt }),
+      body: JSON.stringify({ refreshToken }),
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.accessToken) return false
@@ -50,7 +53,7 @@ async function tryRefresh(): Promise<boolean> {
 async function req<T>(url: string, body?: unknown, retried = false, method?: string): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers["Content-Type"] = "application/json"
-  const token = localStorage.getItem(ACCESS_KEY)
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY)
   if (token) headers["Authorization"] = `Bearer ${token}`
 
   let res: Response
@@ -65,7 +68,7 @@ async function req<T>(url: string, body?: unknown, retried = false, method?: str
   }
 
   // Access token expired → refresh once and retry.
-  if (res.status === 401 && !retried && localStorage.getItem(REFRESH_KEY)) {
+  if (res.status === 401 && !retried && localStorage.getItem(REFRESH_TOKEN_KEY)) {
     if (await tryRefresh()) return req<T>(url, body, true, method)
     auth.clear()
     throw new Error("Session expired. Please log in again.")
@@ -99,13 +102,13 @@ export const api = {
   },
   me: () => req<Me>("/api/auth/me"),
   logout: async () => {
-    const rt = localStorage.getItem("rp_refresh")
+    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
     auth.clear()
-    if (rt)
+    if (refreshToken)
       await fetch("/api/auth/logout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken: rt }),
+        body: JSON.stringify({ refreshToken }),
       }).catch(() => {})
   },
 
@@ -157,8 +160,15 @@ export const api = {
   linkedinAccount: () => req<LinkedInAccountState>("/api/linkedin"),
   // Settings → LinkedIn limits — the ONE place limits are saved. Returns the
   // refreshed account state so the UI reflects exactly what the engine enforces.
-  saveLinkedinLimits: (dailyLimit: number, weeklyInviteCap: number) =>
-    patch<LinkedInAccountState>("/api/linkedin/limits", { dailyLimit, weeklyInviteCap }),
+  saveLinkedinLimits: (payload: {
+    dailyLimit: number
+    weeklyInviteCap: number
+    warmupTarget?: number
+    hoursStart?: string
+    hoursEnd?: string
+    timezone?: string
+    sendWeekends?: boolean
+  }) => patch<LinkedInAccountState>("/api/linkedin/limits", payload),
   notifications: () => req<NotificationItem[]>("/api/notifications"),
 
   // Real data for the app screens
@@ -182,174 +192,4 @@ export const api = {
   getIntegrations: () => req<IntegrationsState>("/api/integrations"),
   googleConnectUrl: () => req<{ url: string }>("/api/integrations/google/connect"),
   disconnectGoogle: () => req<{ ok: true }>("/api/integrations/google/disconnect", {}),
-}
-
-export type InboxMessage = {
-  from: "me" | "them"
-  channel: "linkedin" | "email"
-  subject?: string
-  text: string
-  time: string
-}
-
-export type InboxThread = {
-  id: string
-  leadId: string
-  channel: "linkedin" | "email"
-  unread: boolean
-  preview?: string
-  time?: string
-  leadName?: string
-  leadFirstName?: string
-  leadTitle?: string
-  leadCompany?: string
-  leadEmail?: string
-  leadLocation?: string
-  leadStatus?: string
-  leadTags?: string[]
-  campaign?: string | null
-  messages: InboxMessage[]
-}
-
-export type Me = {
-  id: string
-  email: string
-  fullName: string
-  workspaceId: string
-  workspaceName: string
-  onboardingDone: boolean
-}
-
-export type LinkedInAccountState = {
-  connected: boolean
-  loggedIn: boolean
-  status: "none" | "connecting" | "warming_up" | "active" | "checkpoint" | "paused" | "disconnected"
-  email: string | null
-  dailyLimit: number | null
-  weeklyInviteCap: number | null
-  warmup: { todayLimit: number; target: number; progressPct: number; daysToFull: number } | null
-}
-
-export type NotificationItem = {
-  id: string
-  kind: string
-  text: string
-  read_at: string | null
-  created_at: string
-}
-
-export type DashboardData = {
-  invitesSent: number
-  emailsSent: number
-  acceptanceRate: number
-  replies: number
-  meetings: number
-  totalLeads: number
-  queuedToday: number
-  scheduled: number
-  sentToday: number
-  account: {
-    status: string
-    loggedIn: boolean
-    warmup: { todayLimit: number; target: number; progressPct: number; daysToFull: number } | null
-    country: string | null
-    dedicatedIp: string | null
-  } | null
-  activity: { id: string; text: string; tone: string; time: string }[]
-}
-
-export type DailyStat = { day: string; invites: number; accepted: number; replies: number }
-
-export type HourlyStat = { day: string; hour: number; sends: number; replies: number }
-
-export type LeadRow = {
-  id: string
-  name: string
-  firstName: string
-  title: string
-  company: string
-  location: string
-  linkedinUrl: string
-  email: string
-  emailVerified: boolean
-  status: string
-  source: string | null
-  tags: string[]
-  lastActivity: string | null
-  createdAt: string
-}
-
-export type CampaignRow = {
-  id: string
-  name: string
-  status: string
-  leads: number
-  sent: number
-  acceptedPct: number
-  repliedPct: number
-  trend: number[]
-}
-
-export type TemplateRow = {
-  id: string
-  name: string
-  channel: string
-  subject?: string
-  body: string
-  used: number
-  acceptPct: number
-}
-
-export type SendJob = {
-  id: string
-  batchId: string
-  kind: string
-  name: string
-  target: string
-  status: "queued" | "scheduled" | "running" | "sent" | "failed" | "canceled"
-  day: number
-  scheduledFor: string
-  sentAt: string | null
-}
-
-export type ConnectionDelivery = "scheduled" | "queued" | "running" | "sent" | "failed" | "canceled"
-export type ConnectionOutcome = "in_queue" | "pending" | "accepted" | "replied" | "failed"
-
-export type ConnectionRow = {
-  id: string
-  batchId: string | null
-  name: string
-  linkedinUrl: string
-  company: string
-  role: string
-  message: string
-  delivery: ConnectionDelivery
-  outcome: ConnectionOutcome
-  leadStatus: string | null
-  lastActivity: string | null
-  sentAt: string | null
-  scheduledFor: string
-  error: string | null
-  createdAt: string
-}
-
-export type ConnectionsData = {
-  summary: {
-    total: number
-    sent: number
-    accepted: number
-    replied: number
-    pending: number
-    inQueue: number
-    failed: number
-    acceptanceRate: number
-  }
-  rows: ConnectionRow[]
-}
-
-export type IntegrationsState = {
-  gmail:
-    | { connected: true; email: string; dailyLimit: number; status: string; connectedAt: string | null }
-    | { connected: false }
-  integrations: { provider: string; active: boolean; created_at: string }[]
 }

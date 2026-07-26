@@ -3,7 +3,6 @@ import { AppModule } from './app.module';
 import { Worker, Job } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
-import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
 import { LINKEDIN_DRIVER, EMAIL_DRIVER } from '@/modules/drivers/driver.tokens';
 import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
@@ -21,9 +20,22 @@ import { PacingService } from '@/modules/engine/pacing.service';
 import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
+import { EmailWarmupService } from '@/modules/drivers/email-warmup.service';
 import pino from 'pino';
 
 const logger = pino({ name: 'worker' });
+
+// Keep the worker alive through transient infra blips (Supabase pooler dropping a
+// connection mid-query → in-flight query rejection / active-client 'error'). Without
+// these, either one exits the process ("Connection terminated unexpectedly" exit 1).
+// Deferred/failed jobs are re-driven by the scheduler, so logging + staying up is correct.
+process.on('unhandledRejection', (reason: any) => {
+  logger.warn(`Unhandled rejection (non-fatal): ${reason?.message || reason}`);
+});
+process.on('uncaughtException', (err: any) => {
+  logger.error(`Uncaught exception (kept alive): ${err?.message || err}`);
+});
+
 const nowIso = () => new Date().toISOString();
 const localDate = () => new Date().toLocaleDateString('en-US');
 
@@ -52,6 +64,7 @@ async function bootstrap() {
   const gmailInbox = app.get(GmailInboxService);
   const scheduler = app.get(SchedulerService);
   const linkedinSync = app.get(LinkedInSyncService);
+  const emailWarmup = app.get(EmailWarmupService);
 
   logger.info({ linkedin: env.LINKEDIN_DRIVER, email: env.EMAIL_DRIVER }, 'Drivers selected');
 
@@ -146,7 +159,7 @@ async function bootstrap() {
     workspaceId: string,
     accountId: string | null,
     outcome: string,
-    leadName: string,
+    _leadName: string,
   ) => {
     if (accountId) {
       await db
@@ -575,9 +588,30 @@ async function bootstrap() {
     );
   }
 
+  /* ---------- 7. Email warm-up loop (deliverability) ---------- */
+
+  // The workspace's own Gmail mailboxes exchange natural mails and engage with
+  // them (read / star / reply / rescue-from-spam) so Gmail learns each sender
+  // gets engagement. API only — opens no browser. Needs ≥2 connected mailboxes.
+  const runEmailWarmup = async () => {
+    try {
+      await emailWarmup.tick();
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Email warm-up tick failed');
+    }
+  };
+  if (env.EMAIL_WARMUP_ENABLED && env.EMAIL_DRIVER === 'gmail') {
+    setTimeout(runEmailWarmup, 60_000); // first pass shortly after boot
+    setInterval(runEmailWarmup, env.EMAIL_WARMUP_TICK_MS);
+  } else {
+    logger.warn(
+      'Email warm-up DISABLED (EMAIL_WARMUP_ENABLED=false or EMAIL_DRIVER!=gmail) — no mailbox reputation building.',
+    );
+  }
+
   logger.info(
     { schedulerTickMs: env.SCHEDULER_TICK_MS },
-    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync',
+    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync, email-warmup',
   );
 }
 

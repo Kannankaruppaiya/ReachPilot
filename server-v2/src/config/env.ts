@@ -77,6 +77,17 @@ const envSchema = z.object({
     .string()
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
+  // Email warm-up loop: the workspace's connected Gmail mailboxes exchange
+  // natural-looking mails and open/read/star/reply on the receiving side —
+  // rescuing any that land in spam — to build sender reputation. Needs ≥2
+  // connected mailboxes and the gmail.modify scope. API only, no browser.
+  EMAIL_WARMUP_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false' && v !== '0')
+    .default('false'),
+  EMAIL_WARMUP_TICK_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
+  // Ceiling for the per-mailbox daily warm-up send budget (ramp: 2 + age/2 days).
+  EMAIL_WARMUP_MAX_PER_DAY: z.coerce.number().int().positive().default(8),
 
   // Residential/mobile proxy for LinkedIn egress (one dedicated IP per account).
   // Either a provider gateway (PROXY_SERVER + creds) or per-account IPs in the DB.

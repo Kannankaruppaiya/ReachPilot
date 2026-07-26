@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react"
 import { BadgeCheck, Download, Loader2, Search, Tag, Users, X } from "lucide-react"
-import { api } from "../api"
-import type { LeadRow } from "../api"
-import { Avatar, Badge, Button, Card, EmptyState, cx, inputCls, useToast } from "../ui"
+import { api } from "@/lib/api"
+import type { LeadRow } from "@/types"
+import { Avatar, Badge, Button, Card, EmptyState } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
 
 export function Leads() {
   const toast = useToast()
@@ -39,10 +42,10 @@ export function Leads() {
           <h1 className="text-2xl font-bold">Leads</h1>
           <p className="text-sm text-sub">Everyone you're reaching out to, in one table.</p>
         </div>
-        <div className="relative">
+        <div className="relative w-full sm:w-auto">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-sub" />
           <input
-            className={cx(inputCls, "w-64 pl-9")}
+            className={cx(inputCls, "w-full pl-9 sm:w-64")}
             placeholder="Search name or company"
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -52,7 +55,7 @@ export function Leads() {
       </div>
 
       {sel.length > 0 && (
-        <Card className="flex items-center gap-3 border-accent bg-accent/5 px-4 py-2.5">
+        <Card className="flex flex-wrap items-center gap-3 border-accent bg-accent/5 px-4 py-2.5">
           <span className="tabular text-sm font-bold">{sel.length} selected</span>
           <Button variant="outline" className="px-3 py-1.5 text-xs" onClick={() => toast(`${sel.length} lead(s) added to campaign`)}>
             <Users size={13} /> Add to campaign
@@ -88,6 +91,7 @@ export function Leads() {
             action={<Button variant="outline" onClick={() => setQ("")}>Clear search</Button>}
           />
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead>
               <tr className="border-b border-line text-xs font-semibold uppercase tracking-wide text-sub">
@@ -141,6 +145,7 @@ export function Leads() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </Card>
 

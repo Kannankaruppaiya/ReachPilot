@@ -10,7 +10,7 @@ export class ConditionEvaluator {
     workspaceId: string,
     leadId: string,
     conditionType: string,
-    params: any,
+    _params: any,
   ): Promise<boolean> {
     const db = getDb();
     const lead = await db

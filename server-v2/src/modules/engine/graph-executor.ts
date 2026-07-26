@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { getDb } from '@/db';
 import { ConditionEvaluator } from './condition-evaluator';
+import { spin } from './spintax';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
@@ -212,6 +213,8 @@ export class GraphExecutor {
       title: lead.title,
       location: lead.location,
     };
-    return tpl.replace(/\{\{(\w+)(?:\|([^}]*))?\}\}/g, (_, key, fb) => map[key] || fb || `{{${key}}}`);
+    // Variables first, then spintax ({Hi|Hey|Hello}) — see spintax.ts.
+    const filled = tpl.replace(/\{\{(\w+)(?:\|([^}]*))?\}\}/g, (_, key, fb) => map[key] || fb || `{{${key}}}`);
+    return spin(filled);
   }
 }

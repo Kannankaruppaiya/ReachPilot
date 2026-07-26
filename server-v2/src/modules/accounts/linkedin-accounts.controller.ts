@@ -20,14 +20,33 @@ export class LinkedinAccountsController {
    */
   @Patch('limits')
   async updateLimits(
-    @Body() body: { dailyLimit?: number; weeklyInviteCap?: number },
+    @Body() body: {
+      dailyLimit?: number;
+      weeklyInviteCap?: number;
+      warmupTarget?: number;
+      hoursStart?: string;
+      hoursEnd?: string;
+      timezone?: string;
+      sendWeekends?: boolean;
+    },
     @Req() req: Request,
   ) {
     const user = (req as any).user as JwtPayload;
     if (body?.dailyLimit == null || body?.weeklyInviteCap == null) {
       throw new BadRequestException('dailyLimit and weeklyInviteCap are required.');
     }
-    return this.linkedin.updateLimits(user.workspaceId, body.dailyLimit, body.weeklyInviteCap);
+    return this.linkedin.updateLimits(
+      user.workspaceId,
+      body.dailyLimit,
+      body.weeklyInviteCap,
+      body.warmupTarget,
+      {
+        hoursStart: body.hoursStart,
+        hoursEnd: body.hoursEnd,
+        timezone: body.timezone,
+        sendWeekends: body.sendWeekends,
+      },
+    );
   }
 
   @Post('connect')

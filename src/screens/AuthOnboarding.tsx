@@ -19,8 +19,11 @@ import {
   UploadCloud,
   AlertTriangle,
 } from "lucide-react"
-import { Button, Card, Field, LinkedinIcon, Modal, cx, inputCls, useToast } from "../ui"
-import { api } from "../api"
+import { Button, Card, Field, LinkedinIcon, Modal } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
+import { api } from "@/lib/api"
 
 function ErrorBanner({ message }: { message: string }) {
   return (

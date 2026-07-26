@@ -20,9 +20,12 @@ import {
   Users,
   X,
 } from "lucide-react"
-import { api, auth } from "./api"
-import type { LinkedInAccountState, Me } from "./api"
-import { Avatar, LinkedinIcon, ToastProvider, cx } from "./ui"
+import { api, auth } from "@/lib/api"
+import type { LinkedInAccountState, Me } from "@/types"
+import { Avatar, LinkedinIcon } from "@/components/ui"
+import { ToastProvider } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { SHELL_POLL_INTERVAL_MS } from "@/constants"
 import { Auth, Onboarding } from "./screens/AuthOnboarding"
 import { Dashboard } from "./screens/Dashboard"
 import { CampaignBuilder, CampaignDetail, CampaignList } from "./screens/Campaigns"
@@ -31,7 +34,7 @@ import { Leads } from "./screens/Leads"
 import { Analytics, Integrations, Sequences, Settings } from "./screens/Misc"
 import { AutoSend } from "./screens/AutoSend"
 import { Connections } from "./screens/Connections"
-import type { CampaignRow as Campaign } from "./api"
+import type { CampaignRow as Campaign } from "@/types"
 
 type NavKey =
   | "dashboard"
@@ -102,7 +105,7 @@ export default function App() {
         .catch(() => {})
     }
     load()
-    const t = setInterval(load, 60_000)
+    const t = setInterval(load, SHELL_POLL_INTERVAL_MS)
     return () => {
       alive = false
       clearInterval(t)

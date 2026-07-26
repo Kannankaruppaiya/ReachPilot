@@ -11,10 +11,13 @@ ReachPilot — an Expandi-style LinkedIn + email outreach automation platform.
 - **Backend (demo, ignore):** `server/index.js` — old Express mock. NOT used anymore.
 
 ## Run it
-- Frontend: `cd Application && npm run web` → :5173
-- API: `cd Application/server-v2 && npm run start:api` → :4000
-- Worker: `cd Application/server-v2 && npm run start:worker` (BullMQ + Playwright + Gmail)
-- Config: `server-v2/.env` (untracked). Redis = Upstash `rediss://`. Postgres local :5432 (user `reachpilot`).
+Run from the project root (`ReachPilot-main`).
+- Frontend: `npm run web` → :5173
+- API: `npm --prefix server-v2 run start:api` → :4000
+- Worker: `npm --prefix server-v2 run start:worker` (BullMQ + Playwright + Gmail)
+- Config: `server-v2/.env` (untracked; template `server-v2/.env.example`).
+  Redis local `:6379` (or Upstash `rediss://`). Postgres = local `:5432` (user
+  `reachpilot`) **or Supabase session pooler** — see `docs/adr/0001`.
 - Kill by port (Windows): `Get-NetTCPConnection -LocalPort 4000 -State Listen).OwningProcess | Stop-Process`.
 - Kill worker: `Get-CimInstance Win32_Process | ? { $_.CommandLine -like '*worker.ts*' } | Stop-Process`.
 
@@ -39,7 +42,7 @@ GUC via `SET LOCAL`). This bit us repeatedly.
 
 ## Auth (real, `AUTH_BYPASS=false`)
 - `src/modules/auth/*` — signup (argon2 + auto-login tokens), login, refresh, `GET /me`.
-- Frontend: `src/api.ts` stores tokens in localStorage, sends `Authorization: Bearer`,
+- Frontend: `src/lib/api/` stores tokens in localStorage, sends `Authorization: Bearer`,
   auto-refreshes on 401. `App.tsx` gates on `api.me()`. `Auth` component in
   `AuthOnboarding.tsx` = real signup/login form (Google paused).
 
@@ -156,6 +159,18 @@ Verified by `scripts/verify-safety.ts`.
 - Deliverability: @gmail.com cold mail → often spam. Real fix = custom domain +
   SPF/DKIM/DMARC + warm-up (infra, not code).
 
+## Frontend structure (Vite + React)
+`src/` uses the `@/` alias: `components/` (UI + Toast), `hooks/`, `lib/api/`
+(client `{ api, auth }`), `lib/utils/` (cx, template), `constants/`, `types/`,
+`screens/`. A file exporting components exports only components (fast-refresh).
+Type-only imports use `import type` (`verbatimModuleSyntax` is on).
+
 ## Docs
+- `docs/LINKEDIN_AUTOMATION_FLOW.md` — the working connect flow + 7 invariants that must
+  not be broken (pacing defer returns not throws, sent-before-ancillary, etc.). Read before
+  touching pacing/scheduler/driver.
+- `AGENTS.md` — vendor-neutral agent guide (portable quick-start).
+- `docs/adr/` — architecture decision records (e.g. 0001 Supabase migration).
+- `server-v2/.env.example` — env template (copy to `.env`).
 - `REACHPILOT_COMPLETE_SYSTEM_GUIDE.md` — full system design.
 - `BACKEND_ARCHITECTURE.md` — backend architecture report.

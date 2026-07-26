@@ -415,6 +415,13 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await think();
 
+      // The /in/<slug> of the INTENDED target — a hard guard on the custom-invite
+      // deep-link below. LinkedIn's "People also viewed" / "More profiles" rails
+      // carry their OWN custom-invite anchors; a page-wide match once grabbed a
+      // rail person's anchor and, across BullMQ retries, fired invites at several
+      // wrong people. We only goto a custom-invite whose vanityName is this slug.
+      const targetSlug = (targetUrl.match(/\/in\/([^/?#]+)/i)?.[1] || '').toLowerCase();
+
       if (resp && resp.status() === 404) return { status: 'profile_gone' };
       if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
 
@@ -431,36 +438,61 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
       await humanScroll(page);
 
-      // Scope everything to the profile's top-card action bar. The page has many
-      // "More"/"Connect" strings elsewhere (posts, "People also viewed", recent
-      // activity); matching page-wide grabs the wrong control and the click hangs
-      // for 30s. The top card is the <main> region's first section.
-      const card = page.locator('main').first();
+      const main = page.locator('main').first();
 
       // WAIT for the primary action bar to render before scanning. The top-card
       // buttons (Message / Connect / Follow / More / Pending) are lazy-loaded a
       // beat after the profile HTML; scanning too early finds nothing and wrongly
-      // reports `no_connect_button` (the exact false-negative seen on some
-      // profiles that DO have a Connect). Wait for ANY primary action to appear.
-      await card
+      // reports `no_connect_button`. Wait for ANY primary action to appear.
+      await main
         .getByRole('button', { name: /^(Connect|Message|Follow|Following|More|More actions|Pending)$/i })
         .first()
         .waitFor({ state: 'visible', timeout: 12000 })
         .catch(() => undefined);
       await sleep(rnd(500, 1200));
 
-      // Private "LinkedIn Member" — name hidden / out of network. Check ONLY the
-      // profile's primary name heading (the h1), NOT anywhere in <main>: the
-      // "People also viewed" / "More profiles" rails routinely contain private
-      // "LinkedIn Member" entries, and matching those would falsely flag a normal,
-      // connectable target as private.
-      const nameHeading = (
-        (await page.locator('main h1').first().innerText().catch(() => '')) || ''
-      ).trim();
-      if (/^LinkedIn Member$/i.test(nameHeading)) return { status: 'no_connect_button' };
+      // TARGET NAME — read from the PAGE TITLE ("<Name> | LinkedIn", optionally
+      // "(N) <Name> | LinkedIn"). This is far more reliable than any DOM selector:
+      // class names are hashed and — observed live on this exact bug — the name is
+      // NOT dependably an <h1> under <main> (main h1 came back empty while the
+      // title correctly held "Beschi Dinesh"). The name is what lets us pick the
+      // target's own Connect out of the several "Invite <someone> to connect"
+      // buttons the "People also viewed" rails also render.
+      const pageTitle = (await page.title().catch(() => '')) || '';
+      let nameHeading = pageTitle
+        .replace(/^\(\d+\+?\)\s*/, '') // strip "(3) " unread-count prefix
+        .replace(/\s*\|.*$/, '') // strip " | LinkedIn" suffix
+        .trim();
+      // Fallback: first non-empty <h1> ANYWHERE on the page (not just <main>).
+      if (!nameHeading) {
+        const h1s = (await page.locator('h1').allTextContents().catch(() => []))
+          .map((t) => t.replace(/\s+/g, ' ').trim())
+          .filter(Boolean);
+        nameHeading = h1s[0] || '';
+      }
+      // No readable name ⇒ not a rendered profile (redirect / partial load / private
+      // "LinkedIn Member"). ABORT — NEVER fall back to a page-wide Connect match,
+      // which is what once invited rail people. Log the landed URL/title so a real
+      // DOM change is diagnosable without a live probe.
+      if (!nameHeading || /^linkedin( member)?$/i.test(nameHeading)) {
+        const landedUrl = page.url();
+        const redirected = !/\/in\//i.test(landedUrl);
+        this.logger.warn(
+          { requested: targetUrl, landedUrl, title: pageTitle, redirected, nameHeading },
+          'Target name unreadable — aborting, no page-wide Connect fallback',
+        );
+        return {
+          status: 'no_connect_button',
+          error: redirected ? 'redirected_off_profile' : 'profile_not_loaded',
+        };
+      }
 
-      // The Connect control's accessible-name pattern now lives in the selector
-      // registry (CONNECT_NAME), alongside the full connect/more/menu cascades.
+      // Precise, name-constrained matchers. LinkedIn labels each Connect control
+      // "Invite <Full Name> to connect"; only the target's carries THIS name, so
+      // matching by it can never resolve a rail person's control.
+      const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const nameRe = escapeRe(nameHeading).replace(/\s+/g, '\\s+');
+      const targetConnectRe = new RegExp(`^invite\\s+${nameRe}\\s+to connect$`, 'i');
 
       // Enumerate a container's buttons (text + aria-label) for diagnostics.
       const scanButtons = async (root: Locator, limit = 40) => {
@@ -475,35 +507,78 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
         return out;
       };
-      const hasMessageBtn = async () =>
-        (await card.getByRole('button', { name: /^Message$/i }).count()) > 0 ||
-        (await page.getByRole('button', { name: /^Message$/i }).count()) > 0;
 
-      // Scope for the selector registry: profile top card first, page-wide fallback.
+      // TOP CARD, anchored on the node that renders the target's NAME TEXT (not
+      // assuming an <h1>) — the nearest ancestor of that text which also holds a
+      // primary action button. Rails are siblings, so this excludes them. Used to
+      // scope the Message/Pending/More lookups. If it can't be found we still have
+      // the name-constrained Connect matcher below, so we fall back to `main`.
+      const nameNode = page.getByText(nameHeading, { exact: true }).first();
+      const topCard = nameNode.locator(
+        'xpath=ancestor::*[.//button[contains(@aria-label," to connect") or ' +
+          'normalize-space(.)="Message" or normalize-space(.)="More" or normalize-space(.)="More actions"]][1]',
+      );
+      const card: Locator = (await topCard.count().catch(() => 0)) > 0 ? topCard : main;
+
+      // Message button in the target's card ⇒ already connected.
+      const hasMessageBtn = async () =>
+        (await card.getByRole('button', { name: /^Message$/i }).count().catch(() => 0)) > 0;
+
       const scope: SelectorScope = { page, card };
 
-      // Pending invite already out? (button reads "Pending")
-      if (await resolveFirst(scope, SELECTORS.pendingButton, 'pendingButton', this.logger)) {
+      // Pending invite already out? (Pending button in the target's card.)
+      if ((await card.getByRole('button', { name: /^Pending$/i }).count().catch(() => 0)) > 0) {
         return { status: 'pending' };
       }
 
-      // Resolve the Connect control. Profiles vary a lot: Connect may be a direct
-      // top-card button, hidden behind the "More" overflow, or replaced entirely
-      // by Follow/Message. The ordered cascade (top card → page-wide → aria) lives
-      // in the selector registry; resolveFirst logs which tier won (drift signal).
-      //
-      // HYDRATION RACE: the top card renders progressively — Follow/More paint a
-      // beat BEFORE Connect/Message hydrate. The "any action button" wait above
-      // returns as soon as Follow shows up, so scanning immediately would wrongly
-      // route a direct-Connect profile down the More-menu path (seen live: the
-      // scan logged Follow+More only, while the finished page showed a plain
-      // Connect button). Give the direct Connect a short explicit window first.
-      await card
-        .getByRole('button', { name: CONNECT_NAME })
-        .first()
-        .waitFor({ state: 'visible', timeout: 6000 })
+      // Defence-in-depth backstop: a resolved control must name THIS person.
+      const norm = (s: string) =>
+        s.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+      const namesTarget = async (loc: Locator): Promise<boolean> => {
+        const lbl = (await loc.getAttribute('aria-label').catch(() => '')) || '';
+        const who = lbl.match(/invite\s+(.+?)\s+to connect/i)?.[1] || '';
+        if (!who) return true; // no name on the control to disprove
+        const a = norm(who);
+        const b = norm(nameHeading);
+        return !!a && !!b && (a === b || b.includes(a) || a.includes(b));
+      };
+
+      // DIRECT Connect = the control whose aria-label names THIS target. It may be
+      // a <button> OR an <a href="/preload/custom-invite/?vanityName=<slug>">
+      // ANCHOR (role=link) — the profile top card renders Connect as an anchor,
+      // while the "People also viewed" rails render <button>s. Searching buttons
+      // ONLY was the bug: it missed the anchor top-card Connect and matched a rail
+      // button instead. Match either role, name-constrained so only THIS target's
+      // control resolves — never a rail person's.
+      const directConnect = () =>
+        page
+          .getByRole('button', { name: targetConnectRe })
+          .or(page.getByRole('link', { name: targetConnectRe }))
+          .first();
+      await directConnect()
+        .waitFor({ state: 'visible', timeout: 8000 })
         .catch(() => undefined);
-      let connect = await resolveFirst(scope, SELECTORS.connectButton, 'connectButton', this.logger);
+
+      let connect: Locator | null =
+        (await directConnect().count().catch(() => 0)) > 0 ? directConnect() : null;
+
+      // DIAGNOSTIC: when the name-scoped matcher misses, dump every connect-ish
+      // button on the page with its EXACT text + aria-label, so we learn precisely
+      // how THIS profile's own Connect is labelled (vs the rail buttons) — and can
+      // match it with certainty instead of guessing. Read-only, no click.
+      if (!connect) {
+        const bs = page.getByRole('button', { name: /connect/i });
+        const n = Math.min(await bs.count().catch(() => 0), 12);
+        const dump: { text: string; label: string }[] = [];
+        for (let i = 0; i < n; i++) {
+          const b = bs.nth(i);
+          dump.push({
+            text: ((await b.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim(),
+            label: ((await b.getAttribute('aria-label').catch(() => '')) || '').trim(),
+          });
+        }
+        this.logger.log({ nameHeading, connectButtons: dump }, 'Connect-candidate buttons (diagnostic)');
+      }
       // Track whether Connect lives inside the "More" dropdown: a dropdown item
       // is position-anchored, so a PAGE scroll or a force-click-by-coordinate
       // closes/misses it. Menu items need a scroll-free, event-based click.
@@ -533,6 +608,9 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
                 .then(() => true)
                 .catch(() => false)
             : false;
+          // Anchor menu-item resolution to THIS open dropdown, never page-wide —
+          // the rails' Connect anchors live outside it and must not be matchable.
+          if (menuOpened && dropdown) scope.menu = dropdown.filter({ visible: true }).first();
           if (!menuOpened) await sleep(rnd(500, 1000));
         }
         await sleep(rnd(600, 1300));
@@ -551,10 +629,11 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
             : '';
           this.logger.log({ topBtns, menuOpened, menuText }, 'Connect not found after More (connect-step)');
           // Close the dropdown and re-check the top card once — some layouts
-          // only hydrate the direct Connect button late.
+          // only hydrate the direct Connect button late. Name-scoped so the
+          // recheck can't grab a rail control either.
           await page.keyboard.press('Escape').catch(() => undefined);
           await sleep(rnd(500, 1000));
-          connect = await resolveFirst(scope, SELECTORS.connectButton, 'connectButton(recheck)', this.logger);
+          connect = (await directConnect().count().catch(() => 0)) > 0 ? directConnect() : null;
           if (!connect) {
             if (await hasMessageBtn()) return { status: 'already_connected' };
             const followOnly =
@@ -581,6 +660,18 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         this.logger.log({ connectEl: info, viaMenu }, 'Resolved Connect control');
       } catch {
         /* diagnostics only */
+      }
+
+      // 🔴 FINAL TARGET-IDENTITY GUARD (covers the menu path too). Whatever we
+      // resolved — direct or via the More menu — must name THIS profile's person.
+      // A mismatch means a rail/related control slipped through: abort, no click.
+      // This is the hard backstop for the "one job → several wrong invites" bug.
+      if (!(await namesTarget(connect))) {
+        this.logger.warn(
+          { profileName: nameHeading, viaMenu },
+          'Resolved Connect control names a DIFFERENT person than the profile — aborting invite',
+        );
+        return { status: 'no_connect_button', error: 'connect_target_mismatch' };
       }
 
       // What "the invite opened" looks like — REAL signals only: the send-invite
@@ -610,20 +701,35 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // straight to that href deterministically renders the invite composer
       // (verified: send-invite-modal + "Add a note" both appear). So when Connect
       // is an anchor with that href, GOTO it instead of clicking.
+      // The Connect control — whether the top-card DIRECT anchor or the "More"
+      // menu item — is an <a href="/preload/custom-invite/?vanityName=<slug>">.
+      // Clicking it relies on LinkedIn's SPA router intercepting the anchor, which
+      // is flaky under automation (full navigation that reloads before the
+      // composer renders, or the router click never firing). Navigating straight
+      // to that href deterministically renders the invite composer. So for ANY
+      // custom-invite anchor (direct or menu), GOTO it — after confirming its
+      // vanityName is THIS target, never a rail person's.
       let opened = false;
-      if (viaMenu) {
+      {
         const href = await connect!
           .evaluate((el) => (el.tagName === 'A' ? (el as HTMLAnchorElement).getAttribute('href') : null))
           .catch(() => null);
-        if (href && /custom-invite|\/in\//.test(href)) {
+        const vanity = href ? (href.match(/vanityName=([^&]+)/i)?.[1] || '').toLowerCase() : '';
+        const slugMatches = !!targetSlug && (!vanity || vanity === targetSlug);
+        if (href && /custom-invite/.test(href) && slugMatches) {
           const abs = href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
-          this.logger.log({ abs }, 'Opening invite composer via Connect deep-link');
+          this.logger.log({ abs, viaMenu }, 'Opening invite composer via Connect deep-link');
           await page.goto(abs, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
           await sleep(rnd(1500, 2600));
           if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
           // The composer usually renders straight from the deep-link; if so, skip
           // the click strategies entirely.
           opened = await invitedUi();
+        } else if (href && vanity && targetSlug && vanity !== targetSlug) {
+          // Anchor points at a DIFFERENT person — do not send. Fail cleanly so the
+          // job never invites a rail profile (root cause of past wrong invites).
+          this.logger.warn({ vanity, targetSlug }, 'Connect resolved a non-target profile — aborting invite');
+          return { status: 'no_connect_button', error: 'connect_target_mismatch' };
         }
       }
 

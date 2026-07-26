@@ -10,9 +10,9 @@ import {
   YAxis,
 } from "recharts"
 import { CalendarClock, Loader2, Send, ThumbsUp, MessageSquare } from "lucide-react"
-import { api } from "../api"
-import type { DashboardData, DailyStat } from "../api"
-import { Card, ProgressRing, StatCard } from "../ui"
+import { api } from "@/lib/api"
+import type { DashboardData, DailyStat } from "@/types"
+import { Card, ProgressRing, StatCard } from "@/components/ui"
 
 /** "Jul 17" from whatever date string the backend hands back (ISO or raw JS date). */
 function fmtDay(value: string): string {

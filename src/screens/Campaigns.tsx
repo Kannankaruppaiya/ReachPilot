@@ -17,10 +17,13 @@ import {
   UserPlus,
 } from "lucide-react"
 import { Line, LineChart, ResponsiveContainer } from "recharts"
-import { longestRender, renderTemplate } from "../template"
-import { api } from "../api"
-import type { CampaignRow, LeadRow, LinkedInAccountState, TemplateRow } from "../api"
-import { Avatar, Badge, Button, Card, Dot, EmptyState, Field, LinkedinIcon, cx, inputCls, useToast } from "../ui"
+import { longestRender, renderTemplate } from "@/lib/utils/template"
+import { api } from "@/lib/api"
+import type { CampaignRow, LeadRow, LinkedInAccountState, TemplateRow } from "@/types"
+import { Avatar, Badge, Button, Card, Dot, EmptyState, Field, LinkedinIcon } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
 
 type Campaign = CampaignRow
 
@@ -86,6 +89,7 @@ export function CampaignList({
             action={<Button onClick={onNew}><Plus size={16} /> New campaign</Button>}
           />
         ) : (
+        <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead>
             <tr className="border-b border-line text-xs font-semibold uppercase tracking-wide text-sub">
@@ -145,6 +149,7 @@ export function CampaignList({
             ))}
           </tbody>
         </table>
+        </div>
         )}
       </Card>
     </div>
@@ -444,7 +449,9 @@ export function CampaignBuilder({ onDone }: { onDone: () => void }) {
                         </p>
                         <p className="mt-1 text-xs text-sub">
                           Fallbacks: <code className="rounded bg-mutedbg px-1">{"{{firstName|there}}"}</code> is
-                          used when a lead is missing a first name.
+                          used when a lead is missing a first name. Variation:{" "}
+                          <code className="rounded bg-mutedbg px-1">{"{Hi|Hey|Hello}"}</code> picks one option
+                          per recipient.
                         </p>
                       </div>
                     </div>

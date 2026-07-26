@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react"
 import { Inbox as InboxIcon, Mail, Send, Loader2 } from "lucide-react"
-import { api, type InboxThread } from "../api"
-import { Avatar, Badge, Button, Card, EmptyState, LinkedinIcon, cx, inputCls, useToast } from "../ui"
+import { api } from "@/lib/api"
+import type { InboxThread } from "@/types"
+import { Avatar, Badge, Button, Card, EmptyState, LinkedinIcon } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
 
 export function Inbox() {
   const toast = useToast()

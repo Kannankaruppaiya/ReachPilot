@@ -15,9 +15,12 @@ import {
   Users,
   XCircle,
 } from "lucide-react"
-import { api } from "../api"
-import type { ConnectionRow, ConnectionsData, ConnectionOutcome, ConnectionDelivery } from "../api"
-import { Badge, Button, Card, StatCard, cx, inputCls, useToast } from "../ui"
+import { api } from "@/lib/api"
+import type { ConnectionRow, ConnectionsData, ConnectionOutcome, ConnectionDelivery } from "@/types"
+import { Badge, Button, Card, StatCard } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
 
 const REFRESH_MS = 20_000
 const PAGE_SIZES = [10, 25, 50, 100]
@@ -36,6 +39,11 @@ function timeAgo(iso: string | null): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" })
 }
 
+// ── Outcome column temporarily disabled ───────────────────────────────
+// LinkedIn sync is OFF (LINKEDIN_SYNC_ENABLED=false), so acceptance/reply
+// detection never runs — every sent invite would show a misleading "Awaiting".
+// Re-enable outcomeMeta + the <th>/<td>/`om` below when sync is turned back on.
+/*
 const outcomeMeta: Record<ConnectionOutcome, { tone: string; label: string; icon: React.ReactNode }> = {
   accepted: { tone: "success", label: "Accepted", icon: <UserCheck size={12} /> },
   replied: { tone: "accent", label: "Replied", icon: <MessageSquare size={12} /> },
@@ -43,6 +51,7 @@ const outcomeMeta: Record<ConnectionOutcome, { tone: string; label: string; icon
   in_queue: { tone: "sub", label: "In queue", icon: <Clock size={12} /> },
   failed: { tone: "danger", label: "Failed", icon: <XCircle size={12} /> },
 }
+*/
 
 const deliveryMeta: Record<ConnectionDelivery, { tone: string; label: string }> = {
   sent: { tone: "success", label: "Sent" },
@@ -277,7 +286,8 @@ export function Connections() {
                   <th className="px-4 py-3">Person</th>
                   <th className="px-4 py-3">Company</th>
                   <th className="px-4 py-3">Delivery</th>
-                  <th className="px-4 py-3">Outcome</th>
+                  {/* Outcome column disabled — LinkedIn sync off (see outcomeMeta) */}
+                  {/* <th className="px-4 py-3">Outcome</th> */}
                   <th className="px-4 py-3">Sent</th>
                   <th className="px-4 py-3">Profile</th>
                   <th className="px-4 py-3 text-right">Actions</th>
@@ -340,7 +350,7 @@ export function Connections() {
 }
 
 function ConnectionRowView({ r, onDelete }: { r: ConnectionRow; onDelete: () => void }) {
-  const om = outcomeMeta[r.outcome]
+  // const om = outcomeMeta[r.outcome]  // outcome column disabled (sync off)
   const dm = deliveryMeta[r.delivery]
   return (
     <tr className="border-b border-line last:border-0 hover:bg-mutedbg/40">
@@ -361,6 +371,7 @@ function ConnectionRowView({ r, onDelete }: { r: ConnectionRow; onDelete: () => 
       <td className="px-4 py-3">
         <Badge tone={dm.tone}>{dm.label}</Badge>
       </td>
+      {/* Outcome cell disabled — LinkedIn sync off (re-enable with outcomeMeta/om above)
       <td className="px-4 py-3">
         <div className="flex items-center gap-1.5">
           <Badge tone={om.tone}>
@@ -373,6 +384,7 @@ function ConnectionRowView({ r, onDelete }: { r: ConnectionRow; onDelete: () => 
           )}
         </div>
       </td>
+      */}
       <td className="px-4 py-3 whitespace-nowrap text-sub">{timeAgo(r.sentAt)}</td>
       <td className="px-4 py-3">
         {r.linkedinUrl ? (

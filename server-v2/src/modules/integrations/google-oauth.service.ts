@@ -2,10 +2,16 @@ import { Injectable, Logger } from '@nestjs/common';
 import { OAuth2Client } from 'google-auth-library';
 import { getEnv } from '@/config/env';
 
-/** Gmail scopes: send email, read replies (inbox sync), and read the address. */
+/**
+ * Gmail scopes: send email, read replies (inbox sync), read the address, and
+ * modify labels — the warm-up loop marks warm-up mail read/starred and moves
+ * it out of spam, which needs gmail.modify. Mailboxes connected BEFORE this
+ * scope was added must be re-connected once to grant it.
+ */
 export const GMAIL_SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.modify',
   'https://www.googleapis.com/auth/userinfo.email',
 ];
 

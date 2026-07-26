@@ -1,10 +1,7 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
 import { X } from "lucide-react"
-
-export function cx(...parts: (string | false | undefined)[]) {
-  return parts.filter(Boolean).join(" ")
-}
+import { cx } from "@/lib/utils/cx"
+import { useCountUp } from "@/hooks/useCountUp"
 
 export function LinkedinIcon({ size = 16, className }: { size?: number; className?: string }) {
   return (
@@ -81,24 +78,6 @@ export function Button({
       {...props}
     />
   )
-}
-
-export function useCountUp(target: number, duration = 800) {
-  const [value, setValue] = useState(0)
-  const ref = useRef<number | null>(null)
-  useEffect(() => {
-    const start = performance.now()
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - start) / duration)
-      setValue(Math.round(target * (1 - Math.pow(1 - p, 3))))
-      if (p < 1) ref.current = requestAnimationFrame(tick)
-    }
-    ref.current = requestAnimationFrame(tick)
-    return () => {
-      if (ref.current) cancelAnimationFrame(ref.current)
-    }
-  }, [target, duration])
-  return value
 }
 
 export function StatCard({
@@ -213,34 +192,6 @@ export function Modal({
   )
 }
 
-type Toast = { id: number; text: string }
-const ToastContext = createContext<(text: string) => void>(() => {})
-export const useToast = () => useContext(ToastContext)
-
-export function ToastProvider({ children }: { children: ReactNode }) {
-  const [toasts, setToasts] = useState<Toast[]>([])
-  const push = (text: string) => {
-    const id = Date.now()
-    setToasts((t) => [...t, { id, text }])
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000)
-  }
-  return (
-    <ToastContext.Provider value={push}>
-      {children}
-      <div aria-live="polite" className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2">
-        {toasts.map((t) => (
-          <div
-            key={t.id}
-            className="toast-in flex items-center gap-3 rounded-lg bg-navy px-4 py-3 text-sm font-medium text-white shadow-lg dark:bg-accent"
-          >
-            {t.text}
-          </div>
-        ))}
-      </div>
-    </ToastContext.Provider>
-  )
-}
-
 export function EmptyState({ icon, title, hint, action }: { icon: ReactNode; title: string; hint: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 p-10 text-center">
@@ -269,6 +220,3 @@ export function Field({
     </label>
   )
 }
-
-export const inputCls =
-  "w-full rounded-md border border-line bg-card px-3 py-2.5 text-sm placeholder:text-sub focus:border-accent"

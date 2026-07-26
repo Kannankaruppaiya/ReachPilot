@@ -1,0 +1,22 @@
+---
+description: ReachPilot frontend conventions (React 19 + Vite + Tailwind)
+globs: src/**/*.ts,src/**/*.tsx
+alwaysApply: false
+---
+
+# Frontend rules (`src/`)
+
+- **Imports use the `@/` alias** → `src/*`. Prefer `@/lib/api`, `@/types`,
+  `@/components/ui`, `@/hooks`, `@/constants` over relative paths.
+- **Type-only imports use `import type { … }`** (`verbatimModuleSyntax` is on) —
+  a plain import of a type is a build error.
+- **A file that exports components exports ONLY components** (React fast-refresh).
+  Put hooks in `hooks/`, helpers in `lib/utils/`, constants in `constants/`.
+- **No magic numbers** — name them in `@/constants` (e.g. `SHELL_POLL_INTERVAL_MS`).
+- **API calls go through `@/lib/api`** (`{ api, auth }`); never `fetch('/api/...')`
+  directly in a screen. Types live in `@/types`.
+- **Responsive is required.** Wide tables → wrap in `overflow-x-auto`; inputs →
+  `w-full sm:w-<n>`; button rows → `flex-wrap`; grids scale with `sm:/md:/lg:/xl:`.
+  No screen may cause horizontal page overflow at 375px.
+- **Immutability** — spread to update state/arrays; use functional `setState(prev => …)`.
+- Verify UI changes in the browser preview before claiming done.

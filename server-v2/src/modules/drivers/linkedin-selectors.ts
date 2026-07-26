@@ -36,6 +36,11 @@ export interface SelectorScope {
   page: Page;
   card?: Locator;
   modal?: Locator;
+  /** The opened overflow ("More") dropdown. Connect-menu items MUST resolve from
+   *  inside this, never page-wide: the "People also viewed" / "More profiles"
+   *  rails carry their own Connect anchors, and a page-wide match sent invites to
+   *  the wrong (rail) person. */
+  menu?: Locator;
 }
 
 export type Candidate = (s: SelectorScope) => Locator;
@@ -52,6 +57,10 @@ export const CONNECT_NAME = /invite .* to connect|^connect$/i;
 // candidate can anchor against either; the union keeps the fallback-to-page ergonomic.
 const scoped = (s: SelectorScope): Page | Locator => s.card ?? s.page;
 const modalScoped = (s: SelectorScope): Page | Locator => s.modal ?? s.page;
+// Menu items resolve ONLY from inside the open dropdown when we have it. Falling
+// back to the whole page is what let a rail profile's Connect anchor win — so
+// there is deliberately NO page fallback here.
+const menuScoped = (s: SelectorScope): Page | Locator => s.menu ?? s.page;
 
 /**
  * The registry. Each key is an ordered candidate cascade for ONE logical element.
@@ -77,15 +86,15 @@ export const SELECTORS = {
    *  <a href="/preload/custom-invite/…"> anchor (role=link). The anchor tiers are
    *  what the deep-link goto path in the driver relies on resolving. */
   connectMenuItem: [
-    (s) => s.page.getByRole('menuitem', { name: CONNECT_NAME }),
-    (s) => s.page.getByRole('button', { name: CONNECT_NAME }),
-    (s) => s.page.getByRole('link', { name: CONNECT_NAME }),
-    (s) => s.page.locator('a[href*="custom-invite"]'),
+    (s) => menuScoped(s).getByRole('menuitem', { name: CONNECT_NAME }),
+    (s) => menuScoped(s).getByRole('button', { name: CONNECT_NAME }),
+    (s) => menuScoped(s).getByRole('link', { name: CONNECT_NAME }),
+    (s) => menuScoped(s).locator('a[href*="custom-invite"]'),
     // Any interactive dropdown item whose visible text is exactly "Connect".
     (s) =>
-      s.page
+      menuScoped(s)
         .locator(
-          '[role="menu"] a, [role="menu"] [role], .artdeco-dropdown__content a, .artdeco-dropdown__content [role], .artdeco-dropdown__content li > div',
+          'a, [role="menuitem"], [role="button"], li > div',
         )
         .filter({ hasText: /^\s*Connect\s*$/ }),
   ] as Candidate[],

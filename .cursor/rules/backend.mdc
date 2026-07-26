@@ -1,0 +1,32 @@
+---
+description: ReachPilot backend conventions (NestJS + Kysely + Postgres RLS + BullMQ)
+globs: server-v2/**/*.ts
+alwaysApply: false
+---
+
+# Backend rules (`server-v2/`)
+
+## 🔴 Row-level security (the #1 gotcha)
+- Tenant tables have **FORCE ROW LEVEL SECURITY**. Raw `getDb()` reads/writes
+  return 0 rows / throw unless wrapped in `withWorkspace(workspaceId, db => …)`
+  (sets `app.workspace_id` via `SET LOCAL`).
+- Cross-tenant work: enumerate `workspaces` (NOT RLS'd) then `withWorkspace(ws.id)`.
+- NOT RLS'd (safe with raw `getDb`): `workspaces`, `users`, `user_sessions`,
+  `messages`, `campaign_steps`, `proxies`, `plans`.
+- The app DB user has **no DDL rights** — don't add migrations expecting
+  `npm run migrate` to alter schema as that user.
+
+## Scheduler & worker
+- **The scheduler tick is the backbone** — scheduled jobs are drained there, not
+  inline. Without the worker, sequences never advance past day one.
+- **Pacing deferrals `return`, never `throw`** (throwing burns all 3 BullMQ
+  attempts in the blocked window). Call `pacing.release()` on defer/failure.
+- Commit "sent" BEFORE ancillary writes (idempotent, no double-send).
+
+## Conventions
+- `@/` alias → `server-v2/src/*`. Every service touching tenant tables uses `withWorkspace`.
+- Kysely increment in `onConflict`: `eb('col','+',n)`.
+- Validate inputs (`class-validator` / explicit guards); throw `BadRequestException`
+  with a user-safe message.
+- Never connect the app to a Supabase **transaction pooler** (:6543) — it breaks
+  `SET LOCAL` used for RLS. Use session pooler / direct (docs/adr/0001).

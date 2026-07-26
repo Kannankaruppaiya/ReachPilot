@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { WorkspacesService } from '@/modules/workspaces/workspaces.service';

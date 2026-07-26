@@ -16,15 +16,18 @@ import {
   Plug,
   ShieldCheck,
 } from "lucide-react"
-import { Badge, Button, Card, Field, LinkedinIcon, cx, inputCls, useToast } from "../ui"
-import {
-  api,
-  type IntegrationsState,
-  type TemplateRow,
-  type HourlyStat,
-  type Me,
-  type LinkedInAccountState,
-} from "../api"
+import { Badge, Button, Card, Field, LinkedinIcon } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
+import { api } from "@/lib/api"
+import type {
+  IntegrationsState,
+  TemplateRow,
+  HourlyStat,
+  Me,
+  LinkedInAccountState,
+} from "@/types"
 
 /* ---------- Sequences ---------- */
 
@@ -324,11 +327,26 @@ export function Integrations() {
           </div>
           {gmail?.connected ? (
             <>
-              <p className="text-sm text-sub">{gmail.email}</p>
+              {(state?.gmailAccounts?.length ? state.gmailAccounts : [gmail]).map((a: any) => (
+                <p key={a.email} className="text-sm text-sub">
+                  {a.email}
+                  {!a.connected && <span className="ml-1 text-xs text-warn">({a.status})</span>}
+                </p>
+              ))}
               <p className="tabular mt-1 text-xs text-sub">Daily limit · {gmail.dailyLimit} emails/day</p>
-              <Button variant="outline" className="mt-3" disabled={busy} onClick={disconnectGmail}>
-                {busy ? <Loader2 size={16} className="animate-spin" /> : "Disconnect"}
-              </Button>
+              <p className="mt-2 text-xs text-sub">
+                Connect a second mailbox to activate email warm-up (mailboxes exchange mail and
+                rescue each other from spam — builds sender reputation). Re-connecting an existing
+                mailbox refreshes its permissions.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button disabled={busy} onClick={connectGmail}>
+                  {busy ? <Loader2 size={16} className="animate-spin" /> : <><Mail size={16} /> Connect / re-connect mailbox</>}
+                </Button>
+                <Button variant="outline" disabled={busy} onClick={disconnectGmail}>
+                  {busy ? <Loader2 size={16} className="animate-spin" /> : "Disconnect"}
+                </Button>
+              </div>
             </>
           ) : (
             <>
@@ -359,6 +377,19 @@ export function Integrations() {
 
 const tabs = ["Profile", "LinkedIn limits", "Blacklist", "Billing"] as const
 
+// Common timezones offered in the working-hours picker (working hours are
+// evaluated in the account's timezone by the pacing engine).
+const TZ_OPTIONS = [
+  "UTC",
+  "Asia/Kolkata",
+  "Asia/Singapore",
+  "Asia/Dubai",
+  "Europe/London",
+  "America/New_York",
+  "America/Los_Angeles",
+  "Australia/Sydney",
+]
+
 export function Settings() {
   const toast = useToast()
   const [tab, setTab] = useState<(typeof tabs)[number]>("LinkedIn limits")
@@ -366,6 +397,11 @@ export function Settings() {
   const [account, setAccount] = useState<LinkedInAccountState | null>(null)
   const [invites, setInvites] = useState(5)
   const [weeklyCap, setWeeklyCap] = useState(100)
+  const [warmupTarget, setWarmupTarget] = useState(45)
+  const [hoursStart, setHoursStart] = useState("09:00")
+  const [hoursEnd, setHoursEnd] = useState("18:00")
+  const [timezone, setTimezone] = useState("UTC")
+  const [sendWeekends, setSendWeekends] = useState(false)
   const [saving, setSaving] = useState(false)
 
   // Real profile + account limits — nothing hardcoded.
@@ -379,6 +415,11 @@ export function Settings() {
         setAccount(a)
         setInvites(a.dailyLimit ?? a.warmup?.todayLimit ?? 5)
         if (a.weeklyInviteCap) setWeeklyCap(a.weeklyInviteCap)
+        if (a.warmup?.target) setWarmupTarget(a.warmup.target)
+        if (a.hoursStart) setHoursStart(a.hoursStart)
+        if (a.hoursEnd) setHoursEnd(a.hoursEnd)
+        if (a.timezone) setTimezone(a.timezone)
+        setSendWeekends(!!a.sendWeekends)
       })
       .catch(() => {})
     return () => {
@@ -387,7 +428,6 @@ export function Settings() {
   }, [])
 
   const safeToday = account?.warmup?.todayLimit ?? 5
-  const target = account?.warmup?.target ?? 45
 
   // Persist the limits — this page is the ONLY place limits are set; the
   // backend stores them on the account and the pacing engine enforces them.
@@ -398,10 +438,23 @@ export function Settings() {
     }
     setSaving(true)
     try {
-      const a = await api.saveLinkedinLimits(invites, weeklyCap)
+      const a = await api.saveLinkedinLimits({
+        dailyLimit: invites,
+        weeklyInviteCap: weeklyCap,
+        warmupTarget,
+        hoursStart,
+        hoursEnd,
+        timezone,
+        sendWeekends,
+      })
       setAccount(a)
       setInvites(a.dailyLimit ?? invites)
       if (a.weeklyInviteCap) setWeeklyCap(a.weeklyInviteCap)
+      if (a.warmup?.target) setWarmupTarget(a.warmup.target)
+      if (a.hoursStart) setHoursStart(a.hoursStart)
+      if (a.hoursEnd) setHoursEnd(a.hoursEnd)
+      if (a.timezone) setTimezone(a.timezone)
+      setSendWeekends(!!a.sendWeekends)
       toast("Limits saved — the engine now enforces these.")
     } catch (e) {
       toast(e instanceof Error ? e.message : "Couldn't save limits")
@@ -452,13 +505,13 @@ export function Settings() {
         <div className="flex max-w-xl flex-col gap-5">
           <Field label={`Daily connection requests — ${invites}/day`}>
             <input
-              type="range" min={1} max={target} value={invites}
+              type="range" min={1} max={warmupTarget} value={invites}
               onChange={(e) => setInvites(Number(e.target.value))}
               className="w-full accent-[#0369a1]"
             />
             <span className="mt-1 block text-xs text-sub">
               {account?.warmup
-                ? `Your warm-up allows ${safeToday}/day today, ramping to ${target}. The engine enforces this regardless of what you set here.`
+                ? `Your warm-up allows ${safeToday}/day today, ramping to ${warmupTarget}. The engine enforces this regardless of what you set here.`
                 : "Connect a LinkedIn account to see your real warm-up limit."}
             </span>
           </Field>
@@ -478,6 +531,63 @@ export function Settings() {
             />
             <span className="mt-1 block text-xs text-sub">LinkedIn enforces ~100 invites/week for most accounts.</span>
           </Field>
+          <Field label="Warm-up target (daily cap at full capacity)">
+            <input
+              type="number"
+              min={5}
+              max={100}
+              className={inputCls}
+              value={warmupTarget}
+              onChange={(e) => setWarmupTarget(Math.max(5, Math.min(100, Number(e.target.value) || 5)))}
+            />
+            <span className="mt-1 block text-xs text-sub">
+              The daily limit the warm-up ramp climbs toward (default 45). Real safe limits vary by
+              account (free vs premium) — keep it conservative.
+            </span>
+          </Field>
+          <Field label="Working hours (only send during these hours)">
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="time"
+                className={cx(inputCls, "w-auto")}
+                value={hoursStart}
+                onChange={(e) => setHoursStart(e.target.value)}
+                aria-label="Working hours start"
+              />
+              <span className="text-sub">to</span>
+              <input
+                type="time"
+                className={cx(inputCls, "w-auto")}
+                value={hoursEnd}
+                onChange={(e) => setHoursEnd(e.target.value)}
+                aria-label="Working hours end"
+              />
+            </div>
+            <span className="mt-1 block text-xs text-sub">
+              The engine only sends between these hours (in the timezone below). An end time before
+              the start wraps past midnight.
+            </span>
+          </Field>
+          <Field label="Timezone">
+            <select className={inputCls} value={timezone} onChange={(e) => setTimezone(e.target.value)}>
+              {!TZ_OPTIONS.includes(timezone) && <option value={timezone}>{timezone}</option>}
+              {TZ_OPTIONS.map((tz) => (
+                <option key={tz} value={tz}>
+                  {tz}
+                </option>
+              ))}
+            </select>
+            <span className="mt-1 block text-xs text-sub">Working hours are evaluated in this timezone.</span>
+          </Field>
+          <label className="flex w-fit items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={sendWeekends}
+              onChange={(e) => setSendWeekends(e.target.checked)}
+              className="accent-[#0369a1]"
+            />
+            Send on weekends (Sat &amp; Sun)
+          </label>
           <p className="rounded-md bg-mutedbg p-3 text-xs text-sub">
             This is the only place limits are set — Auto Connect and campaigns always send within
             what you save here. Automation may conflict with LinkedIn's User Agreement. Conservative

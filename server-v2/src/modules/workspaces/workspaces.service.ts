@@ -1,6 +1,5 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { getDb } from '@/db';
-import { withWorkspace } from '@/db/rls';
 
 @Injectable()
 export class WorkspacesService {

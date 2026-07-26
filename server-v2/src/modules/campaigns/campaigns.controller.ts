@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Param, Body, Req, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, Req } from '@nestjs/common';
 import { Request } from 'express';
 import { CampaignsService } from './campaigns.service';
 import { JwtPayload } from '@/common/auth.guard';

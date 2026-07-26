@@ -1,0 +1,27 @@
+---
+description: ReachPilot security & account-safety rules (always applied)
+globs:
+alwaysApply: true
+---
+
+# Security & account-safety (ALWAYS)
+
+## Secrets
+- **Never commit real `.env`** or paste secrets into tracked files, code, logs,
+  ADRs, or docs. Only `*.env.example` (placeholders) is tracked.
+- Credentials (LinkedIn password/cookie/TOTP, OAuth tokens) are stored via the
+  **envelope-encryption vault** (`MASTER_KEY`). Never log or return them in plaintext.
+- Rotating `MASTER_KEY` makes existing encrypted secrets unreadable — treat as a migration.
+- Never put personal data or secrets in URLs / query strings.
+
+## LinkedIn account safety (this is the product, not an afterthought)
+- **Never repeat-login a real LinkedIn account** — rapid automated logins trigger
+  security challenges/bans. Log in ONCE → store cookie → reuse. Respect the login cooldown.
+- Use **throwaway accounts** + `LINKEDIN_DRIVER=simulator` for dev/testing.
+- Real automation should egress via a dedicated, country-matched proxy per account.
+- Respect pacing: warm-up ramp, daily/weekly caps, working hours, inter-action spacing.
+
+## Auth
+- Access tokens are short-lived; refresh tokens are single-use (rotated + revoked).
+  Client refresh must be single-flight to avoid revoked-token logout races.
+- Multi-tenant isolation depends on RLS + `withWorkspace`; don't bypass it.

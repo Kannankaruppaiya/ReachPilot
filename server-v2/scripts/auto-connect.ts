@@ -114,7 +114,7 @@ function parseArgs(argv: string[]): Args {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const nowIso = () => new Date().toISOString();
+const _nowIso = () => new Date().toISOString();
 const localDate = () => new Date().toLocaleDateString('en-US');
 const short = (id?: string | null) => (id ? id.slice(0, 8) : '-');
 

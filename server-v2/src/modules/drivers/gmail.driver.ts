@@ -1,3 +1,4 @@
+import { randomBytes } from 'crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
@@ -23,6 +24,42 @@ function displayName(email: string): string {
 /** Escape text for safe HTML embedding. */
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// eslint-disable-next-line no-control-regex
+const isAscii = (s: string) => /^[\x00-\x7F]*$/.test(s);
+
+/**
+ * Quoted-printable encode (RFC 2045) — the transfer encoding Gmail itself uses
+ * for non-ASCII bodies, so our parts look exactly like Gmail-composed ones.
+ */
+function quotedPrintable(text: string): string {
+  const bytes = Buffer.from(text.replace(/\r?\n/g, '\r\n'), 'utf8');
+  let out = '';
+  let line = '';
+  const push = (s: string) => {
+    // Soft-wrap at 75 chars so no encoded line exceeds the RFC's 76 limit.
+    if (line.length + s.length > 75) {
+      out += line + '=\r\n';
+      line = '';
+    }
+    line += s;
+  };
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0x0d && bytes[i + 1] === 0x0a) {
+      out += line + '\r\n';
+      line = '';
+      i++;
+      continue;
+    }
+    if ((b >= 33 && b <= 126 && b !== 61) || b === 32 || b === 9) {
+      push(String.fromCharCode(b));
+    } else {
+      push('=' + b.toString(16).toUpperCase().padStart(2, '0'));
+    }
+  }
+  return out + line;
 }
 
 /**
@@ -56,6 +93,9 @@ export class GmailDriver implements EmailDriver {
         db.selectFrom('email_accounts').selectAll().where('id', '=', ctx.emailAccountId).executeTakeFirst(),
       );
     } else if (ctx?.workspaceId) {
+      // No explicit mailbox on the job → the workspace's DEFAULT sender is the
+      // most recently connected active mailbox (deterministic; without the
+      // orderBy, Postgres returns an arbitrary row once there are several).
       acct = await read((db) =>
         db
           .selectFrom('email_accounts')
@@ -63,6 +103,7 @@ export class GmailDriver implements EmailDriver {
           .where('workspace_id', '=', ctx.workspaceId)
           .where('provider', '=', 'gmail')
           .where('status', '=', 'active')
+          .orderBy('connected_at', 'desc')
           .limit(1)
           .executeTakeFirst(),
       );
@@ -97,11 +138,13 @@ export class GmailDriver implements EmailDriver {
   }
 
   /**
-   * Build a base64url-encoded RFC 822 message tuned for inbox placement:
-   *  - real From display name + Reply-To (not a bare address)
-   *  - Message-ID + Date
-   *  - List-Unsubscribe (+ One-Click) — Gmail weighs this heavily for cold mail
-   *  - multipart/alternative (plain + HTML) with an unsubscribe footer
+   * Build a base64url-encoded RFC 822 message that is indistinguishable from
+   * one composed in the Gmail UI. Deliberately MINIMAL headers — no Message-ID,
+   * Date, Reply-To, or List-Unsubscribe: Gmail assigns its own Message-ID/Date
+   * on send, and the bulk-mail markers (unsubscribe header + footer, custom
+   * message-id format, `rp_` boundary, styled HTML wrapper) were fingerprinting
+   * us as a sending tool and hurting inbox placement (manual Gmail sends from
+   * the same account landed in the inbox; ours went to spam).
    */
   private buildRawMessage(
     from: string,
@@ -111,49 +154,45 @@ export class GmailDriver implements EmailDriver {
     fromName?: string,
   ): string {
     const name = encodeHeader(fromName || displayName(from));
-    const domain = from.split('@')[1] || 'mail.local';
-    const messageId = `<${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}@${domain}>`;
-    const unsubMailto = `mailto:${from}?subject=unsubscribe`;
 
     const isHtml = /<[a-z][\s\S]*>/i.test(body);
-    // Derive both representations from whatever we were given.
+    // Derive both representations from whatever we were given. Plain-text
+    // bodies get Gmail's own bare wrapper (`<div dir="ltr">`) — no inline
+    // styles, which read as a mail-tool template.
     const plain = (isHtml ? body.replace(/<[^>]+>/g, '') : body).trim();
     const htmlBody = isHtml
       ? body
-      : `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:15px;line-height:1.5;color:#1a1a1a">${escapeHtml(plain).replace(/\n/g, '<br>')}</div>`;
+      : `<div dir="ltr">${escapeHtml(plain).replace(/\n/g, '<br>')}</div>`;
 
-    const footerPlain = `\r\n\r\n—\r\nDon't want these emails? Unsubscribe: ${unsubMailto}`;
-    const footerHtml = `<p style="margin-top:24px;color:#8a8a8a;font-size:12px">Don't want these emails? <a href="${unsubMailto}" style="color:#8a8a8a">Unsubscribe</a>.</p>`;
+    // Gmail-style boundary: a run of zeros followed by hex.
+    const boundary = `000000000000${randomBytes(6).toString('hex')}`;
 
-    const boundary = `rp_${Math.random().toString(36).slice(2)}`;
-    const headers = [
-      `From: ${name} <${from}>`,
-      `To: ${to}`,
-      `Reply-To: ${from}`,
-      `Subject: ${encodeHeader(subject)}`,
-      `Date: ${new Date().toUTCString()}`,
-      `Message-ID: ${messageId}`,
-      // mailto-only List-Unsubscribe. One-Click (List-Unsubscribe-Post) is
-      // intentionally omitted — RFC 8058 requires an https:// URI for it, which
-      // needs a public unsubscribe endpoint (add in production, not localhost).
-      `List-Unsubscribe: <${unsubMailto}>`,
-      'MIME-Version: 1.0',
-      `Content-Type: multipart/alternative; boundary="${boundary}"`,
-    ];
+    // Like Gmail: quoted-printable only when the content actually needs it.
+    const part = (type: string, content: string): string[] => {
+      if (isAscii(content)) {
+        return [`Content-Type: ${type}; charset="UTF-8"`, '', content];
+      }
+      return [
+        `Content-Type: ${type}; charset="UTF-8"`,
+        'Content-Transfer-Encoding: quoted-printable',
+        '',
+        quotedPrintable(content),
+      ];
+    };
 
     const message = [
-      ...headers,
+      'MIME-Version: 1.0',
+      `From: ${name} <${from}>`,
+      `To: ${to}`,
+      `Subject: ${encodeHeader(subject)}`,
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
       '',
       `--${boundary}`,
-      'Content-Type: text/plain; charset=UTF-8',
-      'Content-Transfer-Encoding: 8bit',
+      ...part('text/plain', plain),
       '',
-      plain + footerPlain,
       `--${boundary}`,
-      'Content-Type: text/html; charset=UTF-8',
-      'Content-Transfer-Encoding: 8bit',
+      ...part('text/html', htmlBody),
       '',
-      htmlBody + footerHtml,
       `--${boundary}--`,
       '',
     ].join('\r\n');

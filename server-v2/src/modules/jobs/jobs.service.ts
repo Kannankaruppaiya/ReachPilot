@@ -1,10 +1,10 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
-import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
 import { computeWarmup } from '@/modules/engine/warmup';
+import { spin } from '@/modules/engine/spintax';
 
 let redisClient: Redis | null = null;
 let linkedinQueue: Queue | null = null;
@@ -350,13 +350,18 @@ export class JobsService {
     return result;
   }
 
-  /** Fill {{firstName}}/{{company}}/{{role}} placeholders from a row's fields. */
+  /**
+   * Fill {{firstName}}/{{company}}/{{role}} placeholders from a row's fields,
+   * then resolve spintax groups (`{Hi|Hey|Hello}`) so each recipient gets a
+   * unique variation. Variables first, spin second — see spintax.ts.
+   */
   private fillTemplate(tpl: string, row: any): string {
     const firstName = String(row.name || '').trim().split(/\s+/)[0] || 'there';
-    return String(tpl || '')
+    const filled = String(tpl || '')
       .replace(/\{\{\s*firstName\s*\}\}/g, firstName)
       .replace(/\{\{\s*company\s*\}\}/g, row.company || 'your company')
       .replace(/\{\{\s*role\s*\}\}/g, row.role || row.title || 'your role');
+    return spin(filled);
   }
 
   private mapToFrontend(r: any) {

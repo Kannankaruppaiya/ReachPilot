@@ -12,9 +12,12 @@ import {
   UserPlus,
   X,
 } from "lucide-react"
-import { Badge, Button, Card, Field, LinkedinIcon, cx, inputCls, useToast } from "../ui"
-import { api } from "../api"
-import type { LinkedInAccountState } from "../api"
+import { Badge, Button, Card, Field, LinkedinIcon } from "@/components/ui"
+import { useToast } from "@/components/Toast"
+import { cx } from "@/lib/utils/cx"
+import { inputCls } from "@/constants"
+import { api } from "@/lib/api"
+import type { LinkedInAccountState } from "@/types"
 
 type Mode = "linkedin" | "email"
 
@@ -41,10 +44,19 @@ const detect = (headers: string[], patterns: RegExp[]): string => {
 }
 
 function fillTemplate(tpl: string, r: Row) {
-  return tpl
+  const filled = tpl
     .replace(/\{\{firstName\}\}/g, r.firstName || "there")
     .replace(/\{\{company\}\}/g, r.company || "your company")
     .replace(/\{\{role\}\}/g, r.role || "your role")
+  // Preview spintax like the backend does — but pick the FIRST option so the
+  // preview is stable while typing (the real send randomizes per recipient).
+  let out = filled
+  let prev: string
+  do {
+    prev = out
+    out = out.replace(/\{([^{}]*\|[^{}]*)\}/g, (_, inner: string) => inner.split("|")[0] ?? "")
+  } while (out !== prev)
+  return out
 }
 
 const dayLabel = (day: number) => {
@@ -410,6 +422,10 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
           onChange={(e) => setTemplate(e.target.value)}
           aria-label="Message template"
         />
+        <p className="mt-1 text-xs text-sub">
+          Variation: <code className="rounded bg-mutedbg px-1">{"{Hi|Hey|Hello}"}</code> picks one option
+          per recipient — varied wording keeps your emails out of the bulk-mail spam fingerprint.
+        </p>
         {valid && (
           <div className="mt-3 rounded-md bg-mutedbg p-3 text-sm">
             <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-sub">
