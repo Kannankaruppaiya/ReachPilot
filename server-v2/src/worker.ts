@@ -7,6 +7,7 @@ import { withWorkspace } from '@/db/rls';
 import { LINKEDIN_DRIVER, EMAIL_DRIVER } from '@/modules/drivers/driver.tokens';
 import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
 import { connectWithNoteFallback } from '@/modules/drivers/connect-with-fallback';
+import { ConnectionNoteService } from '@/modules/ai/connection-note.service';
 import {
   LinkedInDriver,
   LinkedInActionResult,
@@ -65,6 +66,7 @@ async function bootstrap() {
   const scheduler = app.get(SchedulerService);
   const linkedinSync = app.get(LinkedInSyncService);
   const emailWarmup = app.get(EmailWarmupService);
+  const connectionNote = app.get(ConnectionNoteService);
 
   logger.info({ linkedin: env.LINKEDIN_DRIVER, email: env.EMAIL_DRIVER }, 'Drivers selected');
 
@@ -249,6 +251,12 @@ async function bootstrap() {
       // silently ran as connection requests.
       const drv = ctx || undefined;
       const t = payload.target;
+      // Resolve the connection note at SEND time so AI/Apify personalization runs
+      // per prospect on the pacing schedule (falls back to the filled template).
+      const connectNote =
+        jobRow.action === 'connect_request'
+          ? await connectionNote.build(workspaceId, payload)
+          : payload.message;
       let res: LinkedInActionResult;
       try {
         switch (jobRow.action) {
@@ -273,11 +281,11 @@ async function bootstrap() {
           case 'connect_request':
             // Connect WITH the note, auto-falling back to a note-less connect when
             // the account's personalized-note quota is spent (free-tier limit).
-            res = await connectWithNoteFallback(linkedinDriver, t, payload.message, drv, logger);
+            res = await connectWithNoteFallback(linkedinDriver, t, connectNote, drv, logger);
             break;
           default:
             logger.warn({ jobId, action: jobRow.action }, 'Unknown LinkedIn action — treating as connect');
-            res = await connectWithNoteFallback(linkedinDriver, t, payload.message, drv, logger);
+            res = await connectWithNoteFallback(linkedinDriver, t, connectNote, drv, logger);
         }
       } catch (err: any) {
         res = { status: 'failed', error: String(err?.message || err) };

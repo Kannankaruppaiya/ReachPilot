@@ -32,22 +32,49 @@ export const auth = {
   },
 }
 
-async function tryRefresh(): Promise<boolean> {
+// Refresh outcome — tri-state so callers don't conflate "session is dead"
+// with "server was briefly unreachable":
+//   ok          → new tokens stored, retry the original request
+//   rejected    → definitive 401/403 → clear tokens, route to login
+//   unavailable → network error / 5xx → keep tokens, surface transient error
+type RefreshResult = "ok" | "rejected" | "unavailable"
+
+async function tryRefresh(): Promise<RefreshResult> {
   const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY)
-  if (!refreshToken) return false
+  if (!refreshToken) return "rejected"
+  let res: Response
   try {
-    const res = await fetch("/api/auth/refresh", {
+    res = await fetch("/api/auth/refresh", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refreshToken }),
     })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || !data.accessToken) return false
-    auth.set(data.accessToken, data.refreshToken)
-    return true
   } catch {
-    return false
+    // Network error — don't log the user out over a blip.
+    return "unavailable"
   }
+  if (res.status === 401 || res.status === 403) return "rejected"
+  if (!res.ok) return "unavailable" // 5xx / anything transient
+  const data = await res.json().catch(() => ({}))
+  if (!data.accessToken) return "unavailable"
+  auth.set(data.accessToken, data.refreshToken)
+  return "ok"
+}
+
+// Single-flight: when a burst of requests all 401 at once (poller + a screen
+// mount firing together), only ONE /auth/refresh runs. The rest await the same
+// promise and reuse its result, so the rotating refresh token is spent exactly
+// once per burst instead of once per request (the second-onward used the now
+// revoked token → 401 → logout, which was the bug).
+let refreshInFlight: Promise<RefreshResult> | null = null
+
+function refreshOnce(): Promise<RefreshResult> {
+  if (!refreshInFlight) {
+    refreshInFlight = tryRefresh().finally(() => {
+      refreshInFlight = null
+    })
+  }
+  return refreshInFlight
 }
 
 async function req<T>(url: string, body?: unknown, retried = false, method?: string): Promise<T> {
@@ -67,11 +94,16 @@ async function req<T>(url: string, body?: unknown, retried = false, method?: str
     throw new Error("Can't reach the server. Is the API running on port 4000?")
   }
 
-  // Access token expired → refresh once and retry.
+  // Access token expired → refresh once (shared across a concurrent burst) and retry.
   if (res.status === 401 && !retried && localStorage.getItem(REFRESH_TOKEN_KEY)) {
-    if (await tryRefresh()) return req<T>(url, body, true, method)
-    auth.clear()
-    throw new Error("Session expired. Please log in again.")
+    const result = await refreshOnce()
+    if (result === "ok") return req<T>(url, body, true, method)
+    if (result === "rejected") {
+      auth.clear()
+      throw new Error("Session expired. Please log in again.")
+    }
+    // "unavailable" — keep tokens; the next action retries once the API is back.
+    throw new Error("Can't reach the server. Is the API running on port 4000?")
   }
 
   const data = await res.json().catch(() => ({}))
@@ -144,6 +176,9 @@ export const api = {
     rows: { name: string; target: string; company: string; role: string }[]
     template: string
     subject?: string
+    useAi?: boolean
+    useApify?: boolean
+    aiGuidance?: string
   }) => req<{ batchId: string; total: number; today: number; queuedDays: number }>("/api/send/create", payload),
   listJobs: (batchId: string) => req<SendJob[]>(`/api/send/jobs?batchId=${batchId}`),
   // Cancel one not-yet-sent job (queue "close" button).
@@ -192,4 +227,97 @@ export const api = {
   getIntegrations: () => req<IntegrationsState>("/api/integrations"),
   googleConnectUrl: () => req<{ url: string }>("/api/integrations/google/connect"),
   disconnectGoogle: () => req<{ ok: true }>("/api/integrations/google/disconnect", {}),
+  connectApify: (token: string, enabledTools?: string) =>
+    req<{ connected: true; toolCount: number; enabledTools: string }>(
+      "/api/integrations/apify/connect",
+      { token, enabledTools },
+    ),
+  disconnectApify: () => req<{ ok: true }>("/api/integrations/apify/disconnect", {}),
+
+  // AI assistant
+  aiStatus: () => req<{ configured: boolean }>("/api/ai/status"),
+  aiChat,
+  aiConversations: () => req<ConversationSummary[]>("/api/ai/conversations"),
+  aiConversation: (id: string) =>
+    req<{ id: string; messages: StoredMessage[] }>(`/api/ai/conversations/${id}`),
+  aiDeleteConversation: (id: string) =>
+    req<{ ok: true }>(`/api/ai/conversations/${id}`, undefined, false, "DELETE"),
+}
+
+/** A saved conversation as the sidebar lists it. */
+export interface ConversationSummary {
+  id: string
+  title: string
+  updatedAt: string
+}
+
+/** A tool call + result, persisted with an assistant turn. */
+export interface ToolTrace {
+  name: string
+  args?: unknown
+  ok?: boolean
+  result?: unknown
+}
+
+/** A persisted message loaded from history. */
+export interface StoredMessage {
+  role: "user" | "assistant"
+  content: string
+  tools?: ToolTrace[]
+}
+
+/** Agent chat event mirrored from the backend AgentEvent union. */
+export type AgentEvent =
+  | { type: "conversation"; id: string }
+  | { type: "tool_call"; name: string; args: unknown }
+  | { type: "tool_result"; name: string; ok: boolean; result: unknown }
+  | { type: "text"; text: string }
+  | { type: "error"; message: string }
+  | { type: "done" }
+
+/**
+ * Streaming agent chat over SSE. EventSource can't send an Authorization header
+ * or a POST body, so we read the fetch stream manually and dispatch each
+ * `data:` line as a parsed AgentEvent. Returns when the stream ends.
+ */
+async function aiChat(
+  messages: { role: "user" | "assistant"; content: string }[],
+  onEvent: (e: AgentEvent) => void,
+  signal?: AbortSignal,
+  conversationId?: string,
+): Promise<void> {
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY)
+  const res = await fetch("/api/ai/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ messages, conversationId }),
+    signal,
+  })
+  if (!res.ok || !res.body) {
+    throw new Error(`AI chat failed (${res.status}). Is the API running?`)
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // SSE events are separated by a blank line; each has a `data:` payload.
+    let idx: number
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const chunk = buffer.slice(0, idx)
+      buffer = buffer.slice(idx + 2)
+      const line = chunk.split("\n").find((l) => l.startsWith("data:"))
+      if (!line) continue
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()) as AgentEvent)
+      } catch {
+        /* ignore malformed frame */
+      }
+    }
+  }
 }

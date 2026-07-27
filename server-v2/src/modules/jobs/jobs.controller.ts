@@ -16,6 +16,9 @@ export class JobsController {
       rows?: any[];
       template?: string;
       subject?: string;
+      useAi?: boolean;
+      useApify?: boolean;
+      aiGuidance?: string;
     },
     @Req() req: Request,
   ) {
@@ -29,6 +32,11 @@ export class JobsController {
       body.rows || [],
       body.template || '',
       body.subject || '',
+      {
+        useAi: !!body.useAi,
+        useApify: !!body.useApify,
+        aiGuidance: body.aiGuidance || '',
+      },
     );
   }
 

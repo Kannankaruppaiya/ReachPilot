@@ -211,6 +211,7 @@ export class JobsService {
     rows: any[],
     template: string,
     subject?: string,
+    personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string } = {},
   ): Promise<{ batchId: string; total: number; today: number; queuedDays: number }> {
     if (kind !== 'linkedin' && kind !== 'email') {
       throw new BadRequestException('Invalid channel.');
@@ -279,8 +280,17 @@ export class JobsService {
           target: row.target || row.linkedinUrl || row.email || '',
           company: row.company || '',
           role: row.role || row.title || '',
+          // Template is always filled as the fallback; when AI is on the worker
+          // generates the real note at send time (and Apify enriches it).
           message: this.fillTemplate(template, row),
           subject: this.fillTemplate(subject || '', row),
+          ...(kind === 'linkedin' && personalization.useAi
+            ? {
+                useAi: true,
+                useApify: !!personalization.useApify,
+                aiGuidance: personalization.aiGuidance || '',
+              }
+            : {}),
         };
 
         const jobData = {

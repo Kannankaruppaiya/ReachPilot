@@ -906,50 +906,71 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       }
 
       // ---- CONFIRM the invite actually went out (no false positives) ----
-      // Clicking "Send" is not, by itself, proof. Require a POSITIVE signal:
-      //   (a) an "Invitation sent" toast,
-      //   (b) the top-card control flipping to "Pending", OR
-      //   (c) the invite COMPOSER CLOSING — we clicked the resolved Send button
-      //       (not Cancel), so a modal that disappears means the invite went
-      //       through. (c) is what makes profiles whose Connect lived under "More"
-      //       confirm correctly: after sending, their top card shows no "Pending"
-      //       button (the flipped state hides inside the … menu), so (b) alone
-      //       false-negatived a send that really happened.
+      // Clicking "Send" is NOT proof. A rejected send — most commonly the
+      // free-tier PERSONALIZED-NOTE quota being exhausted — ALSO closes the
+      // composer, so "the modal disappeared" is NOT a reliable sent signal (it
+      // once marked leads sent whose profile still showed Connect). Trust only:
+      //   (a) an "Invitation sent" toast, or (b) the control flipping to Pending;
+      // otherwise verify on the profile itself.
       const sentToast = page
         .getByText(/invitation sent|invitation to .*(is|was) sent|sent your invitation|your invitation to .* was sent/i)
         .first();
       const pendingBtn = page.getByRole('button', { name: /^Pending$/i }).first();
-      const composerGone = async () => {
-        const modalVis = await page
-          .locator('[data-test-modal-id="send-invite-modal"]')
-          .filter({ visible: true })
-          .count()
-          .catch(() => 0);
-        const sendVis = await page
-          .locator('button[aria-label="Send invitation" i]')
-          .filter({ visible: true })
-          .count()
-          .catch(() => 0);
-        return modalVis === 0 && sendVis === 0;
-      };
 
       let confirmed = false;
-      const deadline = Date.now() + 9000;
+      const deadline = Date.now() + 8000;
       while (Date.now() < deadline && !confirmed) {
         if (await sentToast.isVisible().catch(() => false)) confirmed = true;
         else if (await pendingBtn.isVisible().catch(() => false)) confirmed = true;
-        else if (await composerGone()) confirmed = true; // Send clicked + modal closed = sent
         else await sleep(400);
       }
 
-      if (!confirmed) {
-        // Composer is still open with no toast/pending after ~9s — an inline error
-        // (note cap, limit) most likely blocked the send. Classify precisely.
-        this.logger.warn('Invite composer still open with no confirmation — send did not complete');
-        if (await page.getByText(/reached the weekly|invitation limit/i).count().catch(() => 0)) {
-          return { status: 'limit_reached' };
+      // Note-cap surfaced BY the send attempt (deep-link composer shows it only
+      // after Send). Retry this lead WITHOUT a note — connect-with-fallback does
+      // the note-less send, which works up to the much larger weekly cap.
+      if (!confirmed && message) {
+        const capNow = await page
+          .getByText(
+            /reached (the|your).{0,30}(personalized|note)|you.?ve used all|no free personalized|premium.{0,20}(note|personalize)|upgrade.{0,30}(note|personalize|send a note)/i,
+          )
+          .filter({ visible: true })
+          .count()
+          .catch(() => 0);
+        if (capNow) {
+          this.logger.warn('Note quota exhausted at send — falling back to a note-less connect');
+          return { status: 'limit_reached', error: 'note_cap' };
         }
-        return { status: 'failed', error: 'invite_not_confirmed' };
+      }
+
+      // Still unconfirmed → the composer may have closed with no toast/Pending.
+      // GROUND TRUTH: reload the profile and check whether the target's OWN
+      // Connect control is gone (or shows Pending). Only trust "Connect gone"
+      // when the profile actually rendered (title carries the name), so a failed
+      // page load can't masquerade as a successful send.
+      if (!confirmed) {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+        await sleep(rnd(1800, 3000));
+        if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
+        const pendingNow = await page
+          .getByRole('button', { name: /^Pending$/i })
+          .first()
+          .isVisible()
+          .catch(() => false);
+        const titleName = ((await page.title().catch(() => '')) || '').toLowerCase();
+        const firstName = nameHeading.toLowerCase().split(/\s+/)[0] || '';
+        const profileLoaded = !!firstName && titleName.includes(firstName);
+        const connectStill = await directConnect().count().catch(() => 0);
+        if (pendingNow || (profileLoaded && connectStill === 0)) {
+          confirmed = true;
+        } else {
+          this.logger.warn(
+            { pendingNow, profileLoaded, connectStill },
+            'Invite NOT confirmed — profile still shows Connect (or did not load)',
+          );
+          // A note was typed → most likely the note quota; retry note-less.
+          if (message) return { status: 'limit_reached', error: 'note_cap' };
+          return { status: 'failed', error: 'invite_not_confirmed' };
+        }
       }
 
       const externalId = 'li_inv_' + Date.now().toString(36);

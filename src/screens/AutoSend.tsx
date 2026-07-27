@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import * as XLSX from "xlsx"
 import {
+  Boxes,
   CalendarClock,
   CheckCircle2,
   FileSpreadsheet,
@@ -8,6 +9,7 @@ import {
   Mail,
   Rocket,
   Send,
+  Sparkles,
   UploadCloud,
   UserPlus,
   X,
@@ -90,6 +92,11 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       ? "Hi {{firstName}}, impressed by your work at {{company}}. I'd love to connect and share how we help {{role}}s grow."
       : "Hi {{firstName}},\n\nI came across your profile at {{company}} and wanted to reach out about an opportunity that fits your experience as {{role}}.\n\nOpen to a quick chat this week?",
   )
+  // Personalization (LinkedIn Auto Connect only). AI writes a unique note per
+  // person; Apify (only when AI is on) scrapes each profile first for grounding.
+  const [useAi, setUseAi] = useState(false)
+  const [useApify, setUseApify] = useState(false)
+  const [aiGuidance, setAiGuidance] = useState("")
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -211,6 +218,9 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
         rows: list.map((r) => ({ name: r.name, target: r.target, company: r.company, role: r.role })),
         template,
         subject: mode === "email" ? subject : undefined,
+        ...(mode === "linkedin" && useAi
+          ? { useAi: true, useApify, aiGuidance }
+          : {}),
       })
       batchId = res.batchId
       toast(
@@ -256,6 +266,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
 
   const parsed = rawRows.length > 0
   const valid = parsed && mapping.name && mapping.target
+  const aiMode = mode === "linkedin" && useAi
   const total = valid ? buildRows().length : 0
   const days = total ? Math.ceil(total / cap) : 0
   const sentCount = rows.filter((r) => r.status === "sent").length
@@ -398,44 +409,106 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
 
       {/* 2. Message */}
       <Card className="p-5">
-        <h2 className="mb-3 flex items-center gap-2 font-bold">{icon} 2. Message template</h2>
-        <div className="mb-2 flex flex-wrap gap-1.5">
-          {["{{firstName}}", "{{company}}", "{{role}}"].map((v) => (
-            <button
-              key={v}
-              onClick={() => setTemplate(template + " " + v)}
-              className="rounded-full bg-accent/10 px-2.5 py-1 text-xs font-semibold text-accent hover:bg-accent/20"
-            >
-              {v}
-            </button>
-          ))}
-        </div>
-        {mode === "email" && (
-          <Field label="Subject">
-            <input className={inputCls} value={subject} onChange={(e) => setSubject(e.target.value)} />
-          </Field>
-        )}
-        <textarea
-          rows={mode === "email" ? 5 : 3}
-          className={cx(inputCls, "mt-3 resize-none font-[inherit]")}
-          value={template}
-          onChange={(e) => setTemplate(e.target.value)}
-          aria-label="Message template"
-        />
-        <p className="mt-1 text-xs text-sub">
-          Variation: <code className="rounded bg-mutedbg px-1">{"{Hi|Hey|Hello}"}</code> picks one option
-          per recipient — varied wording keeps your emails out of the bulk-mail spam fingerprint.
-        </p>
-        {valid && (
-          <div className="mt-3 rounded-md bg-mutedbg p-3 text-sm">
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-sub">
-              Preview — {buildRows()[0]?.name}
-            </p>
-            {mode === "email" && (
-              <p className="font-semibold">{fillTemplate(subject, buildRows()[0])}</p>
-            )}
-            <p className="whitespace-pre-line">{fillTemplate(template, buildRows()[0])}</p>
+        <h2 className="mb-3 flex items-center gap-2 font-bold">{icon} 2. Message</h2>
+
+        {/* Personalization toggles — LinkedIn Auto Connect only */}
+        {mode === "linkedin" && (
+          <div className="mb-4 flex flex-col gap-2 rounded-lg border border-line bg-mutedbg/30 p-3">
+            <Toggle
+              on={useAi}
+              onChange={(v) => {
+                setUseAi(v)
+                if (!v) setUseApify(false)
+              }}
+              icon={<Sparkles size={15} />}
+              title="AI-personalized notes"
+              subtitle="Gemini writes a unique, human-sounding note for each person — no two alike."
+            />
+            <Toggle
+              on={useApify}
+              disabled={!useAi}
+              onChange={setUseApify}
+              icon={<Boxes size={15} />}
+              title="Enrich with Apify"
+              subtitle={
+                useAi
+                  ? "Scrape each LinkedIn profile first, so the note references a real detail about them."
+                  : "Turn on AI notes to enable profile enrichment."
+              }
+            />
           </div>
+        )}
+
+        {aiMode ? (
+          <>
+            <Field label="Voice & what to mention (optional)">
+              <textarea
+                rows={2}
+                className={cx(inputCls, "resize-none font-[inherit]")}
+                value={aiGuidance}
+                onChange={(e) => setAiGuidance(e.target.value)}
+                placeholder="e.g. founder-to-founder tone; mention we help with LinkedIn outreach automation"
+                aria-label="AI guidance"
+              />
+              <span className="mt-1 block text-xs text-sub">
+                Guides the AI's tone and the reason-to-connect. Leave blank for a neutral, friendly note.
+              </span>
+            </Field>
+            {valid && (
+              <div className="mt-3 rounded-md border border-accent/30 bg-accent/5 p-3 text-sm">
+                <p className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-accent">
+                  <Sparkles size={12} /> AI writes each note at send time
+                </p>
+                <p className="text-sub">
+                  Every prospect gets a distinct note grounded in their name, role
+                  {buildRows()[0]?.company ? ` & company (e.g. ${buildRows()[0].company})` : ""}
+                  {useApify ? ", plus real details scraped from their LinkedIn profile" : ""}. Notes are
+                  generated per person as they're sent, so nothing looks templated.
+                </p>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {["{{firstName}}", "{{company}}", "{{role}}"].map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setTemplate(template + " " + v)}
+                  className="rounded-full bg-accent/10 px-2.5 py-1 text-xs font-semibold text-accent hover:bg-accent/20"
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+            {mode === "email" && (
+              <Field label="Subject">
+                <input className={inputCls} value={subject} onChange={(e) => setSubject(e.target.value)} />
+              </Field>
+            )}
+            <textarea
+              rows={mode === "email" ? 5 : 3}
+              className={cx(inputCls, "mt-3 resize-none font-[inherit]")}
+              value={template}
+              onChange={(e) => setTemplate(e.target.value)}
+              aria-label="Message template"
+            />
+            <p className="mt-1 text-xs text-sub">
+              Variation: <code className="rounded bg-mutedbg px-1">{"{Hi|Hey|Hello}"}</code> picks one option
+              per recipient — varied wording keeps your emails out of the bulk-mail spam fingerprint.
+            </p>
+            {valid && (
+              <div className="mt-3 rounded-md bg-mutedbg p-3 text-sm">
+                <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-sub">
+                  Preview — {buildRows()[0]?.name}
+                </p>
+                {mode === "email" && (
+                  <p className="font-semibold">{fillTemplate(subject, buildRows()[0])}</p>
+                )}
+                <p className="whitespace-pre-line">{fillTemplate(template, buildRows()[0])}</p>
+              </div>
+            )}
+          </>
         )}
       </Card>
 
@@ -576,6 +649,54 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
           )}
         </Card>
       )}
+    </div>
+  )
+}
+
+/** A labelled switch row used for the AI / Apify personalization toggles. */
+function Toggle({
+  on,
+  onChange,
+  icon,
+  title,
+  subtitle,
+  disabled,
+}: {
+  on: boolean
+  onChange: (v: boolean) => void
+  icon: React.ReactNode
+  title: string
+  subtitle: string
+  disabled?: boolean
+}) {
+  return (
+    <div className={cx("flex items-start gap-3", disabled && "opacity-55")}>
+      <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-xs text-sub">{subtitle}</p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={title}
+        disabled={disabled}
+        onClick={() => !disabled && onChange(!on)}
+        className={cx(
+          "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed",
+          on ? "bg-accent" : "bg-line",
+        )}
+      >
+        <span
+          className={cx(
+            "inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform",
+            on ? "translate-x-[18px]" : "translate-x-0.5",
+          )}
+        />
+      </button>
     </div>
   )
 }

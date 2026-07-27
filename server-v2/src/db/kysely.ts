@@ -43,6 +43,8 @@ export interface DatabaseSchema {
   hourly_stats: any;
   campaign_stats: any;
   template_stats: any;
+  ai_conversations: any;
+  ai_messages: any;
 }
 
 let dbInstance: Kysely<DatabaseSchema> | null = null;

@@ -516,8 +516,29 @@ export interface Workspaces {
   onboarding_step: Generated<number>;
 }
 
+export interface AiConversations {
+  id: Generated<string>;
+  workspace_id: string;
+  user_id: string | null;
+  title: Generated<string>;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+}
+
+export interface AiMessages {
+  id: Generated<string>;
+  conversation_id: string;
+  workspace_id: string;
+  role: string;
+  content: Generated<string>;
+  tools: Json | null;
+  created_at: Generated<Timestamp>;
+}
+
 export interface DB {
   ab_tests: AbTests;
+  ai_conversations: AiConversations;
+  ai_messages: AiMessages;
   ab_variants: AbVariants;
   activity: Activity;
   api_keys: ApiKeys;

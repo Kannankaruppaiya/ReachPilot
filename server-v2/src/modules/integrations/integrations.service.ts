@@ -3,6 +3,7 @@ import * as jwt from 'jsonwebtoken';
 import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
 import { SecretsService } from '@/modules/vault/secrets.service';
+import { ApifyMcpService } from '@/modules/ai/apify-mcp.service';
 import { GoogleOAuthService } from './google-oauth.service';
 
 interface OAuthState {
@@ -22,6 +23,7 @@ export class IntegrationsService {
   constructor(
     private readonly oauth: GoogleOAuthService,
     private readonly secrets: SecretsService,
+    private readonly apifyMcp: ApifyMcpService,
   ) {}
 
   /** Build the Google consent URL, signing the workspace/user into `state`. */
@@ -124,8 +126,15 @@ export class IntegrationsService {
 
       const others = await db
         .selectFrom('integrations')
-        .select(['provider', 'active', 'created_at'])
+        .select(['provider', 'active', 'created_at', 'config'])
         .execute();
+
+      const apifyRow = others.find((i) => i.provider === 'apify' && i.active);
+      const apifyConfig = apifyRow
+        ? ((typeof apifyRow.config === 'string' ? JSON.parse(apifyRow.config) : apifyRow.config) as
+            | { enabledTools?: string }
+            | null)
+        : null;
 
       return {
         gmail: gmail
@@ -143,9 +152,101 @@ export class IntegrationsService {
           status: a.status,
           connectedAt: a.connected_at,
         })),
-        integrations: others,
+        apify: apifyRow
+          ? {
+              connected: true,
+              enabledTools: apifyConfig?.enabledTools || getEnv().APIFY_MCP_DEFAULT_TOOLS,
+              connectedAt: apifyRow.created_at,
+            }
+          : { connected: false },
+        integrations: others.map((i) => ({
+          provider: i.provider,
+          active: i.active,
+          created_at: i.created_at,
+        })),
       };
     });
+  }
+
+  /**
+   * Connect Apify: validate the API token against the hosted MCP server, encrypt
+   * it into the vault, and upsert the `integrations` row (provider='apify') with
+   * the enabled tool set. The AI assistant then gets Apify's tools on its next
+   * chat. Throws if the token can't reach Apify so the UI can reject it inline.
+   */
+  async connectApify(
+    workspaceId: string,
+    token: string,
+    enabledTools?: string,
+  ): Promise<{ connected: true; toolCount: number; enabledTools: string }> {
+    const clean = (token || '').trim();
+    if (!clean) throw new BadRequestException('An Apify API token is required.');
+    const tools = (enabledTools || '').trim() || getEnv().APIFY_MCP_DEFAULT_TOOLS;
+
+    // Validate before storing — a bad token or unreachable server fails here.
+    const { toolCount } = await this.apifyMcp.verifyToken(clean, tools);
+
+    const secretId = await this.secrets.encrypt(clean, 'integration_credentials', { workspaceId });
+
+    await withWorkspace(workspaceId, async (db) => {
+      const existing = await db
+        .selectFrom('integrations')
+        .select(['id', 'credentials_secret_id'])
+        .where('provider', '=', 'apify')
+        .executeTakeFirst();
+
+      if (existing) {
+        if (existing.credentials_secret_id) {
+          await this.secrets.remove(existing.credentials_secret_id, workspaceId).catch(() => undefined);
+        }
+        await db
+          .updateTable('integrations')
+          .set({ active: true, credentials_secret_id: secretId, config: JSON.stringify({ enabledTools: tools }) })
+          .where('id', '=', existing.id)
+          .execute();
+      } else {
+        await db
+          .insertInto('integrations')
+          .values({
+            workspace_id: workspaceId,
+            provider: 'apify',
+            active: true,
+            credentials_secret_id: secretId,
+            config: JSON.stringify({ enabledTools: tools }),
+          })
+          .execute();
+      }
+
+      await db
+        .insertInto('activity')
+        .values({ workspace_id: workspaceId, text: `Apify connected — ${toolCount} tools available`, tone: 'success' })
+        .execute();
+    });
+
+    this.logger.log(`Apify connected for workspace ${workspaceId}: ${toolCount} tools`);
+    return { connected: true, toolCount, enabledTools: tools };
+  }
+
+  /** Disconnect Apify: drop the stored token and deactivate the integration. */
+  async disconnectApify(workspaceId: string): Promise<{ ok: true }> {
+    await withWorkspace(workspaceId, async (db) => {
+      const row = await db
+        .selectFrom('integrations')
+        .select(['id', 'credentials_secret_id'])
+        .where('provider', '=', 'apify')
+        .executeTakeFirst();
+      if (!row) return;
+
+      if (row.credentials_secret_id) {
+        await this.secrets.remove(row.credentials_secret_id, workspaceId).catch(() => undefined);
+      }
+      await db
+        .updateTable('integrations')
+        .set({ active: false, credentials_secret_id: null })
+        .where('id', '=', row.id)
+        .execute();
+    });
+    return { ok: true };
   }
 
   /** Disconnect Gmail: revoke the token and drop the stored credential. */

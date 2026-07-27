@@ -8,6 +8,9 @@ export interface LeadContext {
   title?: string;
   company?: string;
   location?: string;
+  /** Extra facts scraped from the prospect's profile (Apify) — free-form text
+   *  the model can reference for a genuinely personalized note. */
+  profileContext?: string;
 }
 
 /** Campaign-level tone/intent knobs. */
@@ -92,11 +95,15 @@ export class AiService {
       `- No salesy pitch, no links, no emojis, no hashtags.`,
       voice.valueProp ? `- Softly hint at this reason to connect: ${voice.valueProp}` : ``,
       voice.senderName ? `- The note is from ${voice.senderName}; do not sign it.` : ``,
+      lead.profileContext
+        ? `- Ground the note in ONE specific, genuine detail from their profile below — not a generic compliment.`
+        : ``,
       `- STRICT: at most ${maxChars} characters. One or two sentences.`,
       `- Output ONLY the note text. No quotes, no preamble, no template placeholders.`,
       ``,
       `Prospect:`,
       facts,
+      lead.profileContext ? `\nProfile details:\n${lead.profileContext}` : ``,
     ]
       .filter(Boolean)
       .join('\n');
@@ -116,7 +123,10 @@ export class AiService {
         signal: controller.signal,
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.9, topP: 0.95, maxOutputTokens: 256 },
+          // maxOutputTokens must cover Gemini 2.5/3 "thinking" tokens PLUS the note,
+          // or the answer returns empty/truncated (thinking eats the whole budget).
+          // 1024 leaves ample room for a <280-char note after thinking.
+          generationConfig: { temperature: 0.9, topP: 0.95, maxOutputTokens: 1024 },
         }),
       });
       if (!res.ok) {

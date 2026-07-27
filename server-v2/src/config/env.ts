@@ -101,6 +101,22 @@ const envSchema = z.object({
   GEMINI_API_KEY: z.string().default(''),
   GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
 
+  // Apify MCP: the hosted Model Context Protocol server. The user's per-workspace
+  // Apify API token (stored encrypted in the vault, referenced from `integrations`)
+  // is what actually authorizes tool calls; this is just the endpoint + the default
+  // tool set offered when connecting. See https://mcp.apify.com.
+  APIFY_MCP_URL: z.string().default('https://mcp.apify.com'),
+  APIFY_MCP_DEFAULT_TOOLS: z.string().default('actors,docs,apify/rag-web-browser'),
+
+  // Apify LinkedIn profile scraper actor used by Auto Connect's "AI + Apify"
+  // personalization (scrape the prospect's profile → feed it to the note writer).
+  // harvestapi handles LinkedIn auth server-side (no cookie needed). Actor id uses
+  // `~` in the API path (owner~name). The input key + scraper mode are actor-
+  // specific — configurable so a different actor can be dropped in via .env.
+  APIFY_LINKEDIN_ACTOR: z.string().default('harvestapi/linkedin-profile-scraper'),
+  APIFY_LINKEDIN_INPUT_KEY: z.string().default('queries'),
+  APIFY_LINKEDIN_MODE: z.string().default('Profile details no email ($4 per 1k)'),
+
   RATE_LIMIT_AUTH_MAX: z.coerce.number().default(20),
   RATE_LIMIT_AUTH_WINDOW_MS: z.coerce.number().default(60000),
   RATE_LIMIT_SEND_MAX: z.coerce.number().default(10),

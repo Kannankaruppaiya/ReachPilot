@@ -186,5 +186,9 @@ export type IntegrationsState = {
     | { connected: false }
   /** Every Gmail mailbox (the email warm-up loop pairs ≥2 of them). */
   gmailAccounts?: { email: string; connected: boolean; status: string; connectedAt: string | null }[]
+  /** Apify MCP connection — powers the AI assistant's web-scraping/actor tools. */
+  apify?:
+    | { connected: true; enabledTools: string; connectedAt: string | null }
+    | { connected: false }
   integrations: { provider: string; active: boolean; created_at: string }[]
 }

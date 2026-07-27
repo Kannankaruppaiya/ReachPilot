@@ -10,6 +10,7 @@ import {
 } from "recharts"
 import {
   BadgeCheck,
+  Boxes,
   FlaskConical,
   Loader2,
   Mail,
@@ -231,11 +232,18 @@ export function Analytics() {
 
 /* ---------- Integrations ---------- */
 
+const APIFY_DEFAULT_TOOLS = "actors,docs,apify/rag-web-browser"
+
 export function Integrations() {
   const toast = useToast()
   const [state, setState] = useState<IntegrationsState | null>(null)
   const [li, setLi] = useState<LinkedInAccountState | null>(null)
   const [busy, setBusy] = useState(false)
+  // Apify connect form
+  const [showApify, setShowApify] = useState(false)
+  const [apifyToken, setApifyToken] = useState("")
+  const [apifyTools, setApifyTools] = useState(APIFY_DEFAULT_TOOLS)
+  const [apifyBusy, setApifyBusy] = useState(false)
 
   const load = () => {
     api.linkedinAccount().then(setLi).catch(() => setLi(null))
@@ -276,7 +284,40 @@ export function Integrations() {
     }
   }
 
+  const connectApify = async () => {
+    if (!apifyToken.trim()) {
+      toast("Paste your Apify API token first.")
+      return
+    }
+    setApifyBusy(true)
+    try {
+      const r = await api.connectApify(apifyToken.trim(), apifyTools.trim() || APIFY_DEFAULT_TOOLS)
+      toast(`Apify connected — ${r.toolCount} tools available in the Assistant ✓`)
+      setApifyToken("")
+      setShowApify(false)
+      await load()
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Couldn't connect Apify")
+    } finally {
+      setApifyBusy(false)
+    }
+  }
+
+  const disconnectApify = async () => {
+    setApifyBusy(true)
+    try {
+      await api.disconnectApify()
+      toast("Apify disconnected")
+      await load()
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Disconnect failed")
+    } finally {
+      setApifyBusy(false)
+    }
+  }
+
   const gmail = state?.gmail
+  const apify = state?.apify
 
   return (
     <div className="flex flex-col gap-6">
@@ -355,6 +396,90 @@ export function Integrations() {
                 {busy ? <Loader2 size={16} className="animate-spin" /> : <><Mail size={16} /> Connect Google</>}
               </Button>
             </>
+          )}
+        </Card>
+
+        <Card className="p-5">
+          <div className="mb-3 flex items-center gap-3">
+            <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600"><Boxes size={20} /></span>
+            <div>
+              <p className="font-bold">Apify</p>
+              {apify?.connected ? (
+                <Badge tone="success"><BadgeCheck size={12} /> Connected</Badge>
+              ) : (
+                <Badge tone="sub">Not connected</Badge>
+              )}
+            </div>
+          </div>
+          {apify?.connected ? (
+            <>
+              <p className="text-sm text-sub">
+                Web scraping, actors &amp; data extraction available to the AI Assistant.
+              </p>
+              <p className="mt-1 break-words text-xs text-sub">
+                Enabled tools · <span className="font-mono">{apify.enabledTools}</span>
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button variant="outline" disabled={apifyBusy} onClick={() => setShowApify((v) => !v)}>
+                  Update token
+                </Button>
+                <Button variant="outline" disabled={apifyBusy} onClick={disconnectApify}>
+                  {apifyBusy ? <Loader2 size={16} className="animate-spin" /> : "Disconnect"}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <p className="mb-3 text-sm text-sub">
+              Connect your Apify token to give the AI Assistant web-scraping &amp; actor tools
+              (find leads, enrich data, browse the web).
+            </p>
+          )}
+
+          {(showApify || !apify?.connected) && (
+            <div className="mt-3 flex flex-col gap-2">
+              <Field label="Apify API token">
+                <input
+                  type="password"
+                  className={inputCls}
+                  placeholder="apify_api_…"
+                  value={apifyToken}
+                  onChange={(e) => setApifyToken(e.target.value)}
+                  autoComplete="off"
+                />
+                <span className="mt-1 block text-xs text-sub">
+                  Get it at{" "}
+                  <a
+                    href="https://console.apify.com/settings/integrations"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-accent underline"
+                  >
+                    console.apify.com/settings/integrations
+                  </a>
+                </span>
+              </Field>
+              <Field label="Enabled tools">
+                <input
+                  className={inputCls}
+                  value={apifyTools}
+                  onChange={(e) => setApifyTools(e.target.value)}
+                  placeholder={APIFY_DEFAULT_TOOLS}
+                />
+                <span className="mt-1 block text-xs text-sub">
+                  Comma-separated tool categories or Actors (e.g. actors, docs, apify/rag-web-browser).
+                </span>
+              </Field>
+              <div className="flex gap-2">
+                <Button className="w-fit" disabled={apifyBusy} onClick={connectApify}>
+                  {apifyBusy ? <Loader2 size={16} className="animate-spin" /> : <><Boxes size={16} /> {apify?.connected ? "Save" : "Connect Apify"}</>}
+                </Button>
+                {apify?.connected && (
+                  <Button variant="outline" className="w-fit" disabled={apifyBusy} onClick={() => setShowApify(false)}>
+                    Cancel
+                  </Button>
+                )}
+              </div>
+            </div>
           )}
         </Card>
 

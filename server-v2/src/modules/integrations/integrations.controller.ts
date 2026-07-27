@@ -1,8 +1,13 @@
-import { Controller, Get, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, Res } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { IntegrationsService } from './integrations.service';
 import { JwtPayload, Public } from '@/common';
 import { getEnv } from '@/config/env';
+
+interface ApifyConnectBody {
+  token?: string;
+  enabledTools?: string;
+}
 
 @Controller('api/integrations')
 export class IntegrationsController {
@@ -55,5 +60,21 @@ export class IntegrationsController {
     const user = (req as any).user as JwtPayload;
     const workspaceId = (req as any).workspaceId || user.workspaceId;
     return this.integrations.disconnectGoogle(workspaceId);
+  }
+
+  /** Connect Apify: store the API token (validated against the MCP server first). */
+  @Post('apify/connect')
+  async connectApify(@Body() body: ApifyConnectBody, @Req() req: Request) {
+    const user = (req as any).user as JwtPayload;
+    const workspaceId = (req as any).workspaceId || user.workspaceId;
+    return this.integrations.connectApify(workspaceId, body?.token || '', body?.enabledTools);
+  }
+
+  /** Disconnect Apify. */
+  @Post('apify/disconnect')
+  async disconnectApify(@Req() req: Request) {
+    const user = (req as any).user as JwtPayload;
+    const workspaceId = (req as any).workspaceId || user.workspaceId;
+    return this.integrations.disconnectApify(workspaceId);
   }
 }

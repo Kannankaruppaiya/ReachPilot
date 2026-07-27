@@ -13,6 +13,7 @@ import {
   Rocket,
   Search,
   Send,
+  Sparkles,
   UserPlus,
   Settings as SettingsIcon,
   Sun,
@@ -34,10 +35,12 @@ import { Leads } from "./screens/Leads"
 import { Analytics, Integrations, Sequences, Settings } from "./screens/Misc"
 import { AutoSend } from "./screens/AutoSend"
 import { Connections } from "./screens/Connections"
+import { Assistant } from "./screens/Assistant"
 import type { CampaignRow as Campaign } from "@/types"
 
 type NavKey =
   | "dashboard"
+  | "assistant"
   | "campaigns"
   | "autoconnect"
   | "connections"
@@ -51,6 +54,7 @@ type NavKey =
 
 const nav: { key: NavKey; label: string; icon: React.ReactNode }[] = [
   { key: "dashboard", label: "Dashboard", icon: <LayoutDashboard size={17} /> },
+  { key: "assistant", label: "Assistant", icon: <Sparkles size={17} /> },
   { key: "campaigns", label: "Campaigns", icon: <Rocket size={17} /> },
   { key: "autoconnect", label: "Auto Connect", icon: <UserPlus size={17} /> },
   { key: "connections", label: "Connections", icon: <UserCheck size={17} /> },
@@ -90,6 +94,16 @@ export default function App() {
         auth.clear()
         setPhase("auth")
       })
+  }, [])
+
+  // Returning from the Google OAuth redirect (`/?gmail=connected|error`) — land
+  // the user on the Integrations page, where the connection lives and where
+  // Integrations shows the result toast. Runs once on mount, before Integrations
+  // reads + clears the query param.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).has("gmail")) {
+      setView("integrations")
+    }
   }, [])
 
   // Once in the app, load the real account/warm-up state + unread notifications,
@@ -143,7 +157,7 @@ export default function App() {
           {phase === "auth" && <Auth onDone={() => setPhase("onboarding")} />}
           {phase === "onboarding" && <Onboarding onDone={() => setPhase("app")} />}
           {phase === "app" && (
-            <div className="flex min-h-screen">
+            <div className="flex h-screen overflow-hidden">
               {/* sidebar */}
               <aside
                 className={cx(
@@ -266,8 +280,9 @@ export default function App() {
                   </div>
                 </header>
 
-                <main className="flex-1 p-4 lg:p-6">
+                <main className={cx("min-h-0 flex-1", view === "assistant" ? "overflow-hidden" : "overflow-y-auto p-4 lg:p-6")}>
                   {view === "dashboard" && <Dashboard />}
+                  {view === "assistant" && <Assistant />}
                   {view === "campaigns" && campaignView === "list" && (
                     <CampaignList
                       onOpen={(c) => {
