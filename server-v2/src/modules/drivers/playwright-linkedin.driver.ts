@@ -825,28 +825,40 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
 
         // Note-cap: free accounts get only a handful of PERSONALIZED-note invites
-        // (per month). Once spent, the composer shows a Premium upsell / limit
-        // message instead of a usable note field. Signal `note_cap` so the caller
-        // (connect-with-fallback) can retry this lead WITHOUT a note — note-less
-        // requests keep working up to the much larger weekly cap.
-        const noteCap = await modal
+        // (per month). Once spent, the composer shows a limit banner ("N
+        // personalized invitations remaining for this month") — on free tier it
+        // STILL renders a usable note field alongside it, and clicking Send with a
+        // note is then rejected. Signal `note_cap` so the caller (connect-with-
+        // fallback) can retry this lead WITHOUT a note — note-less requests keep
+        // working up to the much larger weekly cap.
+        const noteCapText = modal
           .getByText(
             /reached (the|your).{0,30}(personalized|note)|personalized invitation|upgrade.{0,30}(add a note|personalize|send a note|note)|premium.{0,20}(note|personalize)|note.{0,15}is a premium/i,
           )
-          .filter({ visible: true })
-          .count()
-          .catch(() => 0);
+          .filter({ visible: true });
+        const noteBox = (await resolveFirst(modalScope, SELECTORS.noteBox, 'noteBox', this.logger))
+          ?? modal.locator('textarea, div[role="textbox"]').first();
+
+        // Let the composer paint before reading the cap. The deep-link custom-invite
+        // composer opens the note field directly (no "Add a note" click+sleep above),
+        // so a single immediate count() could fire BEFORE the limit banner renders and
+        // miss it — the intermittent "note count not detected" bug. Wait for either the
+        // note field or the banner to be visible, then a brief settle to cover the case
+        // where the note field paints a beat before the banner.
+        await noteBox
+          .first()
+          .or(noteCapText.first())
+          .waitFor({ state: 'visible', timeout: 4000 })
+          .catch(() => undefined);
+        await sleep(rnd(350, 650));
+
+        const noteCap = await noteCapText.count().catch(() => 0);
         if (noteCap) {
           this.logger.warn('Personalized-note quota exhausted (note-cap) — signalling fallback to a note-less connect');
           return { status: 'limit_reached', error: 'note_cap' };
         }
 
-        const noteBox = (await resolveFirst(modalScope, SELECTORS.noteBox, 'noteBox', this.logger))
-          ?? modal.locator('textarea, div[role="textbox"]').first();
-        const noteReady = await noteBox
-          .waitFor({ state: 'visible', timeout: 4000 })
-          .then(() => true)
-          .catch(() => false);
+        const noteReady = await noteBox.isVisible().catch(() => false);
         if (noteReady) {
           await noteBox.click().catch(() => undefined);
           for (const ch of message.slice(0, 300)) {
