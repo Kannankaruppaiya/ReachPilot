@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as os from 'os';
 import * as path from 'path';
 import { getEnv } from '@/config/env';
-import { AiService } from '@/modules/ai/ai.service';
+import { AiService, ExtractedProfile } from '@/modules/ai/ai.service';
 
 /** A single normalized profile parsed from a public search result. */
 export interface ScrapedLead {
@@ -104,6 +104,127 @@ export class LeadScraperService {
     };
   }
 
+  /* ---------------- data-quality guards (kill false leads) ---------------- */
+
+  // Company/entity markers — a "name" containing these is not a person.
+  private static readonly NAME_JUNK =
+    /\b(ltd|pvt|private|limited|llp|inc|corp|co\.|company|solutions?|technolog|group|industries|enterprises?|global|consult|services?|systems?|ventures?|associates?|at)\b/i;
+  // Role words — used to detect a "name" that is really just a job title.
+  private static readonly ROLE_WORDS =
+    /\b(head|manager|director|officer|cfo|ceo|coo|cto|vp|president|lead|analyst|accountant|executive|specialist|controller|finance|accounts|hr|sales|marketing|engineer|founder|owner|partner)\b/i;
+  private static readonly IN_STATES = [
+    'tamil nadu', 'kerala', 'karnataka', 'andhra pradesh', 'telangana', 'maharashtra',
+    'gujarat', 'delhi', 'punjab', 'haryana', 'rajasthan', 'west bengal', 'uttar pradesh',
+    'madhya pradesh', 'bihar', 'odisha', 'assam', 'goa', 'jharkhand', 'chhattisgarh',
+  ];
+
+  /** The /in/<slug> handle, lowercased — the stable dedup key (subdomain-agnostic). */
+  private slugOf(url: string): string {
+    return (url.match(/linkedin\.com\/in\/([^/?#]+)/i)?.[1] || '').toLowerCase();
+  }
+
+  /** Strip honorifics/certs, fix ALL-CAPS, collapse whitespace. */
+  private normalizeName(raw: string): string {
+    let n = (raw || '').trim().replace(/\s*\|\s*LinkedIn\s*$/i, '');
+    n = n.replace(/^(mr|mrs|ms|dr|er|ca|cma|cfa|prof)\.?\s+/i, ''); // leading honorific/cert
+    n = n.split(',')[0].trim(); // drop trailing ", CA, MBA" clauses
+    if (n && n === n.toUpperCase()) n = n.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+    return n.replace(/\s{2,}/g, ' ').trim();
+  }
+
+  /** A plausible real person name — not a company, role, or headline. */
+  private isPersonName(name: string): boolean {
+    const n = (name || '').trim();
+    if (!n || n.length > 45) return false;
+    const words = n.split(/\s+/);
+    if (words.length > 5) return false; // headlines are long
+    if (LeadScraperService.NAME_JUNK.test(n)) return false; // company markers / "at"
+    if (!/[a-zA-Z]{2,}/.test(n)) return false; // pure handle/number
+    // Reject a "name" made entirely of role words ("Head Of Finance").
+    const nonRole = words.filter(
+      (w) => !LeadScraperService.ROLE_WORDS.test(w) && !/^(of|the|and|&|-)$/i.test(w),
+    );
+    return nonRole.length > 0;
+  }
+
+  /** Does the extracted title share a real keyword with what the user asked for? */
+  private titleRelevant(title: string, requested: string[]): boolean {
+    const t = (title || '').toLowerCase();
+    if (!t) return true; // empty title — don't drop on this axis
+    const stop = new Set([
+      'of', 'the', 'and', 'a', 'for', 'to', 'in', 'at', 'senior', 'junior', 'lead',
+      'head', 'sr', 'jr', 'assistant', 'deputy', 'general', 'manager', 'director',
+    ]);
+    const kws = new Set<string>();
+    for (const req of requested)
+      for (const w of req.toLowerCase().split(/\W+/)) if (w.length > 2 && !stop.has(w)) kws.add(w);
+    if (!kws.size) return true; // titles were only generic words
+    for (const w of t.split(/\W+/)) if (kws.has(w)) return true;
+    return false;
+  }
+
+  /** Keep a field only if it is actually grounded in the source text (anti-hallucination). */
+  private grounded(value: string, source: string): string {
+    const v = (value || '').trim();
+    if (!v) return '';
+    const src = (source || '').toLowerCase();
+    const words = v.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+    if (!words.length) return v;
+    const hit = words.filter((w) => src.includes(w)).length;
+    return hit / words.length >= 0.6 ? v : '';
+  }
+
+  /** True unless the location clearly names a DIFFERENT state/country than requested. */
+  private locationOk(loc: string, requested?: string): boolean {
+    const l = (loc || '').toLowerCase();
+    const req = (requested || '').toLowerCase();
+    if (!l || !req) return true;
+    if (l.includes(req) || req.includes(l)) return true;
+    const reqState = LeadScraperService.IN_STATES.find((s) => req.includes(s));
+    const locState = LeadScraperService.IN_STATES.find((s) => l.includes(s));
+    if (reqState && locState && reqState !== locState) return false; // different Indian state
+    if (req.includes('india') && /\b(usa|uk|uae|dubai|singapore|canada|australia|germany|qatar|saudi|nigeria)\b/.test(l))
+      return false; // foreign vs an India request
+    return true; // lenient (e.g. "Chennai" for "Tamil Nadu")
+  }
+
+  /**
+   * The anti-false gate: normalize + validate every candidate, ground its fields
+   * against the original SERP text, drop non-persons / off-target titles /
+   * wrong-region leads, and dedup by profile slug (subdomain-agnostic).
+   */
+  private validateClean(
+    cands: (ScrapedLead & { sourceText: string })[],
+    opts: SearchOptions,
+  ): ScrapedLead[] {
+    const bySlug = new Map<string, ScrapedLead>();
+    let dropped = 0;
+    for (const c of cands) {
+      const slug = this.slugOf(c.linkedinUrl);
+      if (!slug || bySlug.has(slug)) continue;
+
+      const name = this.normalizeName(c.name);
+      if (!this.isPersonName(name)) { dropped++; continue; } // #1/#7/#8 role-as-name
+      if (!this.titleRelevant(c.title, opts.titles)) { dropped++; continue; } // #2 off-target
+
+      const company = this.grounded(c.company, c.sourceText); // #4 anti-hallucination
+      const location = this.grounded(c.location, c.sourceText);
+      if (location && !this.locationOk(location, opts.location)) { dropped++; continue; } // #3 wrong region
+
+      bySlug.set(slug, {
+        name,
+        firstName: name.split(/\s+/)[0] || '',
+        title: c.title.trim(),
+        company,
+        location,
+        linkedinUrl: c.linkedinUrl,
+        snippet: c.snippet,
+      });
+    }
+    if (dropped) this.logger.log(`  validation dropped ${dropped} false/low-quality candidates`);
+    return [...bySlug.values()];
+  }
+
   /**
    * Search Google for LinkedIn profiles matching the titles + location and return
    * up to `maxResults` unique, parsed leads. Best-effort: a blocked/empty load
@@ -121,7 +242,7 @@ export class LeadScraperService {
       env.SCRAPER_PROFILE_DIR || path.join(os.tmpdir(), 'reachpilot-scraper-profile');
 
     let ctx: any;
-    const byUrl = new Map<string, ScrapedLead>();
+    const candidates: (ScrapedLead & { sourceText: string })[] = [];
     try {
       ctx = await this.launch(chromium, profileDir);
       const page = ctx.pages()[0] || (await ctx.newPage());
@@ -156,39 +277,41 @@ export class LeadScraperService {
         })
         .catch(() => [] as any[]);
 
-      // Clean the messy SERP snippets with one batched Gemini call (accurate
-      // company/title/location). Falls back to the regex parse if AI is off or
-      // fails — so extraction can only improve results, never break them.
+      // Clean the messy SERP snippets with one batched Gemini call, then merge
+      // PER-URL with the regex parse — a partial/failed AI extraction never loses
+      // leads (missed URLs fall back to regex). Both feed the validation gate.
       const extracted = await this.ai.extractProfiles(
         raw.map((r) => ({ title: r.title, snippet: r.snippet, url: r.href })),
       );
-      if (extracted && extracted.length) {
-        const snippetByUrl = new Map<string, string>();
-        for (const r of raw) {
-          const u = this.cleanProfileUrl(r.href);
-          if (u && !snippetByUrl.has(u)) snippetByUrl.set(u, r.snippet);
-        }
-        for (const p of extracted) {
-          const cleanUrl = this.cleanProfileUrl(p.linkedinUrl);
-          if (!cleanUrl || byUrl.has(cleanUrl)) continue;
-          byUrl.set(cleanUrl, {
-            name: p.name,
-            firstName: p.name.split(/\s+/)[0] || '',
-            title: p.title,
-            company: p.company,
-            location: p.location,
-            linkedinUrl: cleanUrl,
-            snippet: (snippetByUrl.get(cleanUrl) || '').slice(0, 300),
-          });
-        }
-        this.logger.log(`  AI-extracted ${byUrl.size} unique profiles from ${raw.length} results`);
-      } else {
-        for (const r of raw) {
-          const lead = this.parseResult(r.title, r.snippet, r.href);
-          if (lead && !byUrl.has(lead.linkedinUrl)) byUrl.set(lead.linkedinUrl, lead);
-        }
-        this.logger.log(`  regex-parsed ${byUrl.size} unique profiles from ${raw.length} results`);
+      const aiBySlug = new Map<string, ExtractedProfile>();
+      for (const p of extracted || []) {
+        const slug = this.slugOf(p.linkedinUrl);
+        if (slug && !aiBySlug.has(slug)) aiBySlug.set(slug, p);
       }
+      for (const r of raw) {
+        const cleanUrl = this.cleanProfileUrl(r.href);
+        if (!cleanUrl) continue;
+        const sourceText = `${r.title} ${r.snippet}`;
+        const ai = aiBySlug.get(this.slugOf(cleanUrl));
+        if (ai) {
+          candidates.push({
+            name: ai.name,
+            firstName: '',
+            title: ai.title,
+            company: ai.company,
+            location: ai.location,
+            linkedinUrl: cleanUrl,
+            snippet: r.snippet.trim().slice(0, 300),
+            sourceText,
+          });
+        } else {
+          const reg = this.parseResult(r.title, r.snippet, r.href);
+          if (reg) candidates.push({ ...reg, sourceText });
+        }
+      }
+      this.logger.log(
+        `  ${candidates.length} candidates (${aiBySlug.size} AI-clean, rest regex) from ${raw.length} results`,
+      );
     } catch (err: any) {
       this.logger.warn(`Scrape error (returning partial): ${err?.message || err}`);
     } finally {
@@ -196,9 +319,9 @@ export class LeadScraperService {
     }
 
     const region = opts.location?.trim() || '';
-    return [...byUrl.values()]
-      .slice(0, maxResults)
-      .map((l) => ({ ...l, location: l.location || region }));
+    const clean = this.validateClean(candidates, opts);
+    this.logger.log(`Scrape done: ${clean.length} valid leads (of ${candidates.length} candidates)`);
+    return clean.slice(0, maxResults).map((l) => ({ ...l, location: l.location || region }));
   }
 
   /** Launch a stealth Chrome; fall back to bundled Chromium if the channel is absent. */
