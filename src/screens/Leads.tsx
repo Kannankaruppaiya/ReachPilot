@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { BadgeCheck, Download, Loader2, Search, Tag, Users, X } from "lucide-react"
+import { BadgeCheck, Download, Loader2, Search, Sparkles, Tag, Users, X } from "lucide-react"
 import { api } from "@/lib/api"
 import type { LeadRow } from "@/types"
 import { Avatar, Badge, Button, Card, EmptyState } from "@/components/ui"
@@ -15,6 +15,19 @@ export function Leads() {
   const [leads, setLeads] = useState<LeadRow[]>([])
   const [loading, setLoading] = useState(true)
 
+  // Scrape-leads modal
+  const [scrapeOpen, setScrapeOpen] = useState(false)
+  const [titles, setTitles] = useState("Finance Head, Finance Manager")
+  const [location, setLocation] = useState("Tamil Nadu")
+  const [count, setCount] = useState(15)
+  const [scraping, setScraping] = useState(false)
+
+  const loadLeads = () =>
+    api
+      .getLeads()
+      .then((rows) => setLeads(rows))
+      .catch(() => undefined)
+
   useEffect(() => {
     let alive = true
     api
@@ -26,6 +39,31 @@ export function Leads() {
       alive = false
     }
   }, [])
+
+  const runScrape = async () => {
+    const titleList = titles
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+    if (!titleList.length) {
+      toast("Enter at least one job title.")
+      return
+    }
+    setScraping(true)
+    try {
+      await api.scrapeLeads({ titles: titleList, location: location.trim() || undefined, maxResults: count })
+      setScrapeOpen(false)
+      toast("Scraping started — leads will appear here in a few seconds.")
+      // The scrape runs in the worker (~10-20s). Poll a few times to reveal new leads.
+      for (const delay of [6000, 12000, 20000, 28000]) {
+        setTimeout(loadLeads, delay)
+      }
+    } catch {
+      toast("Couldn't start the scrape. Try again.")
+    } finally {
+      setScraping(false)
+    }
+  }
 
   const visible = leads.filter(
     (l) =>
@@ -42,15 +80,20 @@ export function Leads() {
           <h1 className="text-2xl font-bold">Leads</h1>
           <p className="text-sm text-sub">Everyone you're reaching out to, in one table.</p>
         </div>
-        <div className="relative w-full sm:w-auto">
-          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-sub" />
-          <input
-            className={cx(inputCls, "w-full pl-9 sm:w-64")}
-            placeholder="Search name or company"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            aria-label="Search leads"
-          />
+        <div className="flex w-full items-center gap-2 sm:w-auto">
+          <div className="relative flex-1 sm:flex-none">
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-sub" />
+            <input
+              className={cx(inputCls, "w-full pl-9 sm:w-64")}
+              placeholder="Search name or company"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              aria-label="Search leads"
+            />
+          </div>
+          <Button className="shrink-0 whitespace-nowrap" onClick={() => setScrapeOpen(true)}>
+            <Sparkles size={15} /> Scrape leads
+          </Button>
         </div>
       </div>
 
@@ -195,6 +238,82 @@ export function Leads() {
               )}
             </div>
           </aside>
+        </div>
+      )}
+
+      {scrapeOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => !scraping && setScrapeOpen(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border border-line bg-card p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-label="Scrape leads"
+          >
+            <div className="mb-4 flex items-start justify-between">
+              <div className="flex items-center gap-2">
+                <Sparkles size={18} className="text-accent" />
+                <div>
+                  <p className="text-lg font-bold">Scrape leads</p>
+                  <p className="text-xs text-sub">Find LinkedIn profiles by title + location — free.</p>
+                </div>
+              </div>
+              <button
+                aria-label="Close"
+                className="rounded-md p-1.5 text-sub hover:bg-mutedbg"
+                onClick={() => !scraping && setScrapeOpen(false)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-4">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-semibold uppercase tracking-wide text-sub">Job titles</span>
+                <input
+                  className={inputCls}
+                  value={titles}
+                  onChange={(e) => setTitles(e.target.value)}
+                  placeholder="Finance Head, Finance Manager"
+                />
+                <span className="text-xs text-sub">Comma-separated. Each is matched as an exact phrase.</span>
+              </label>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-semibold uppercase tracking-wide text-sub">Location</span>
+                <input
+                  className={inputCls}
+                  value={location}
+                  onChange={(e) => setLocation(e.target.value)}
+                  placeholder="Tamil Nadu"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs font-semibold uppercase tracking-wide text-sub">How many</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  className={cx(inputCls, "w-28")}
+                  value={count}
+                  onChange={(e) => setCount(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+                />
+              </label>
+
+              <div className="mt-1 flex items-center justify-end gap-2">
+                <Button variant="outline" onClick={() => setScrapeOpen(false)} disabled={scraping}>
+                  Cancel
+                </Button>
+                <Button onClick={runScrape} disabled={scraping}>
+                  {scraping ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                  {scraping ? "Starting…" : "Scrape"}
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -212,6 +212,13 @@ export const api = {
   getAnalyticsHourly: () => req<HourlyStat[]>("/api/analytics/hourly"),
   getChannels: () => req<{ channel: string; replies: number }[]>("/api/analytics/channels"),
   getLeads: () => req<LeadRow[]>("/api/leads"),
+  // Free local scrape: Google → LinkedIn profiles by title + location. Enqueues
+  // a worker job; scraped leads appear in the table shortly after.
+  scrapeLeads: (payload: { titles: string[]; location?: string; maxResults?: number }) =>
+    req<{ ok: true; queued: boolean; titles: string[]; location?: string; maxResults: number }>(
+      "/api/leads/scrape",
+      payload,
+    ),
   getCampaigns: () => req<CampaignRow[]>("/api/campaigns"),
   getTemplates: () => req<TemplateRow[]>("/api/templates"),
   updateCampaign: (id: string, body: { status?: string; dailyCap?: number }) =>

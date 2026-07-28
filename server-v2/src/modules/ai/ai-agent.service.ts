@@ -1,9 +1,24 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Queue } from 'bullmq';
+import Redis from 'ioredis';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
 import { getEnv } from '@/config/env';
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+// Lazy singleton producer for the lead-scrape queue (same pattern as
+// jobs.service / scraping.controller) — lets the scrape_leads tool enqueue a
+// worker job without the agent taking a queue dependency in its constructor.
+let scrapeRedis: Redis | null = null;
+let scrapeQueue: Queue | null = null;
+function getScrapeQueue(): Queue {
+  if (scrapeQueue) return scrapeQueue;
+  const env = getEnv();
+  if (!scrapeRedis) scrapeRedis = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
+  scrapeQueue = new Queue('lead-scrape', { connection: scrapeRedis as any });
+  return scrapeQueue;
+}
 
 /** Parse a JSON string, returning undefined instead of throwing on bad input. */
 function safeJson(s: string): any {
@@ -147,6 +162,40 @@ export class AiAgentService {
               .execute();
             return { count: rows.length, campaigns: rows };
           }),
+      },
+      {
+        name: 'scrape_leads',
+        description:
+          'Find NEW LinkedIn leads by job title and location and add them to the workspace. Scrapes public Google results for free and imports the matching profiles into the Leads table (deduped). Use when the user asks to find, source, or scrape prospects — e.g. "find Finance Heads in Chennai" or "scrape 20 CTOs in Bangalore". Runs in the background; leads appear shortly.',
+        parameters: {
+          type: 'object',
+          properties: {
+            titles: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Job titles to search, e.g. ["Finance Head", "Finance Manager"]. Each is matched as an exact phrase.',
+            },
+            location: { type: 'string', description: 'Region or city, e.g. "Tamil Nadu" or "Chennai".' },
+            count: { type: 'number', description: 'How many leads to fetch (1-50, default 15).' },
+          },
+          required: ['titles'],
+        },
+        execute: async (args, ctx) => {
+          const titles = Array.isArray(args?.titles)
+            ? args.titles.map((t: any) => String(t || '').trim()).filter(Boolean).slice(0, 6)
+            : [];
+          if (!titles.length) return { error: 'Provide at least one job title to search.' };
+          const location = args?.location ? String(args.location).trim() : undefined;
+          const maxResults = Math.min(Math.max(Number(args?.count) || 15, 1), 50);
+          await getScrapeQueue().add('scrape', { workspaceId: ctx.workspaceId, titles, location, maxResults });
+          return {
+            queued: true,
+            titles,
+            location,
+            maxResults,
+            note: 'Scraping started in the background — the new leads will appear in the Leads table in a few seconds.',
+          };
+        },
       },
       {
         name: 'get_connections',
