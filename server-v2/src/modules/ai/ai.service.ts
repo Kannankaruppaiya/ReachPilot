@@ -32,6 +32,15 @@ export interface GeneratedNote {
   model?: string;
 }
 
+/** A cleanly-extracted lead from a batch of raw search results (extractProfiles). */
+export interface ExtractedProfile {
+  name: string;
+  title: string;
+  company: string;
+  location: string;
+  linkedinUrl: string;
+}
+
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MAX_CHARS = 280; // safely under LinkedIn's ~300-char note limit
 
@@ -110,6 +119,92 @@ export class AiService {
   }
 
   /** Single generateContent call against the Gemini REST API. */
+  /**
+   * Clean structured lead fields out of raw search-engine results. Google SERP
+   * snippets are messy ("Finance Manager · 19 years · Nov 2024 - Present …"), so
+   * a regex parse mislabels company/title. One batched Gemini call (JSON mode)
+   * reads name / title / company / location far more reliably. Returns null on
+   * any failure or when Gemini isn't configured — the caller then falls back to
+   * its own regex parse, so this can only improve results, never break them.
+   */
+  async extractProfiles(
+    raw: { title: string; snippet: string; url: string }[],
+  ): Promise<ExtractedProfile[] | null> {
+    const env = getEnv();
+    if (!env.GEMINI_API_KEY || !raw.length) return null;
+    const url = `${GEMINI_BASE}/${encodeURIComponent(env.GEMINI_MODEL)}:generateContent?key=${env.GEMINI_API_KEY}`;
+
+    const prompt = [
+      'These are LinkedIn profile search results (title, snippet, url).',
+      'For each result extract the person\'s real NAME, current job TITLE, current COMPANY, and LOCATION.',
+      'Rules:',
+      '- Use ONLY facts present in that result\'s title/snippet; if a field is unknown, use "".',
+      '- name = the person (usually the text before " - " in the title).',
+      '- Never put role text in company or company text in title. Drop tenure phrases like "19 years" or "Nov 2024 - Present".',
+      '- Copy linkedinUrl EXACTLY as given.',
+      'Return a JSON array, one object per input result, in the same order.',
+      '',
+      'RESULTS:',
+      JSON.stringify(raw.map((r) => ({ title: r.title, snippet: r.snippet, url: r.url }))),
+    ].join('\n');
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25_000);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            // Room for Gemini-3 "thinking" tokens PLUS a JSON array of ~30 objects.
+            maxOutputTokens: 8192,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  name: { type: 'STRING' },
+                  title: { type: 'STRING' },
+                  company: { type: 'STRING' },
+                  location: { type: 'STRING' },
+                  linkedinUrl: { type: 'STRING' },
+                },
+                required: ['name', 'linkedinUrl'],
+              },
+            },
+          },
+        }),
+      });
+      if (!res.ok) {
+        this.logger.warn(`extractProfiles: Gemini ${res.status} — falling back to regex parse`);
+        return null;
+      }
+      const data: any = await res.json();
+      const text: string =
+        data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text || '').join('') || '';
+      const arr = JSON.parse(text);
+      if (!Array.isArray(arr)) return null;
+      return arr
+        .map((o: any) => ({
+          name: String(o?.name || '').trim(),
+          title: String(o?.title || '').trim(),
+          company: String(o?.company || '').trim(),
+          location: String(o?.location || '').trim(),
+          linkedinUrl: String(o?.linkedinUrl || '').trim(),
+        }))
+        .filter((o: ExtractedProfile) => o.name && /linkedin\.com\/in\//i.test(o.linkedinUrl));
+    } catch (err: any) {
+      this.logger.warn(`extractProfiles failed (${err?.message}) — falling back to regex parse`);
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async callGemini(prompt: string): Promise<string> {
     const env = getEnv();
     const url = `${GEMINI_BASE}/${encodeURIComponent(env.GEMINI_MODEL)}:generateContent?key=${env.GEMINI_API_KEY}`;

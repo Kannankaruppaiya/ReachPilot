@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { LeadsModule } from '@/modules/leads/leads.module';
+import { AiModule } from '@/modules/ai/ai.module';
 import { LeadScraperService } from './lead-scraper.service';
 import { ScrapingController } from './scraping.controller';
 
@@ -10,7 +11,7 @@ import { ScrapingController } from './scraping.controller';
  * and exposes LeadScraperService for the worker to resolve.
  */
 @Module({
-  imports: [LeadsModule],
+  imports: [LeadsModule, AiModule],
   controllers: [ScrapingController],
   providers: [LeadScraperService],
   exports: [LeadScraperService],

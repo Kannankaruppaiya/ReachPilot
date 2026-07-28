@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as os from 'os';
 import * as path from 'path';
 import { getEnv } from '@/config/env';
+import { AiService } from '@/modules/ai/ai.service';
 
 /** A single normalized profile parsed from a public search result. */
 export interface ScrapedLead {
@@ -42,6 +43,8 @@ export interface SearchOptions {
 @Injectable()
 export class LeadScraperService {
   private readonly logger = new Logger(LeadScraperService.name);
+
+  constructor(private readonly ai: AiService) {}
 
   /** LinkedIn-scoped boolean query, e.g. ("Finance Head" OR "Finance Manager") "Tamil Nadu" site:linkedin.com/in */
   private buildQuery(titles: string[], location?: string): string {
@@ -153,11 +156,39 @@ export class LeadScraperService {
         })
         .catch(() => [] as any[]);
 
-      for (const r of raw) {
-        const lead = this.parseResult(r.title, r.snippet, r.href);
-        if (lead && !byUrl.has(lead.linkedinUrl)) byUrl.set(lead.linkedinUrl, lead);
+      // Clean the messy SERP snippets with one batched Gemini call (accurate
+      // company/title/location). Falls back to the regex parse if AI is off or
+      // fails — so extraction can only improve results, never break them.
+      const extracted = await this.ai.extractProfiles(
+        raw.map((r) => ({ title: r.title, snippet: r.snippet, url: r.href })),
+      );
+      if (extracted && extracted.length) {
+        const snippetByUrl = new Map<string, string>();
+        for (const r of raw) {
+          const u = this.cleanProfileUrl(r.href);
+          if (u && !snippetByUrl.has(u)) snippetByUrl.set(u, r.snippet);
+        }
+        for (const p of extracted) {
+          const cleanUrl = this.cleanProfileUrl(p.linkedinUrl);
+          if (!cleanUrl || byUrl.has(cleanUrl)) continue;
+          byUrl.set(cleanUrl, {
+            name: p.name,
+            firstName: p.name.split(/\s+/)[0] || '',
+            title: p.title,
+            company: p.company,
+            location: p.location,
+            linkedinUrl: cleanUrl,
+            snippet: (snippetByUrl.get(cleanUrl) || '').slice(0, 300),
+          });
+        }
+        this.logger.log(`  AI-extracted ${byUrl.size} unique profiles from ${raw.length} results`);
+      } else {
+        for (const r of raw) {
+          const lead = this.parseResult(r.title, r.snippet, r.href);
+          if (lead && !byUrl.has(lead.linkedinUrl)) byUrl.set(lead.linkedinUrl, lead);
+        }
+        this.logger.log(`  regex-parsed ${byUrl.size} unique profiles from ${raw.length} results`);
       }
-      this.logger.log(`  parsed ${byUrl.size} unique profiles from ${raw.length} result links`);
     } catch (err: any) {
       this.logger.warn(`Scrape error (returning partial): ${err?.message || err}`);
     } finally {
