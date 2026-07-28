@@ -172,11 +172,12 @@ export class AuthService {
     const db = getDb();
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
+    // Look up the session regardless of revocation state so we can tell a
+    // concurrent-refresh race apart from an explicit logout / stale replay.
     const session = await db
       .selectFrom('user_sessions')
       .selectAll()
       .where('refresh_token_hash', '=', tokenHash)
-      .where('revoked_at', 'is', null)
       .executeTakeFirst();
 
     if (!session) {
@@ -187,11 +188,19 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token expired.');
     }
 
-    await db
-      .updateTable('user_sessions')
-      .set({ revoked_at: new Date().toISOString() })
-      .where('id', '=', session.id)
-      .execute();
+    if (session.revoked_at) {
+      // This token was already spent. Distinguish two cases:
+      //   - rotated within the grace window → a second tab racing the same
+      //     token; issue fresh tokens instead of logging it out.
+      //   - revoked by logout (rotated_at NULL), or rotated outside the grace
+      //     window (stale replay / possible theft) → reject.
+      const graceMs = getEnv().REFRESH_ROTATION_GRACE_MS;
+      const rotatedAt = session.rotated_at ? new Date(session.rotated_at).getTime() : null;
+      const withinGrace = rotatedAt !== null && Date.now() - rotatedAt <= graceMs;
+      if (!withinGrace) {
+        throw new UnauthorizedException('Refresh token already used.');
+      }
+    }
 
     const membership = await this.findMembership(session.user_id);
 
@@ -201,13 +210,27 @@ export class AuthService {
       .where('id', '=', session.user_id)
       .executeTakeFirstOrThrow();
 
-    return this.createSession(
+    const tokens = await this.createSession(
       user.id,
       user.email,
       membership?.workspaceId || '',
       membership?.role || 'member',
       meta,
     );
+
+    // Mark the presented token rotated + revoked and link it to its replacement.
+    // Only on the first (non-revoked) rotation — a grace-path hit leaves the
+    // original replaced_by pointing at the first replacement.
+    if (!session.revoked_at) {
+      const now = new Date().toISOString();
+      await db
+        .updateTable('user_sessions')
+        .set({ revoked_at: now, rotated_at: now, replaced_by: tokens.sessionId })
+        .where('id', '=', session.id)
+        .execute();
+    }
+
+    return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
   }
 
   async logout(refreshToken: string): Promise<void> {
@@ -285,7 +308,7 @@ export class AuthService {
     workspaceId: string,
     role: string,
     meta: { userAgent?: string; ip?: string },
-  ): Promise<{ accessToken: string; refreshToken: string }> {
+  ): Promise<{ accessToken: string; refreshToken: string; sessionId: string }> {
     const env = getEnv();
     const db = getDb();
 
@@ -306,7 +329,7 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 
-    await db
+    const row = await db
       .insertInto('user_sessions')
       .values({
         user_id: userId,
@@ -315,9 +338,10 @@ export class AuthService {
         ip: meta.ip || null,
         expires_at: expiresAt.toISOString(),
       })
-      .execute();
+      .returning('id')
+      .executeTakeFirstOrThrow();
 
-    return { accessToken, refreshToken };
+    return { accessToken, refreshToken, sessionId: row.id };
   }
 
   /**

@@ -15,6 +15,10 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(32),
   JWT_ACCESS_EXPIRY: z.string().default('15m'),
   JWT_REFRESH_EXPIRY: z.string().default('7d'),
+  // Grace window in which a just-rotated refresh token presented again by a
+  // concurrent tab is treated as a race (issue fresh tokens) instead of a
+  // reuse/theft (401 + logout). Keep short — the cross-tab race resolves in ms.
+  REFRESH_ROTATION_GRACE_MS: z.coerce.number().int().nonnegative().default(30_000),
 
   AUTH_BYPASS: z
     .string()

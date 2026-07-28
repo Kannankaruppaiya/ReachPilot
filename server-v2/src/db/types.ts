@@ -481,6 +481,8 @@ export interface UserSessions {
   last_used_at: Generated<Timestamp>;
   refresh_token_hash: string;
   revoked_at: Timestamp | null;
+  rotated_at: Timestamp | null;
+  replaced_by: string | null;
   user_agent: string | null;
   user_id: string;
 }
