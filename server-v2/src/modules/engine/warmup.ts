@@ -5,8 +5,10 @@
  * this one function means the number the UI shows always matches what the engine
  * actually allows.
  *
- * Curve (Expandi default): start at 5/day, add 3 every 2 days, up to the target,
- * capped by the account's configured warmup_daily_limit.
+ * Curve (Expandi default): start at 5/day, add 3 every 2 days, up to the
+ * warm-up target — the SINGLE daily ceiling. (warmup_daily_limit is kept in
+ * sync with the target and only survives as a fallback for legacy accounts
+ * that were created before a target was stored.)
  */
 
 export interface WarmupState {
@@ -30,15 +32,16 @@ export function computeWarmup(
   warmupTarget?: number | null,
   now: Date = new Date(),
 ): WarmupState {
+  // Single ceiling = the warm-up target. Fall back to warmup_daily_limit only
+  // for legacy accounts that never had a target set.
   const target = Number(warmupTarget) || Number(warmupDailyLimit) || 21;
-  const cap = Number(warmupDailyLimit) || target;
 
   const ageDays = connectedAt
     ? Math.max(0, Math.floor((now.getTime() - new Date(connectedAt).getTime()) / 86400000))
     : 0;
 
   const ramped = Math.min(target, START + STEP * Math.floor(ageDays / EVERY_DAYS));
-  const todayLimit = Math.max(1, Math.min(ramped, cap));
+  const todayLimit = Math.max(1, ramped);
 
   // Days for the ramp to climb from START to target, minus the age so far.
   const totalRampDays = Math.ceil(Math.max(0, target - START) / STEP) * EVERY_DAYS;

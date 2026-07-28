@@ -520,7 +520,6 @@ export function Settings() {
   const [tab, setTab] = useState<(typeof tabs)[number]>("LinkedIn limits")
   const [me, setMe] = useState<Me | null>(null)
   const [account, setAccount] = useState<LinkedInAccountState | null>(null)
-  const [invites, setInvites] = useState(5)
   const [weeklyCap, setWeeklyCap] = useState(100)
   const [warmupTarget, setWarmupTarget] = useState(45)
   const [hoursStart, setHoursStart] = useState("09:00")
@@ -538,7 +537,6 @@ export function Settings() {
       .then((a) => {
         if (!alive) return
         setAccount(a)
-        setInvites(a.dailyLimit ?? a.warmup?.todayLimit ?? 5)
         if (a.weeklyInviteCap) setWeeklyCap(a.weeklyInviteCap)
         if (a.warmup?.target) setWarmupTarget(a.warmup.target)
         if (a.hoursStart) setHoursStart(a.hoursStart)
@@ -564,7 +562,7 @@ export function Settings() {
     setSaving(true)
     try {
       const a = await api.saveLinkedinLimits({
-        dailyLimit: invites,
+        dailyLimit: warmupTarget,
         weeklyInviteCap: weeklyCap,
         warmupTarget,
         hoursStart,
@@ -573,7 +571,6 @@ export function Settings() {
         sendWeekends,
       })
       setAccount(a)
-      setInvites(a.dailyLimit ?? invites)
       if (a.weeklyInviteCap) setWeeklyCap(a.weeklyInviteCap)
       if (a.warmup?.target) setWarmupTarget(a.warmup.target)
       if (a.hoursStart) setHoursStart(a.hoursStart)
@@ -628,23 +625,21 @@ export function Settings() {
 
       {tab === "LinkedIn limits" && (
         <div className="flex max-w-xl flex-col gap-5">
-          <Field label={`Daily connection requests — ${invites}/day`}>
+          <Field label={`Daily connection target — ${warmupTarget}/day`}>
             <input
-              type="range" min={1} max={warmupTarget} value={invites}
-              onChange={(e) => setInvites(Number(e.target.value))}
-              className="w-full accent-[#0369a1]"
+              type="number"
+              min={5}
+              max={100}
+              className={inputCls}
+              value={warmupTarget}
+              onChange={(e) => setWarmupTarget(Math.max(5, Math.min(100, Number(e.target.value) || 5)))}
             />
             <span className="mt-1 block text-xs text-sub">
               {account?.warmup
-                ? `Your warm-up allows ${safeToday}/day today, ramping to ${warmupTarget}. The engine enforces this regardless of what you set here.`
-                : "Connect a LinkedIn account to see your real warm-up limit."}
+                ? `The daily ceiling your account warms up toward. Today it allows ${safeToday}/day, climbing to ${warmupTarget}. Real safe limits vary by account (free vs premium) — keep it conservative.`
+                : "The single daily ceiling your warm-up ramps toward (default 45). Connect a LinkedIn account to see today's live limit."}
             </span>
           </Field>
-          {invites > safeToday && (
-            <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn" role="alert">
-              Above today's warm-up limit of {safeToday}/day — the engine will still cap sends at {safeToday} to protect the account.
-            </div>
-          )}
           <Field label="Weekly invite cap">
             <input
               type="number"
@@ -655,20 +650,6 @@ export function Settings() {
               onChange={(e) => setWeeklyCap(Math.max(1, Math.min(200, Number(e.target.value) || 1)))}
             />
             <span className="mt-1 block text-xs text-sub">LinkedIn enforces ~100 invites/week for most accounts.</span>
-          </Field>
-          <Field label="Warm-up target (daily cap at full capacity)">
-            <input
-              type="number"
-              min={5}
-              max={100}
-              className={inputCls}
-              value={warmupTarget}
-              onChange={(e) => setWarmupTarget(Math.max(5, Math.min(100, Number(e.target.value) || 5)))}
-            />
-            <span className="mt-1 block text-xs text-sub">
-              The daily limit the warm-up ramp climbs toward (default 45). Real safe limits vary by
-              account (free vs premium) — keep it conservative.
-            </span>
           </Field>
           <Field label="Working hours (only send during these hours)">
             <div className="flex flex-wrap items-center gap-3">

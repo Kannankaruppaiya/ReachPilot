@@ -287,6 +287,9 @@ export class LinkedinAccountsService {
         throw new BadRequestException('Warm-up target must be between 5 and 100.');
       }
       fields.warmup_target = targetVal;
+      // The target is the single daily ceiling — keep warmup_daily_limit in sync
+      // so the two columns can never disagree and secretly cap the ramp below it.
+      fields.warmup_daily_limit = targetVal;
     }
 
     // Working hours / timezone / weekends. All optional; overnight windows
