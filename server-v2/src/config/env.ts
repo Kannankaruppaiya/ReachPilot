@@ -20,6 +20,12 @@ const envSchema = z.object({
   // reuse/theft (401 + logout). Keep short — the cross-tab race resolves in ms.
   REFRESH_ROTATION_GRACE_MS: z.coerce.number().int().nonnegative().default(30_000),
 
+  // Local lead scraper (LeadScraperService). Persistent Chrome profile dir for
+  // the stealth (patchright) browser; empty = an OS-temp default. Headful by
+  // default — headless is easily bot-flagged by Google.
+  SCRAPER_PROFILE_DIR: z.string().optional(),
+  SCRAPER_HEADLESS: z.coerce.boolean().default(false),
+
   AUTH_BYPASS: z
     .string()
     .transform((v) => v === 'true' || v === '1')

@@ -22,6 +22,8 @@ import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
 import { EmailWarmupService } from '@/modules/drivers/email-warmup.service';
+import { LeadScraperService } from '@/modules/scraping/lead-scraper.service';
+import { LeadsService } from '@/modules/leads/leads.service';
 import pino from 'pino';
 
 const logger = pino({ name: 'worker' });
@@ -617,9 +619,47 @@ async function bootstrap() {
     );
   }
 
+  /* ---------- 8. Lead scraper (free local Google → LinkedIn) ---------- */
+
+  // A headful stealth (patchright) browser scrapes Google for LinkedIn profiles
+  // matching the requested titles + location, then imports them via LeadsService
+  // (same dedup path as CSV import). Browser work belongs in the worker; the API
+  // only enqueues. NEVER touches a LinkedIn account session — reads Google only.
+  const leadScraper = app.get(LeadScraperService);
+  const leadsService = app.get(LeadsService);
+  const leadScrapeWorker = new Worker(
+    'lead-scrape',
+    async (job: Job) => {
+      const { workspaceId, titles, location, maxResults } = job.data;
+      logger.info({ titles, location, maxResults }, 'Processing lead-scrape job');
+      const leads = await leadScraper.search({ titles, location, maxResults });
+      if (!leads.length) {
+        logger.warn({ titles, location }, 'lead-scrape: no profiles found');
+        return;
+      }
+      const rows = leads.map((l) => ({
+        name: l.name,
+        role: l.title,
+        company: l.company,
+        location: l.location,
+        linkedinUrl: l.linkedinUrl,
+      }));
+      const res = await leadsService.importLeads(
+        workspaceId,
+        `google-scrape:${titles.join('/')}`,
+        rows,
+      );
+      logger.info({ scraped: leads.length, imported: res.count }, 'lead-scrape: leads imported');
+    },
+    { connection: connection as any, concurrency: 1 },
+  );
+  leadScrapeWorker.on('failed', (job, err) =>
+    logger.warn({ jobId: job?.id, err: err.message }, 'lead-scrape job failed'),
+  );
+
   logger.info(
     { schedulerTickMs: env.SCHEDULER_TICK_MS },
-    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync, email-warmup',
+    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync, email-warmup, lead-scrape',
   );
 }
 
