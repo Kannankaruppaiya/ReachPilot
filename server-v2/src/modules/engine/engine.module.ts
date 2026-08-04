@@ -4,11 +4,12 @@ import { PacingService } from './pacing.service';
 import { GraphExecutor } from './graph-executor';
 import { ConditionEvaluator } from './condition-evaluator';
 import { SchedulerService } from './scheduler.service';
+import { CampaignRunnerService } from './campaign-runner.service';
 import { AccountsModule } from '@/modules/accounts/accounts.module';
 
 @Module({
   imports: [AccountsModule],
-  providers: [EngineService, PacingService, GraphExecutor, ConditionEvaluator, SchedulerService],
-  exports: [EngineService, PacingService, GraphExecutor, ConditionEvaluator, SchedulerService],
+  providers: [EngineService, PacingService, GraphExecutor, ConditionEvaluator, SchedulerService, CampaignRunnerService],
+  exports: [EngineService, PacingService, GraphExecutor, ConditionEvaluator, SchedulerService, CampaignRunnerService],
 })
 export class EngineModule {}

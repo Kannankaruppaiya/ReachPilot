@@ -26,12 +26,44 @@ function getQueue(name: string): Queue {
   }
 }
 
+/** Actions that actually reach out (get a durable job + a browser/email send). */
+const OUTBOUND_ACTIONS = new Set([
+  'connect_request',
+  'linkedin_message',
+  'inmail',
+  'visit_profile',
+  'follow',
+  'like_post',
+  'endorse_skill',
+  'send_email',
+]);
+
+const CHANNEL_OF: Record<string, 'linkedin' | 'email'> = {
+  connect_request: 'linkedin',
+  linkedin_message: 'linkedin',
+  inmail: 'linkedin',
+  visit_profile: 'linkedin',
+  follow: 'linkedin',
+  like_post: 'linkedin',
+  endorse_skill: 'linkedin',
+  send_email: 'email',
+};
+
 @Injectable()
 export class GraphExecutor {
   constructor(private readonly conditionEvaluator: ConditionEvaluator) {}
 
   /**
-   * Evaluates the current step of an enrollment and schedules the next action.
+   * Evaluate the enrollment's current step and schedule the next action.
+   *
+   * Safe to call repeatedly (the campaign runner does, on every tick, for any
+   * enrollment that is active or whose wait window has elapsed):
+   *   - CONDITION steps honour the step's delay window (`delay_hours` after the
+   *     lead entered the step) before evaluating, then branch to on_true/on_false.
+   *   - WAIT / internal steps simply advance once their delay has elapsed.
+   *   - OUTBOUND steps materialise exactly one durable job (idempotency-guarded on
+   *     enrollment+step), then park the enrollment as `waiting`; the worker's
+   *     post-send `advanceEnrollment` flips it back to `active` for the next step.
    */
   async executeStep(workspaceId: string, enrollmentId: string): Promise<void> {
     const db = getDb();
@@ -42,16 +74,13 @@ export class GraphExecutor {
       .where('id', '=', enrollmentId)
       .executeTakeFirst();
 
-    if (!enrollment || enrollment.status !== 'active') return;
+    if (!enrollment) return;
+    // Only active/waiting enrollments advance; paused/finished/failed are terminal here.
+    if (enrollment.status !== 'active' && enrollment.status !== 'waiting') return;
 
     const currentStepId = enrollment.current_step_id;
     if (!currentStepId) {
-      // Completed sequence
-      await db
-        .updateTable('enrollments')
-        .set({ status: 'finished', finished_at: new Date().toISOString() })
-        .where('id', '=', enrollmentId)
-        .execute();
+      await this.finish(enrollmentId);
       return;
     }
 
@@ -61,29 +90,68 @@ export class GraphExecutor {
       .where('id', '=', currentStepId)
       .executeTakeFirst();
 
-    if (!step) return;
+    if (!step) {
+      // Dangling step reference — end the sequence rather than loop forever.
+      await this.finish(enrollmentId);
+      return;
+    }
 
+    const now = Date.now();
+    const enteredAt = new Date(
+      (enrollment.step_entered_at as any) || (enrollment.enrolled_at as any) || now,
+    ).getTime();
+    const dueAt = enteredAt + (Number(step.delay_hours) || 0) * 3600_000;
+
+    // ---- CONDITION step: wait out the window, then branch. -------------------
     if (step.kind === 'condition') {
-      const conditionMet = await this.conditionEvaluator.evaluate(
+      if (now < dueAt) {
+        await this.park(enrollmentId, new Date(dueAt).toISOString());
+        return;
+      }
+      const met = await this.conditionEvaluator.evaluate(
         workspaceId,
         enrollment.lead_id,
         step.condition!,
         step.params,
       );
-
-      const nextStepId = conditionMet ? step.on_true_step_id : step.on_false_step_id;
-
-      await db
-        .updateTable('enrollments')
-        .set({ current_step_id: nextStepId || null })
-        .where('id', '=', enrollmentId)
-        .execute();
-
-      // Immediately execute the next step recursively
+      const nextStepId = (met ? step.on_true_step_id : step.on_false_step_id) || null;
+      await this.moveTo(enrollmentId, nextStepId);
+      // Immediately evaluate the branch target (may be another condition or an action).
       return this.executeStep(workspaceId, enrollmentId);
     }
 
-    // Action node
+    // ---- Non-outbound action (wait / enrich / tag / webhook): advance. -------
+    if (!OUTBOUND_ACTIONS.has(step.action || '')) {
+      if (now < dueAt) {
+        await this.park(enrollmentId, new Date(dueAt).toISOString());
+        return;
+      }
+      await this.moveTo(enrollmentId, step.next_step_id || null);
+      return this.executeStep(workspaceId, enrollmentId);
+    }
+
+    // ---- OUTBOUND action: materialise one job, then wait for it. --------------
+    // Idempotency: never create a second job for the same enrollment+step (the
+    // runner may re-visit a `waiting` enrollment whose job is still in flight).
+    const existing = await db
+      .selectFrom('jobs')
+      .select(['id', 'status'])
+      .where('enrollment_id', '=', enrollmentId)
+      .where('step_id', '=', step.id)
+      .executeTakeFirst();
+    if (existing) {
+      // A terminal-failed job means the step can't complete — stop the lead so it
+      // doesn't get stuck retrying forever; otherwise the job is still pending.
+      if (existing.status === 'failed') {
+        await db
+          .updateTable('enrollments')
+          .set({ status: 'failed', finished_at: new Date().toISOString() })
+          .where('id', '=', enrollmentId)
+          .execute();
+      }
+      return;
+    }
+
     const lead = await db
       .selectFrom('leads')
       .selectAll()
@@ -92,7 +160,6 @@ export class GraphExecutor {
 
     let templateBody = '';
     let subject = '';
-
     if (step.template_id) {
       const tpl = await db
         .selectFrom('templates')
@@ -104,26 +171,17 @@ export class GraphExecutor {
         subject = tpl.subject || '';
       }
     }
+    // Inline message body (builder message/email steps store it on the step params).
+    const params = (typeof step.params === 'string' ? JSON.parse(step.params) : step.params) || {};
+    if (!templateBody && params.body) templateBody = String(params.body);
+    if (!subject && params.subject) subject = String(params.subject);
 
+    const channel = CHANNEL_OF[step.action!] || 'linkedin';
     const renderedBody = this.renderTemplate(templateBody, lead);
     const renderedSubject = this.renderTemplate(subject, lead);
 
-    const channelMap: Record<string, 'linkedin' | 'email'> = {
-      'connect_request': 'linkedin',
-      'linkedin_message': 'linkedin',
-      'inmail': 'linkedin',
-      'visit_profile': 'linkedin',
-      'follow': 'linkedin',
-      'like_post': 'linkedin',
-      'endorse_skill': 'linkedin',
-      'send_email': 'email',
-    };
-
-    const channel = channelMap[step.action!] || 'linkedin';
-
     const jobId = crypto.randomUUID();
-    const scheduledTime = new Date();
-    scheduledTime.setHours(scheduledTime.getHours() + (step.delay_hours || 0));
+    const scheduledFor = new Date(Math.max(now, dueAt));
 
     const payload = {
       name: lead.full_name,
@@ -140,7 +198,8 @@ export class GraphExecutor {
       .where('id', '=', enrollment.campaign_id)
       .executeTakeFirst();
 
-    // Create outbound Job in scheduled state
+    const dueNow = scheduledFor.getTime() <= now;
+
     await db
       .insertInto('jobs')
       .values({
@@ -155,51 +214,66 @@ export class GraphExecutor {
         kind: channel,
         action: step.action! as any,
         payload: JSON.stringify(payload),
-        status: 'scheduled',
-        scheduled_for: scheduledTime.toISOString(),
+        // Due now → hand straight to BullMQ (status queued); future → let the
+        // scheduler pick it up when scheduled_for arrives.
+        status: dueNow ? 'queued' : 'scheduled',
+        scheduled_for: scheduledFor.toISOString(),
         idempotency_key: `enrollment:${enrollmentId}:step:${step.id}`,
       })
       .execute();
 
-    // If wait time is 0 (or elapsed), queue into BullMQ
-    if ((step.delay_hours || 0) === 0) {
+    if (dueNow) {
       const q = channel === 'linkedin' ? getQueue('linkedin-actions') : getQueue('email-send');
       await q.add(
         channel === 'linkedin' ? 'linkedin-connect' : 'email-send',
-        {
-          jobId,
-          workspaceId,
-          leadId: lead.id,
-          payload,
-        },
+        { jobId, workspaceId, leadId: lead.id, payload },
         {
           jobId,
           attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 5000,
-          },
-          // A finished BullMQ job left in Redis blocks a later re-add with
-          // the same jobId (silent dedupe) — deferred jobs would never rerun.
+          backoff: { type: 'exponential', delay: 5000 },
           removeOnComplete: true,
           removeOnFail: true,
         },
       );
-
-      await db
-        .updateTable('jobs')
-        .set({ status: 'queued' })
-        .where('id', '=', jobId)
-        .execute();
     }
 
-    // Set enrollment state to waiting on this action completion
+    // Park the enrollment until the job completes (worker advances it) or the
+    // scheduled_for arrives (scheduler dispatches, worker advances).
+    await this.park(enrollmentId, scheduledFor.toISOString());
+  }
+
+  /** Point the enrollment at a new step, resetting the step-entry clock. */
+  private async moveTo(enrollmentId: string, nextStepId: string | null): Promise<void> {
+    const db = getDb();
+    if (!nextStepId) {
+      await this.finish(enrollmentId);
+      return;
+    }
     await db
       .updateTable('enrollments')
       .set({
-        status: 'waiting',
-        next_run_at: scheduledTime.toISOString(),
+        current_step_id: nextStepId,
+        status: 'active',
+        step_entered_at: new Date().toISOString(),
+        next_run_at: new Date().toISOString(),
       })
+      .where('id', '=', enrollmentId)
+      .execute();
+  }
+
+  /** Park an enrollment as waiting until `runAt` (a job or a wait window). */
+  private async park(enrollmentId: string, runAt: string): Promise<void> {
+    await getDb()
+      .updateTable('enrollments')
+      .set({ status: 'waiting', next_run_at: runAt })
+      .where('id', '=', enrollmentId)
+      .execute();
+  }
+
+  private async finish(enrollmentId: string): Promise<void> {
+    await getDb()
+      .updateTable('enrollments')
+      .set({ status: 'finished', finished_at: new Date().toISOString(), next_run_at: null })
       .where('id', '=', enrollmentId)
       .execute();
   }
@@ -207,14 +281,17 @@ export class GraphExecutor {
   private renderTemplate(tpl: string, lead: any): string {
     const map: Record<string, string> = {
       firstName: lead.first_name,
-      lastName: lead.full_name.split(' ').slice(1).join(' '),
+      lastName: String(lead.full_name || '').split(' ').slice(1).join(' '),
       fullName: lead.full_name,
       company: lead.company,
       title: lead.title,
       location: lead.location,
     };
     // Variables first, then spintax ({Hi|Hey|Hello}) — see spintax.ts.
-    const filled = tpl.replace(/\{\{(\w+)(?:\|([^}]*))?\}\}/g, (_, key, fb) => map[key] || fb || `{{${key}}}`);
+    const filled = String(tpl || '').replace(
+      /\{\{(\w+)(?:\|([^}]*))?\}\}/g,
+      (_, key, fb) => map[key] || fb || `{{${key}}}`,
+    );
     return spin(filled);
   }
 }
