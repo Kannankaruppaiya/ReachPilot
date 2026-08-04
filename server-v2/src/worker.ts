@@ -20,9 +20,12 @@ import { SecretsService } from '@/modules/vault/secrets.service';
 import { PacingService } from '@/modules/engine/pacing.service';
 import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
+import { CampaignRunnerService } from '@/modules/engine/campaign-runner.service';
 import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
 import { EmailWarmupService } from '@/modules/drivers/email-warmup.service';
 import { LeadScraperService } from '@/modules/scraping/lead-scraper.service';
+import { ScrapeCursorService } from '@/modules/scraping/scrape-cursor.service';
+import { ScrapeJobsService } from '@/modules/scraping/scrape-jobs.service';
 import { LeadsService } from '@/modules/leads/leads.service';
 import pino from 'pino';
 
@@ -41,6 +44,31 @@ process.on('uncaughtException', (err: any) => {
 
 const nowIso = () => new Date().toISOString();
 const localDate = () => new Date().toLocaleDateString('en-US');
+
+/**
+ * Offload a scrape to the standalone scraper microservice (headful Chrome under
+ * Xvfb on a VPS) when SCRAPER_SERVICE_URL is set. Best-effort: any failure throws
+ * so the caller can fall back to scraping locally in-process.
+ */
+async function scrapeViaService(
+  serviceUrl: string,
+  token: string,
+  body: { titles: string[]; location?: string; maxResults?: number; startPage?: number; pages?: number },
+): Promise<any[]> {
+  const res = await fetch(`${serviceUrl.replace(/\/$/, '')}/scrape`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(180_000), // a paginated scrape can run a while
+  });
+  if (!res.ok) throw new Error(`scraper service ${res.status}`);
+  const data: any = await res.json();
+  if (!data?.ok || !Array.isArray(data.leads)) throw new Error('scraper service bad response');
+  return data.leads;
+}
 
 /** Human-readable activity label per LinkedIn action type. */
 const ACTION_LABEL: Record<string, string> = {
@@ -66,6 +94,7 @@ async function bootstrap() {
   const pacing = app.get(PacingService);
   const gmailInbox = app.get(GmailInboxService);
   const scheduler = app.get(SchedulerService);
+  const campaignRunner = app.get(CampaignRunnerService);
   const linkedinSync = app.get(LinkedInSyncService);
   const emailWarmup = app.get(EmailWarmupService);
   const connectionNote = app.get(ConnectionNoteService);
@@ -103,6 +132,11 @@ async function bootstrap() {
       .set({
         current_step_id: nextStepId,
         status: nextStepId ? 'active' : 'finished',
+        // Reset the step-entry clock so the next step's delay window / condition
+        // timeout is measured from now, and clear the wait marker so the campaign
+        // runner picks it up on the next tick.
+        step_entered_at: nowIso(),
+        next_run_at: nextStepId ? nowIso() : null,
         finished_at: nextStepId ? null : nowIso(),
       })
       .where('id', '=', enrollmentId)
@@ -207,7 +241,7 @@ async function bootstrap() {
       // — the scheduler tick is the retry path now. Throwing here would burn all
       // three BullMQ attempts inside the same blocked window and lose the job.
       const isInvite = jobRow.action === 'connect_request';
-      const paceResult = await pacing.checkPacingAndRegister(accountId, 'linkedin', workspaceId, isInvite);
+      const paceResult = await pacing.checkPacingAndRegister(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id);
       if (!paceResult.allowed) {
         const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
         await withWorkspace(workspaceId, async (db) => {
@@ -236,7 +270,7 @@ async function bootstrap() {
       // slot we just registered against a send that never happened.
       const ctx = await sessions.buildActionContext(accountId, workspaceId);
       if (accountId && !ctx) {
-        await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
         const retryAt = new Date(Date.now() + 3600000).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: 'account_unavailable' }).where('id', '=', jobId).execute();
@@ -360,7 +394,7 @@ async function bootstrap() {
       // Terminal per-lead failures — mark failed, no retry. No invite left our
       // account, so give the pacing slot back.
       if (TERMINAL_FAIL_OUTCOMES.includes(res.status)) {
-        await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
         // Prefer the driver's specific reason (e.g. 'email_required') over the
         // coarse outcome name, so the UI explains WHY a lead was skipped.
         const reason = res.error || res.status;
@@ -462,6 +496,8 @@ async function bootstrap() {
         jobRow.email_account_id || '',
         'email',
         workspaceId,
+        true,
+        jobRow.campaign_id,
       );
       if (!paceResult.allowed) {
         const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
@@ -574,6 +610,30 @@ async function bootstrap() {
     );
   }
 
+  /* ---------- 5b. Campaign runner: drive enrollments through the sequence ---------- */
+
+  // The heartbeat of the campaign engine. Every tick it finds enrollments that
+  // are ready to move (active, or waiting with the wait window elapsed) in an
+  // active campaign and runs the current step via the graph executor — creating
+  // the next durable job, evaluating conditions, or finishing the lead. The
+  // scheduler (5) then dispatches the jobs it creates. Without this, a campaign
+  // never advances past the step the enroll call kicked off.
+  const runCampaignTick = async () => {
+    try {
+      await campaignRunner.tick();
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Campaign runner tick failed');
+    }
+  };
+  if (env.CAMPAIGN_RUNNER_ENABLED) {
+    setTimeout(runCampaignTick, 8_000); // first pass shortly after boot
+    setInterval(runCampaignTick, env.CAMPAIGN_RUNNER_TICK_MS);
+  } else {
+    logger.warn(
+      'Campaign runner DISABLED (CAMPAIGN_RUNNER_ENABLED=false) — campaign enrollments will NOT advance through their sequence.',
+    );
+  }
+
   /* ---------- 6. LinkedIn sync: acceptance + reply detection (B4) ---------- */
 
   // The LinkedIn counterpart to the Gmail inbox sync, extracted into
@@ -588,10 +648,9 @@ async function bootstrap() {
       logger.warn({ err: err.message }, 'LinkedIn sync tick failed');
     }
   };
-  const LINKEDIN_SYNC_MS = 5 * 60 * 1000;
   if (env.LINKEDIN_SYNC_ENABLED) {
     setTimeout(runLinkedInSync, 45_000); // first pass a bit after boot
-    setInterval(runLinkedInSync, LINKEDIN_SYNC_MS);
+    setInterval(runLinkedInSync, env.LINKEDIN_SYNC_TICK_MS);
   } else {
     logger.warn(
       'LinkedIn sync DISABLED (LINKEDIN_SYNC_ENABLED=false) — no browser will open on a timer, but accepted invites / replies will NOT be detected and stale invites will NOT be withdrawn.',
@@ -627,29 +686,85 @@ async function bootstrap() {
   // only enqueues. NEVER touches a LinkedIn account session — reads Google only.
   const leadScraper = app.get(LeadScraperService);
   const leadsService = app.get(LeadsService);
+  const scrapeCursor = app.get(ScrapeCursorService);
+  const scrapeJobs = app.get(ScrapeJobsService);
   const leadScrapeWorker = new Worker(
     'lead-scrape',
     async (job: Job) => {
-      const { workspaceId, titles, location, maxResults } = job.data;
-      logger.info({ titles, location, maxResults }, 'Processing lead-scrape job');
-      const leads = await leadScraper.search({ titles, location, maxResults });
-      if (!leads.length) {
-        logger.warn({ titles, location }, 'lead-scrape: no profiles found');
-        return;
+      const { workspaceId, titles, location, maxResults, startFresh, scrapeJobId } = job.data;
+      try {
+        // Cursor: where did the last run for this exact search stop? Start there so
+        // a rerun sweeps NEW pages instead of re-fetching page 1 (import-dedup would
+        // otherwise drop it all → "0 new"). A startFresh job re-sweeps from page 0.
+        const qk = scrapeCursor.queryKey(titles, location);
+        if (startFresh) await scrapeCursor.reset(workspaceId, qk);
+        const startPage = startFresh ? 0 : await scrapeCursor.nextPage(workspaceId, qk);
+        const pages = Math.min(Math.max(Math.ceil((maxResults || 15) / 8), 1), 10);
+        logger.info({ titles, location, maxResults, startPage, pages }, 'Processing lead-scrape job');
+        await scrapeJobs.update(workspaceId, scrapeJobId, { status: 'running', stage: 'searching Google' });
+
+        // Offload the browser scrape to the remote service when configured (VPS +
+        // Xvfb), else scrape locally in-process. Remote failures fall back to local
+        // so a service blip never drops the job.
+        let leads: any[];
+        const req = { titles, location, maxResults, startPage, pages };
+        if (env.SCRAPER_SERVICE_URL) {
+          try {
+            leads = await scrapeViaService(env.SCRAPER_SERVICE_URL, env.SCRAPER_SERVICE_TOKEN, req);
+            logger.info({ count: leads.length }, 'lead-scrape: got leads from scraper service');
+          } catch (err: any) {
+            logger.warn({ err: err?.message || err }, 'scraper service failed — scraping locally');
+            leads = await leadScraper.search(req);
+          }
+        } else {
+          leads = await leadScraper.search(req);
+        }
+
+        // Only advance the cursor when the run actually produced leads — a fully
+        // blocked/empty run keeps the same page window for the next attempt.
+        if (leads.length) await scrapeCursor.advance(workspaceId, qk, pages);
+
+        if (!leads.length) {
+          logger.warn({ titles, location, startPage }, 'lead-scrape: no profiles found');
+          await scrapeJobs.update(workspaceId, scrapeJobId, {
+            status: 'blocked',
+            stage: 'done',
+            reason: 'no_results',
+            counts: { valid: 0, imported: 0 },
+          });
+          return;
+        }
+
+        await scrapeJobs.update(workspaceId, scrapeJobId, {
+          stage: 'importing',
+          counts: { valid: leads.length },
+        });
+        const rows = leads.map((l) => ({
+          name: l.name,
+          role: l.title,
+          company: l.company,
+          location: l.location,
+          linkedinUrl: l.linkedinUrl,
+        }));
+        const res = await leadsService.importLeads(
+          workspaceId,
+          `google-scrape:${titles.join('/')}`,
+          rows,
+          scrapeJobId,
+        );
+        logger.info({ scraped: leads.length, imported: res.count }, 'lead-scrape: leads imported');
+        await scrapeJobs.update(workspaceId, scrapeJobId, {
+          status: 'done',
+          stage: 'done',
+          counts: { valid: leads.length, imported: res.count },
+        });
+      } catch (err: any) {
+        await scrapeJobs.update(workspaceId, scrapeJobId, {
+          status: 'failed',
+          reason: String(err?.message || err).slice(0, 200),
+        });
+        throw err;
       }
-      const rows = leads.map((l) => ({
-        name: l.name,
-        role: l.title,
-        company: l.company,
-        location: l.location,
-        linkedinUrl: l.linkedinUrl,
-      }));
-      const res = await leadsService.importLeads(
-        workspaceId,
-        `google-scrape:${titles.join('/')}`,
-        rows,
-      );
-      logger.info({ scraped: leads.length, imported: res.count }, 'lead-scrape: leads imported');
     },
     { connection: connection as any, concurrency: 1 },
   );
@@ -659,7 +774,7 @@ async function bootstrap() {
 
   logger.info(
     { schedulerTickMs: env.SCHEDULER_TICK_MS },
-    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, linkedin-sync, email-warmup, lead-scrape',
+    'Worker fleet ready: linkedin-actions, linkedin-login, email-send, gmail-inbox-sync, scheduler, campaign-runner, linkedin-sync, email-warmup, lead-scrape',
   );
 }
 

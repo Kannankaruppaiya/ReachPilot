@@ -4,6 +4,8 @@
 import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY } from "@/constants"
 import type {
   CampaignRow,
+  CampaignBuilderNode,
+  CampaignDetailData,
   ConnectionsData,
   DailyStat,
   DashboardData,
@@ -11,6 +13,7 @@ import type {
   IntegrationsState,
   InboxThread,
   LeadRow,
+  ScrapeJob,
   LinkedInAccountState,
   Me,
   NotificationItem,
@@ -114,6 +117,9 @@ async function req<T>(url: string, body?: unknown, retried = false, method?: str
 /** PATCH helper (the backend exposes PATCH for campaigns/leads/notifications). */
 const patch = <T>(url: string, body: unknown) => req<T>(url, body, false, "PATCH")
 
+/** DELETE helper. */
+const del = <T>(url: string) => req<T>(url, undefined, false, "DELETE")
+
 export const api = {
   // Auth
   signup: async (email: string, password: string, fullName: string) => {
@@ -211,19 +217,63 @@ export const api = {
   getAnalyticsDaily: () => req<DailyStat[]>("/api/analytics/daily"),
   getAnalyticsHourly: () => req<HourlyStat[]>("/api/analytics/hourly"),
   getChannels: () => req<{ channel: string; replies: number }[]>("/api/analytics/channels"),
-  getLeads: () => req<LeadRow[]>("/api/leads"),
+  // No args → every lead (Campaigns needs the full list). With params → one
+  // filtered/sorted page (the Leads screen paginates large sets this way).
+  getLeads: (params?: {
+    limit?: number
+    offset?: number
+    q?: string
+    status?: string
+    source?: string
+    sort?: "recent" | "score"
+    scrapeJobId?: string
+  }) => {
+    const entries = Object.entries(params ?? {}).filter(
+      ([, v]) => v !== undefined && v !== null && v !== "",
+    )
+    const qs = entries.length
+      ? "?" + new URLSearchParams(entries.map(([k, v]) => [k, String(v)])).toString()
+      : ""
+    return req<LeadRow[]>(`/api/leads${qs}`)
+  },
   // Free local scrape: Google → LinkedIn profiles by title + location. Enqueues
-  // a worker job; scraped leads appear in the table shortly after.
-  scrapeLeads: (payload: { titles: string[]; location?: string; maxResults?: number }) =>
-    req<{ ok: true; queued: boolean; titles: string[]; location?: string; maxResults: number }>(
+  // a worker job; scraped leads appear in the table shortly after. startFresh
+  // re-sweeps a search from page 0 instead of continuing the rerun cursor.
+  scrapeLeads: (payload: {
+    titles: string[]
+    location?: string
+    maxResults?: number
+    startFresh?: boolean
+  }) =>
+    req<{ ok: true; queued: boolean; scrapeJobId: string; titles: string[]; location?: string; maxResults: number }>(
       "/api/leads/scrape",
       payload,
     ),
+  // Scrape-run history + live status (powers the Leads history panel + progress).
+  getScrapeJobs: () => req<ScrapeJob[]>("/api/leads/scrape-jobs"),
+  getScrapeJob: (id: string) => req<ScrapeJob | null>(`/api/leads/scrape-jobs/${id}`),
   getCampaigns: () => req<CampaignRow[]>("/api/campaigns"),
+  getCampaign: (id: string) => req<CampaignDetailData>(`/api/campaigns/${id}`),
   getTemplates: () => req<TemplateRow[]>("/api/templates"),
-  updateCampaign: (id: string, body: { status?: string; dailyCap?: number }) =>
-    patch<CampaignRow>(`/api/campaigns/${id}`, body),
-  createCampaign: (body: { name: string; dailyCap: number }) => req<CampaignRow>("/api/campaigns", body),
+  updateCampaign: (
+    id: string,
+    body: { status?: string; dailyCap?: number; name?: string; steps?: CampaignBuilderNode[] },
+  ) => patch<CampaignRow>(`/api/campaigns/${id}`, body),
+  deleteCampaign: (id: string) => del<{ deleted: boolean }>(`/api/campaigns/${id}`),
+  setEnrollment: (id: string, enrollmentId: string, action: "pause" | "resume") =>
+    patch<{ ok: true }>(`/api/campaigns/${id}/enrollments/${enrollmentId}`, { action }),
+  removeEnrollment: (id: string, enrollmentId: string) =>
+    del<{ removed: boolean }>(`/api/campaigns/${id}/enrollments/${enrollmentId}`),
+  createCampaign: (body: {
+    name: string
+    dailyCap: number
+    steps?: CampaignBuilderNode[]
+    leadIds?: string[]
+    launch?: boolean
+  }) => req<CampaignRow>("/api/campaigns", body),
+  enrollLeads: (id: string, leadIds: string[]) =>
+    req<{ enrolled: number }>(`/api/campaigns/${id}/enroll`, { leadIds }),
+  launchCampaign: (id: string) => req<CampaignDetailData>(`/api/campaigns/${id}/launch`, {}),
 
   // Inbox
   getThreads: () => req<InboxThread[]>("/api/threads"),

@@ -20,6 +20,7 @@ export interface DatabaseSchema {
   linkedin_accounts: any;
   email_accounts: any;
   leads: any;
+  scrape_jobs: any;
   blacklist: any;
   templates: any;
   campaigns: any;

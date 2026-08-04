@@ -25,6 +25,28 @@ const envSchema = z.object({
   // default — headless is easily bot-flagged by Google.
   SCRAPER_PROFILE_DIR: z.string().optional(),
   SCRAPER_HEADLESS: z.coerce.boolean().default(false),
+  // Lead-scraper engine: 'legacy' (single-page patchright), 'crawlee' (Crawlee
+  // PlaywrightCrawler — RequestQueue pagination + dedup + session rotation), or
+  // 'multi' (MultiEngineFetcher — rotates across several search engines with
+  // per-engine block-aware cooldown, so one engine's CAPTCHA can't kill a run).
+  // Default legacy until the newer engines reach parity in production.
+  SCRAPER_ENGINE: z.enum(['legacy', 'crawlee', 'multi']).default('legacy'),
+  // Multi-engine order (comma list). The fetcher tries them left-to-right,
+  // skipping any currently cooling down, and aggregates results across all.
+  // Supported: google, bing, duckduckgo, brave, mojeek.
+  SCRAPER_ENGINES: z.string().default('google,bing,duckduckgo,brave'),
+  // How long (ms) to stop querying an engine after it returns a block/CAPTCHA.
+  SCRAPER_ENGINE_COOLDOWN_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
+
+  // Standalone lead-scraper microservice (src/scraper-service.ts). Lets the
+  // browser scrape run on a cheap Linux VPS (headful Chrome under Xvfb) instead
+  // of an always-on PC — the service holds no DB/Redis and returns leads as JSON.
+  //   • On the VPS: `npm run start:scraper` (uses SCRAPER_SERVICE_PORT + _TOKEN).
+  //   • On the main worker: set SCRAPER_SERVICE_URL to offload scraping to that
+  //     VPS; leave it empty to scrape locally in-process (the original path).
+  SCRAPER_SERVICE_PORT: z.coerce.number().int().positive().default(4100),
+  SCRAPER_SERVICE_TOKEN: z.string().default(''),
+  SCRAPER_SERVICE_URL: z.string().default(''),
 
   AUTH_BYPASS: z
     .string()
@@ -59,6 +81,14 @@ const envSchema = z.object({
   // How often the worker drains due `scheduled` jobs into the queues (ms).
   SCHEDULER_TICK_MS: z.coerce.number().int().positive().default(30_000),
 
+  // Campaign runner: drives enrollments through their campaign_steps sequence.
+  // Off means enrolled leads never advance past the step the enroll kicked off.
+  CAMPAIGN_RUNNER_ENABLED: z
+    .string()
+    .transform((v) => v !== 'false' && v !== '0')
+    .default('true'),
+  CAMPAIGN_RUNNER_TICK_MS: z.coerce.number().int().positive().default(60_000),
+
   // ── Background loop switches ────────────────────────────────────────────
   // The LinkedIn sync opens a REAL browser every few minutes (reads the
   // connections list + messaging, and withdraws stale invites). That's the
@@ -76,6 +106,11 @@ const envSchema = z.object({
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
   WITHDRAW_AFTER_DAYS: z.coerce.number().int().positive().default(21),
+  // How often the LinkedIn sync opens a browser to read accepted invites / replies.
+  // Each tick opens a REAL browser per sendable account, so keep it infrequent — a
+  // long interval is safer (fewer automated sessions) and multi-day sequences don't
+  // need minute-level granularity. Default 45 min (was a hardcoded 5 min).
+  LINKEDIN_SYNC_TICK_MS: z.coerce.number().int().positive().default(45 * 60 * 1000),
   // Gmail inbox polling (API only — opens no browser).
   GMAIL_SYNC_ENABLED: z
     .string()

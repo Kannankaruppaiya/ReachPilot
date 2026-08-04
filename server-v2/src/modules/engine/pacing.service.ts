@@ -33,6 +33,7 @@ export class PacingService {
     kind: 'linkedin' | 'email',
     workspaceId?: string,
     isInvite = true,
+    campaignId?: string | null,
   ): Promise<{ allowed: boolean; nextScheduledAt?: string }> {
     // No account linked → nothing to pace against (defensive; an empty string
     // would otherwise be sent to Postgres as an invalid uuid).
@@ -44,6 +45,34 @@ export class PacingService {
       workspaceId ? withWorkspace(workspaceId, fn) : fn(getDb());
 
     const now = new Date();
+
+    // ---- Per-campaign daily cap ----------------------------------------------
+    // A job that belongs to a campaign is ALSO capped by that campaign's own
+    // daily_cap (on top of the account safety limits). Campaign-scoped: Auto
+    // Connect / Auto Mail jobs carry no campaign_id, so they're never affected.
+    // Uses a UTC calendar day so a mixed LinkedIn+email campaign shares one count.
+    let campaignCap = 0;
+    const campDateIso = now.toLocaleDateString('en-US');
+    if (campaignId) {
+      const camp = await read((db) =>
+        db.selectFrom('campaigns').select('daily_cap').where('id', '=', campaignId).executeTakeFirst(),
+      ).catch(() => undefined);
+      campaignCap = Number(camp?.daily_cap || 0);
+    }
+    // Consume + check the campaign slot AFTER the account gates pass, then roll
+    // it back if an account gate blocks — see the helper used in each branch.
+    const takeCampaignSlot = async (accountDailyKey: string, deferAt: string) => {
+      if (!campaignId || campaignCap <= 0) return null;
+      const campKey = `pacing:campaign:${campaignId}:date:${campDateIso}:daily`;
+      const n = await redis.incr(campKey);
+      await redis.expire(campKey, 86400 * 2);
+      if (n > campaignCap) {
+        await redis.decr(campKey); // over the campaign cap
+        await redis.decr(accountDailyKey); // give the account slot back
+        return { allowed: false as const, nextScheduledAt: deferAt };
+      }
+      return null;
+    };
 
     if (kind === 'linkedin') {
       const account = await read((db) =>
@@ -137,6 +166,13 @@ export class PacingService {
       // Passed the daily gate → stamp the action time for spacing (2-day TTL).
       await redis.set(lastKey, String(now.getTime()), 'EX', 86400 * 2);
 
+      // Per-campaign daily cap (rolls back the account slot if over).
+      const campBlocked = await takeCampaignSlot(
+        dailyKey,
+        this.localWallClockToUtc(tz, hoursStart, 1),
+      );
+      if (campBlocked) return campBlocked;
+
       // Weekly cap applies to INVITES only — profile views, follows, likes and
       // endorsements are paced by the daily counter above but don't burn the
       // weekly connection-request allowance.
@@ -188,6 +224,12 @@ export class PacingService {
         tomorrow.setHours(9, 0, 0, 0);
         return { allowed: false, nextScheduledAt: tomorrow.toISOString() };
       }
+
+      // Per-campaign daily cap (rolls back the account slot if over).
+      const tomorrow9 = new Date(now.getTime() + 86400000);
+      tomorrow9.setHours(9, 0, 0, 0);
+      const campBlocked = await takeCampaignSlot(dailyKey, tomorrow9.toISOString());
+      if (campBlocked) return campBlocked;
     }
 
     return { allowed: true };
@@ -210,10 +252,24 @@ export class PacingService {
    * daily quota twice. Best-effort; safe to call more than once (decr floors
    * are re-corrected on the next tick).
    */
-  async release(accountId: string, kind: 'linkedin' | 'email', workspaceId?: string, isInvite = true): Promise<void> {
+  async release(
+    accountId: string,
+    kind: 'linkedin' | 'email',
+    workspaceId?: string,
+    isInvite = true,
+    campaignId?: string | null,
+  ): Promise<void> {
     if (!accountId) return;
     const redis = getRedis();
     const now = new Date();
+
+    // Give back the per-campaign daily slot too, if this was a campaign send.
+    if (campaignId) {
+      const campDateIso = now.toLocaleDateString('en-US');
+      await redis
+        .decr(`pacing:campaign:${campaignId}:date:${campDateIso}:daily`)
+        .catch(() => undefined);
+    }
 
     if (kind === 'linkedin') {
       const read = <T>(fn: (db: Kysely<DatabaseSchema>) => Promise<T>): Promise<T> =>

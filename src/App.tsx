@@ -36,7 +36,7 @@ import { Analytics, Integrations, Sequences, Settings } from "./screens/Misc"
 import { AutoSend } from "./screens/AutoSend"
 import { Connections } from "./screens/Connections"
 import { Assistant } from "./screens/Assistant"
-import type { CampaignRow as Campaign } from "@/types"
+import type { CampaignRow as Campaign, CampaignDetailData } from "@/types"
 
 type NavKey =
   | "dashboard"
@@ -73,6 +73,7 @@ export default function App() {
   const [view, setView] = useState<NavKey>("dashboard")
   const [campaignView, setCampaignView] = useState<"list" | "builder" | "detail">("list")
   const [activeCampaign, setActiveCampaign] = useState<Campaign | null>(null)
+  const [editData, setEditData] = useState<CampaignDetailData | null>(null)
   const [mobileNav, setMobileNav] = useState(false)
   const [me, setMe] = useState<Me | null>(null)
   const [account, setAccount] = useState<LinkedInAccountState | null>(null)
@@ -289,14 +290,39 @@ export default function App() {
                         setActiveCampaign(c)
                         setCampaignView("detail")
                       }}
-                      onNew={() => setCampaignView("builder")}
+                      onNew={() => {
+                        setEditData(null)
+                        setCampaignView("builder")
+                      }}
                     />
                   )}
                   {view === "campaigns" && campaignView === "builder" && (
-                    <CampaignBuilder onDone={() => setCampaignView("list")} />
+                    <CampaignBuilder
+                      edit={
+                        editData
+                          ? {
+                              id: editData.id,
+                              name: editData.name,
+                              dailyCap: editData.dailyCap ?? 15,
+                              nodes: editData.builderNodes,
+                            }
+                          : undefined
+                      }
+                      onDone={() => {
+                        setEditData(null)
+                        setCampaignView("list")
+                      }}
+                    />
                   )}
                   {view === "campaigns" && campaignView === "detail" && activeCampaign && (
-                    <CampaignDetail campaign={activeCampaign} onBack={() => setCampaignView("list")} />
+                    <CampaignDetail
+                      campaign={activeCampaign}
+                      onBack={() => setCampaignView("list")}
+                      onEdit={(d) => {
+                        setEditData(d)
+                        setCampaignView("builder")
+                      }}
+                    />
                   )}
                   {view === "autoconnect" && <AutoSend mode="linkedin" account={account} />}
                   {view === "connections" && <Connections />}

@@ -108,8 +108,23 @@ export type LeadRow = {
   status: string
   source: string | null
   tags: string[]
+  fitScore: number | null
   lastActivity: string | null
+  scrapeJobId: string | null
   createdAt: string
+}
+
+export type ScrapeJob = {
+  id: string
+  titles: string[]
+  location: string | null
+  maxResults: number
+  status: "queued" | "running" | "done" | "blocked" | "failed" | string
+  stage: string | null
+  counts: { raw?: number; valid?: number; imported?: number }
+  reason: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 export type CampaignRow = {
@@ -120,7 +135,47 @@ export type CampaignRow = {
   sent: number
   acceptedPct: number
   repliedPct: number
+  dailyCap?: number
   trend: number[]
+  createdAt?: string
+}
+
+/** One builder node the client sends when creating a campaign sequence. */
+export type CampaignBuilderNode = {
+  kind: "invite" | "message" | "email" | "view" | "follow" | "wait" | "branch"
+  days?: number
+  body?: string
+  subject?: string
+  condition?: string
+  elseAction?: { kind: "email" | "message"; body?: string; subject?: string }
+}
+
+/** A persisted step as returned in the campaign detail. */
+export type CampaignStep = {
+  id: string
+  kind: "action" | "condition"
+  action: string | null
+  condition: string | null
+  delayHours: number
+  body: string
+  subject: string
+}
+
+export type CampaignEnrollment = {
+  enrollmentId: string
+  enrollmentStatus: string
+  leadId: string
+  name: string
+  title: string
+  company: string
+  leadStatus: string
+  nextRunAt: string | null
+}
+
+export type CampaignDetailData = CampaignRow & {
+  steps: CampaignStep[]
+  builderNodes: CampaignBuilderNode[]
+  enrollments: CampaignEnrollment[]
 }
 
 export type TemplateRow = {
