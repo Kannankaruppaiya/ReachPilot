@@ -3,6 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { getEnv } from '@/config/env';
 import { AiService, ExtractedProfile } from '@/modules/ai/ai.service';
+import { CrawleeGoogleFetcher, SerpRaw } from './engine/crawlee-google-fetcher';
+import { MultiEngineFetcher } from './engine/multi-engine-fetcher';
 
 /** A single normalized profile parsed from a public search result. */
 export interface ScrapedLead {
@@ -19,6 +21,10 @@ export interface SearchOptions {
   titles: string[];
   location?: string;
   maxResults?: number;
+  /** First Google result page to fetch (the cursor). Default 0. */
+  startPage?: number;
+  /** How many pages to fetch this run. Default derived from maxResults. */
+  pages?: number;
 }
 
 /**
@@ -43,6 +49,8 @@ export interface SearchOptions {
 @Injectable()
 export class LeadScraperService {
   private readonly logger = new Logger(LeadScraperService.name);
+  private crawleeFetcher?: CrawleeGoogleFetcher;
+  private multiFetcher?: MultiEngineFetcher;
 
   constructor(private readonly ai: AiService) {}
 
@@ -234,27 +242,75 @@ export class LeadScraperService {
     const env = getEnv();
     const maxResults = Math.min(Math.max(opts.maxResults ?? 15, 1), 100);
     const query = this.buildQuery(opts.titles, opts.location);
-    this.logger.log(`Scraping Google for "${query}" (target ${maxResults})`);
+    // Cursor-driven pagination: start at opts.startPage and fetch `pages` pages so
+    // a rerun (given a later startPage) sweeps NEW results, not the same page 1.
+    const startPage = Math.max(opts.startPage ?? 0, 0);
+    const pages = Math.min(Math.max(opts.pages ?? Math.ceil(maxResults / 8), 1), 10);
+    this.logger.log(
+      `Scraping Google for "${query}" (target ${maxResults}, engine=${env.SCRAPER_ENGINE}, pages ${startPage}..${startPage + pages - 1})`,
+    );
 
+    // Fetch is pluggable; every engine returns the same raw SERP rows and feeds
+    // the one extract + validate pipeline below.
+    let raw: SerpRaw[];
+    if (env.SCRAPER_ENGINE === 'multi') {
+      raw = await this.fetchRawMulti(query, startPage, pages, maxResults);
+    } else if (env.SCRAPER_ENGINE === 'crawlee') {
+      raw = await this.fetchRawCrawlee(query, startPage, pages);
+    } else {
+      raw = await this.fetchRawLegacy(query, startPage);
+    }
+
+    return this.assembleLeads(raw, opts, maxResults);
+  }
+
+  /** Crawlee engine: multi-page fetch with dedup + session rotation (lazy init). */
+  private fetchRawCrawlee(query: string, startPage: number, pages: number): Promise<SerpRaw[]> {
+    this.crawleeFetcher ??= new CrawleeGoogleFetcher();
+    return this.crawleeFetcher.fetchRaw({ query, startPage, pages });
+  }
+
+  /**
+   * Multi-engine: rotate across search engines with per-engine block cooldown so
+   * one CAPTCHA can't kill the run, and aggregate results across all of them.
+   * `target` overshoots maxResults to absorb dedup/validation loss downstream.
+   */
+  private fetchRawMulti(
+    query: string,
+    startPage: number,
+    pages: number,
+    maxResults: number,
+  ): Promise<SerpRaw[]> {
+    this.multiFetcher ??= new MultiEngineFetcher();
+    return this.multiFetcher.fetchRaw({
+      query,
+      startPage,
+      pages: Math.min(pages, 6),
+      target: Math.min(maxResults * 2, 120),
+    });
+  }
+
+  /** Legacy engine: original patchright fetch, honoring the page offset. */
+  private async fetchRawLegacy(query: string, startPage: number): Promise<SerpRaw[]> {
+    const env = getEnv();
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { chromium } = require('patchright');
     const profileDir =
       env.SCRAPER_PROFILE_DIR || path.join(os.tmpdir(), 'reachpilot-scraper-profile');
 
     let ctx: any;
-    const candidates: (ScrapedLead & { sourceText: string })[] = [];
     try {
       ctx = await this.launch(chromium, profileDir);
       const page = ctx.pages()[0] || (await ctx.newPage());
 
-      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=20&hl=en&gl=in`;
+      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=20&hl=en&gl=in&start=${startPage * 20}`;
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(3500);
       await this.dismissConsent(page);
 
       // Pull title / href / snippet from each result whose link is a profile. The
       // result <a> is the only linkedin/in anchor that also wraps an <h3>.
-      const raw: { title: string; href: string; snippet: string }[] = await page
+      return await page
         .evaluate(() => {
           const items: { title: string; href: string; snippet: string }[] = [];
           document.querySelectorAll('a').forEach((a) => {
@@ -264,59 +320,64 @@ export class LeadScraperService {
             if (!h3) return;
             const container =
               a.closest('div.MjjYud, div.g, div.tF2Cxc') || a.parentElement?.parentElement;
-            const sn = container?.querySelector(
-              'div.VwiC3b, div[data-sncf], .VwiC3b, span.aCOpRe',
-            );
-            items.push({
-              title: h3.textContent || '',
-              href,
-              snippet: sn?.textContent || '',
-            });
+            const sn = container?.querySelector('div.VwiC3b, div[data-sncf], .VwiC3b, span.aCOpRe');
+            items.push({ title: h3.textContent || '', href, snippet: sn?.textContent || '' });
           });
           return items;
         })
-        .catch(() => [] as any[]);
-
-      // Clean the messy SERP snippets with one batched Gemini call, then merge
-      // PER-URL with the regex parse — a partial/failed AI extraction never loses
-      // leads (missed URLs fall back to regex). Both feed the validation gate.
-      const extracted = await this.ai.extractProfiles(
-        raw.map((r) => ({ title: r.title, snippet: r.snippet, url: r.href })),
-      );
-      const aiBySlug = new Map<string, ExtractedProfile>();
-      for (const p of extracted || []) {
-        const slug = this.slugOf(p.linkedinUrl);
-        if (slug && !aiBySlug.has(slug)) aiBySlug.set(slug, p);
-      }
-      for (const r of raw) {
-        const cleanUrl = this.cleanProfileUrl(r.href);
-        if (!cleanUrl) continue;
-        const sourceText = `${r.title} ${r.snippet}`;
-        const ai = aiBySlug.get(this.slugOf(cleanUrl));
-        if (ai) {
-          candidates.push({
-            name: ai.name,
-            firstName: '',
-            title: ai.title,
-            company: ai.company,
-            location: ai.location,
-            linkedinUrl: cleanUrl,
-            snippet: r.snippet.trim().slice(0, 300),
-            sourceText,
-          });
-        } else {
-          const reg = this.parseResult(r.title, r.snippet, r.href);
-          if (reg) candidates.push({ ...reg, sourceText });
-        }
-      }
-      this.logger.log(
-        `  ${candidates.length} candidates (${aiBySlug.size} AI-clean, rest regex) from ${raw.length} results`,
-      );
+        .catch(() => [] as SerpRaw[]);
     } catch (err: any) {
-      this.logger.warn(`Scrape error (returning partial): ${err?.message || err}`);
+      this.logger.warn(`Legacy scrape error (returning partial): ${err?.message || err}`);
+      return [];
     } finally {
       await ctx?.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * Engine-agnostic: turn raw SERP rows into clean leads. One batched Gemini
+   * clean-extract, merged PER-URL with the regex parse (a partial/failed AI
+   * extraction never loses leads), then the anti-false validation gate.
+   */
+  private async assembleLeads(
+    raw: SerpRaw[],
+    opts: SearchOptions,
+    maxResults: number,
+  ): Promise<ScrapedLead[]> {
+    const candidates: (ScrapedLead & { sourceText: string })[] = [];
+
+    const extracted = await this.ai.extractProfiles(
+      raw.map((r) => ({ title: r.title, snippet: r.snippet, url: r.href })),
+    );
+    const aiBySlug = new Map<string, ExtractedProfile>();
+    for (const p of extracted || []) {
+      const slug = this.slugOf(p.linkedinUrl);
+      if (slug && !aiBySlug.has(slug)) aiBySlug.set(slug, p);
+    }
+    for (const r of raw) {
+      const cleanUrl = this.cleanProfileUrl(r.href);
+      if (!cleanUrl) continue;
+      const sourceText = `${r.title} ${r.snippet}`;
+      const ai = aiBySlug.get(this.slugOf(cleanUrl));
+      if (ai) {
+        candidates.push({
+          name: ai.name,
+          firstName: '',
+          title: ai.title,
+          company: ai.company,
+          location: ai.location,
+          linkedinUrl: cleanUrl,
+          snippet: r.snippet.trim().slice(0, 300),
+          sourceText,
+        });
+      } else {
+        const reg = this.parseResult(r.title, r.snippet, r.href);
+        if (reg) candidates.push({ ...reg, sourceText });
+      }
+    }
+    this.logger.log(
+      `  ${candidates.length} candidates (${aiBySlug.size} AI-clean, rest regex) from ${raw.length} results`,
+    );
 
     const region = opts.location?.trim() || '';
     const clean = this.validateClean(candidates, opts);

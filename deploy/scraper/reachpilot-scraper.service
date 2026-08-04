@@ -1,0 +1,18 @@
+[Unit]
+Description=ReachPilot lead-scraper service (headful Chrome under Xvfb)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/reachpilot/server-v2
+Environment=DISPLAY=:99
+# xvfb-run gives Chrome a virtual screen -> fully headful (bot-detection passes),
+# no physical monitor required.
+ExecStart=/usr/bin/xvfb-run -a --server-args=-screen 0 1920x1080x24 npm run start:scraper
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

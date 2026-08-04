@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { LeadsModule } from '@/modules/leads/leads.module';
 import { AiModule } from '@/modules/ai/ai.module';
 import { LeadScraperService } from './lead-scraper.service';
+import { ScrapeCursorService } from './scrape-cursor.service';
+import { ScrapeJobsService } from './scrape-jobs.service';
 import { ScrapingController } from './scraping.controller';
 
 /**
@@ -13,7 +15,7 @@ import { ScrapingController } from './scraping.controller';
 @Module({
   imports: [LeadsModule, AiModule],
   controllers: [ScrapingController],
-  providers: [LeadScraperService],
-  exports: [LeadScraperService],
+  providers: [LeadScraperService, ScrapeCursorService, ScrapeJobsService],
+  exports: [LeadScraperService, ScrapeCursorService, ScrapeJobsService],
 })
 export class ScrapingModule {}

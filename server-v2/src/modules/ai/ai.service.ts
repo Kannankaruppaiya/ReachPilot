@@ -130,6 +130,34 @@ export class AiService {
   async extractProfiles(
     raw: { title: string; snippet: string; url: string }[],
   ): Promise<ExtractedProfile[] | null> {
+    if (!getEnv().GEMINI_API_KEY || !raw.length) return null;
+
+    // Chunked: a single call with ~100 results overruns the token budget and
+    // returns NOTHING (whole batch silently falls back to regex — seen at scale).
+    // Small batches, a few in parallel, keep extraction clean at volume.
+    const CHUNK = 20;
+    const CONCURRENCY = 3;
+    const chunks: { title: string; snippet: string; url: string }[][] = [];
+    for (let i = 0; i < raw.length; i += CHUNK) chunks.push(raw.slice(i, i + CHUNK));
+
+    const out: ExtractedProfile[] = [];
+    let anySuccess = false;
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const results = await Promise.all(chunks.slice(i, i + CONCURRENCY).map((c) => this.extractChunk(c)));
+      for (const r of results) {
+        if (r) {
+          anySuccess = true;
+          out.push(...r);
+        }
+      }
+    }
+    return anySuccess ? out : null;
+  }
+
+  /** One batched Gemini JSON-mode extraction call (<= ~20 results). */
+  private async extractChunk(
+    raw: { title: string; snippet: string; url: string }[],
+  ): Promise<ExtractedProfile[] | null> {
     const env = getEnv();
     if (!env.GEMINI_API_KEY || !raw.length) return null;
     const url = `${GEMINI_BASE}/${encodeURIComponent(env.GEMINI_MODEL)}:generateContent?key=${env.GEMINI_API_KEY}`;
