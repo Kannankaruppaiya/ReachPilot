@@ -825,15 +825,26 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
 
         // Note-cap: free accounts get only a handful of PERSONALIZED-note invites
-        // (per month). Once spent, the composer shows a limit banner ("N
-        // personalized invitations remaining for this month") — on free tier it
+        // (per month). Once spent, the composer shows a limit banner — on free tier it
         // STILL renders a usable note field alongside it, and clicking Send with a
         // note is then rejected. Signal `note_cap` so the caller (connect-with-
         // fallback) can retry this lead WITHOUT a note — note-less requests keep
         // working up to the much larger weekly cap.
+        //
+        // CRITICAL: distinguish "notes AVAILABLE" from "note quota EXHAUSTED". While
+        // notes REMAIN, LinkedIn shows "<N> personalized invitations remaining/left
+        // this month" — that text contains "personalized invitation", so the old bare
+        // `personalized invitation` alternative false-matched the POSITIVE banner and
+        // sent every invite note-less even when notes were left (the reported "note not
+        // deducted" bug). Fix: match ONLY genuine exhaustion phrases here, and read the
+        // remaining-count separately below — a count > 0 is authoritative "available".
+        const remainingBanner = modal
+          .getByText(/personalized invit\w*\s+(remaining|left)/i)
+          .filter({ visible: true })
+          .first();
         const noteCapText = modal
           .getByText(
-            /reached (the|your).{0,30}(personalized|note)|personalized invitation|upgrade.{0,30}(add a note|personalize|send a note|note)|premium.{0,20}(note|personalize)|note.{0,15}is a premium/i,
+            /reached (the|your).{0,30}(personalized|note)|(0|no)\s+(free\s+)?personalized invit\w*|you.?ve used all|premium.{0,20}(note|personalize)|note.{0,15}is a premium|upgrade.{0,30}(add a note|personalize|send a note|note)/i,
           )
           .filter({ visible: true });
         const noteBox = (await resolveFirst(modalScope, SELECTORS.noteBox, 'noteBox', this.logger))
@@ -852,10 +863,26 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
           .catch(() => undefined);
         await sleep(rnd(350, 650));
 
-        const noteCap = await noteCapText.count().catch(() => 0);
-        if (noteCap) {
-          this.logger.warn('Personalized-note quota exhausted (note-cap) — signalling fallback to a note-less connect');
+        // A visible "N ... remaining/left" count is the authoritative signal: N>0 means
+        // notes ARE available, so never treat it as a cap (type the note). Only cap when
+        // the count is explicitly 0, or there is no count but a true exhaustion phrase.
+        let remaining: number | null = null;
+        if (await remainingBanner.count().catch(() => 0)) {
+          const bannerText = (await remainingBanner.innerText().catch(() => '')) || '';
+          const m = bannerText.match(/(\d+)\s+(?:free\s+)?personalized invit\w*\s+(?:remaining|left)/i);
+          if (m) remaining = parseInt(m[1], 10);
+        }
+        const capPhrase = await noteCapText.count().catch(() => 0);
+        const capped = remaining === 0 || (remaining === null && !!capPhrase);
+        if (capped) {
+          this.logger.warn(
+            { remaining },
+            'Personalized-note quota exhausted (note-cap) — signalling fallback to a note-less connect',
+          );
           return { status: 'limit_reached', error: 'note_cap' };
+        }
+        if (remaining !== null) {
+          this.logger.log({ remaining }, `Personalized-note quota available (${remaining} left) — sending WITH a note`);
         }
 
         const noteReady = await noteBox.isVisible().catch(() => false);
