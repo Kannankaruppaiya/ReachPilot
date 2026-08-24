@@ -49,6 +49,14 @@ GUC via `SET LOCAL`). This bit us repeatedly.
 ## Drivers (swappable via env)
 `src/modules/drivers/` — chosen by `LINKEDIN_DRIVER` / `EMAIL_DRIVER` env (tokens
 in `driver.tokens.ts`, wired in `drivers.module.ts`).
+- 🔴 **PRODUCTION RUNS `LINKEDIN_DRIVER=remote`** — the Oracle VMs never launch a
+  browser. `RemoteAgentDriver` hands each action over Redis to the user's DESKTOP
+  Electron app, which runs the real `PlaywrightLinkedInDriver` on their own IP.
+  `desktop/agent/build.js` esbuild-bundles **this same server source file** into
+  the packaged `app.asar`. So a driver change ships only by rebuilding and
+  reinstalling the desktop app — scp + `pm2 restart` alone changes nothing at
+  runtime, and the gitignored bundle can sit weeks behind the source. See
+  `DEPLOYMENT.md`.
 - **GmailDriver** (`gmail.driver.ts`) — real Gmail API send (OAuth). Rich MIME:
   From display name, Reply-To, Message-ID, List-Unsubscribe, multipart HTML,
   unsubscribe footer (deliverability). `EMAIL_DRIVER=gmail`.
@@ -123,7 +131,7 @@ Verified by `scripts/verify-safety.ts`.
   deterministically per account/day (`seed01`), so the count varies day-to-day
   instead of a robotic constant.
 - **Inter-action spacing**: a per-account Redis `lastaction` stamp enforces a
-  6–14 min randomized minimum gap between actions, spreading the day's quota
+  3–6 min randomized minimum gap between actions, spreading the day's quota
   across working hours instead of bursting. Checked BEFORE the daily counter so
   a spacing defer doesn't consume a slot.
 - **Duplicate-invite guard** (scheduler): a `connect_request` to a lead that
@@ -165,7 +173,35 @@ Verified by `scripts/verify-safety.ts`.
 `screens/`. A file exporting components exports only components (fast-refresh).
 Type-only imports use `import type` (`verbatimModuleSyntax` is on).
 
+## 🔴 Tests MUST run against local services (never the prod DB)
+`server-v2/.env` points `DATABASE_URL` at the **production** Supabase, and the
+live worker's scheduler tick enumerates **every workspace** in it every 30s.
+A test that inserts jobs there gets them claimed and enqueued by the production
+scheduler mid-test — this was observed for real (prod worker logged "Account not
+sendable" for a test account, and a drain test lost rows to the race).
+- `test/setup-test-env.ts` (wired as jest `setupFiles`) loads `server-v2/.env.test`
+  BEFORE `src/config/env.ts` reads `.env`; dotenv never overwrites an existing
+  `process.env` value, so the local URLs win.
+- `test/local-only.ts` → `assertLocalServices(getEnv())`. Any suite that writes
+  rows or enqueues jobs calls this in `beforeAll` and skips if it throws.
+- Local services:
+  ```
+  docker run -d --name rp-test-redis -p 6379:6379 redis:7-alpine
+  docker run -d --name rp-test-pg -p 55432:5432 -e POSTGRES_USER=reachpilot \
+    -e POSTGRES_PASSWORD=reachpilot -e POSTGRES_DB=reachpilot postgres:15-alpine
+  DATABASE_URL=postgresql://reachpilot:reachpilot@127.0.0.1:55432/reachpilot \
+    npx ts-node -r tsconfig-paths/register scripts/migrate.ts
+  ```
+  (`docker compose up -d redis` currently fails — a decorative `───` line in
+  `.env` breaks compose's env parser. Use `docker run`.)
+- Connect-flow suites: `connect-no-note` (pure), `-pacing` (D), `-scheduler` (E),
+  `connect-batch-drip` (100-profile 20/day drip). Never call `scheduler.tick()`
+  in a test — it drains every workspace; use the private `drainWorkspace(ws)`.
+
 ## Docs
+- 🔴 `DEPLOYMENT.md` — **read before deploying anything.** Real topology (2 Oracle
+  VMs, rsync'd not git, `/opt/ReachPilot/`), the decision table for what a given
+  change requires, and why a LinkedIn driver fix needs a desktop rebuild.
 - `docs/LINKEDIN_AUTOMATION_FLOW.md` — the working connect flow + 7 invariants that must
   not be broken (pacing defer returns not throws, sent-before-ancillary, etc.). Read before
   touching pacing/scheduler/driver.
