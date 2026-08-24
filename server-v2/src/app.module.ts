@@ -28,6 +28,7 @@ import { DriversModule } from '@/modules/drivers/drivers.module';
 import { IntegrationsModule } from '@/modules/integrations/integrations.module';
 import { AiModule } from '@/modules/ai/ai.module';
 import { ScrapingModule } from '@/modules/scraping/scraping.module';
+import { AgentModule } from '@/modules/agent/agent.module';
 
 @Module({
   imports: [
@@ -53,6 +54,7 @@ import { ScrapingModule } from '@/modules/scraping/scraping.module';
     IntegrationsModule,
     AiModule,
     ScrapingModule,
+    AgentModule,
   ],
   controllers: [HealthController],
   providers: [

@@ -12,6 +12,7 @@ export interface NotePayload {
   useAi?: boolean;
   useApify?: boolean;
   aiGuidance?: string; // optional voice/value-prop when AI is on
+  noNote?: boolean; // user chose "Send without a note" — skip the note entirely
 }
 
 /**
@@ -34,6 +35,11 @@ export class ConnectionNoteService {
   ) {}
 
   async build(workspaceId: string, payload: NotePayload): Promise<string> {
+    // "Send without a note" wins over everything — return an empty note so the
+    // worker's connect-with-fallback goes straight to the note-less send flow
+    // (the driver skips the whole note composer + note-cap check when message
+    // is empty). Overrides AI/Apify/template.
+    if (payload?.noNote) return '';
     if (!payload?.useAi) return payload?.message || '';
 
     const firstName = String(payload.name || '').trim().split(/\s+/)[0] || 'there';

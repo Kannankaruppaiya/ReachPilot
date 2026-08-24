@@ -71,7 +71,7 @@ const envSchema = z.object({
   SMTP_FROM: z.string().default('noreply@reachpilot.dev'),
 
   // LinkedIn automation driver: 'simulator' (fake) or 'playwright' (real browser).
-  LINKEDIN_DRIVER: z.enum(['simulator', 'playwright']).default('simulator'),
+  LINKEDIN_DRIVER: z.enum(['simulator', 'playwright', 'remote']).default('simulator'),
   PLAYWRIGHT_HEADLESS: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')

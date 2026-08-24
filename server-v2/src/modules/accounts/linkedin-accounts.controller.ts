@@ -78,7 +78,11 @@ export class LinkedinAccountsController {
 
   @Post('2fa/verify')
   async verify2fa(@Body() body: { secret?: string }, @Req() req: Request) {
-    const workspaceId = (req as any).workspaceId || '00000000-0000-0000-0000-000000000010';
+    // Fall back to the JWT's workspace (like every other endpoint) — NOT a
+    // hardcoded demo workspace. Using the wrong workspace made enqueueLogin
+    // look in an empty tenant, so no login job was ever created.
+    const user = (req as any).user as JwtPayload;
+    const workspaceId = (req as any).workspaceId || user.workspaceId;
     const secret = body.secret;
     if (!secret) {
       throw new BadRequestException('2FA verification secret is required.');
@@ -92,7 +96,8 @@ export class LinkedinAccountsController {
 
   @Post('2fa/skip')
   async skip2fa(@Req() req: Request) {
-    const workspaceId = (req as any).workspaceId || '00000000-0000-0000-0000-000000000010';
+    const user = (req as any).user as JwtPayload;
+    const workspaceId = (req as any).workspaceId || user.workspaceId;
     const result = await this.linkedin.skipTwoFa(workspaceId);
     return {
       ok: true,

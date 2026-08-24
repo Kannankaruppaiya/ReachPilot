@@ -211,7 +211,7 @@ export class JobsService {
     rows: any[],
     template: string,
     subject?: string,
-    personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string } = {},
+    personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string; noNote?: boolean } = {},
   ): Promise<{ batchId: string; total: number; today: number; queuedDays: number }> {
     if (kind !== 'linkedin' && kind !== 'email') {
       throw new BadRequestException('Invalid channel.');
@@ -235,7 +235,7 @@ export class JobsService {
       // Find first active LinkedIn/email account for this workspace to link
       const linkedinAcct = await db
         .selectFrom('linkedin_accounts')
-        .select(['id', 'warmup_daily_limit', 'warmup_target', 'connected_at', 'created_at'])
+        .select(['id', 'warmup_daily_limit', 'warmup_target', 'connected_at', 'created_at', 'hours_start', 'hours_end', 'timezone'])
         .where('workspace_id', '=', workspaceId)
         .limit(1)
         .executeTakeFirst();
@@ -261,15 +261,80 @@ export class JobsService {
         .executeTakeFirst();
 
       const createdJobs: any[] = [];
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+
+      // Schedule in the ACCOUNT's timezone + working hours (NOT the server clock).
+      // Old code hardcoded setHours(9) which, on a UTC server, meant 9am UTC =
+      // 2:30pm IST and ignored the account's hours_start entirely. Now each day's
+      // quota starts at the account's working-hours open and is spread evenly
+      // across the [hours_start, hours_end] window so sends trickle through the
+      // day instead of all stacking at one instant (pacing still enforces the
+      // per-action minimum gap at send time).
+      const tz = (kind === 'linkedin' && linkedinAcct?.timezone) || 'UTC';
+      const parseMin = (hhmm: any, def: number) => {
+        const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || ''));
+        return m ? Number(m[1]) * 60 + Number(m[2]) : def;
+      };
+      const startMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_start, 9 * 60) : 9 * 60;
+      let endMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_end, 18 * 60) : 18 * 60;
+      if (endMin <= startMin) endMin = startMin + 60; // guard a wrapped/empty window
+      const windowMin = endMin - startMin;
+
+      // Ensure every LinkedIn target URL carries a protocol. A bare
+      // "linkedin.com/in/x" is treated as a RELATIVE path — the UI "Open" link
+      // resolves it against the app domain (→ Vercel 404) and the driver's goto
+      // fails (→ profile_gone / no_connect_button). Normalize once at job-create.
+      const withProtocol = (u: any): string => {
+        const s = String(u || '').trim();
+        if (!s) return '';
+        return /^https?:\/\//i.test(s) ? s : `https://${s.replace(/^\/+/, '')}`;
+      };
+
+      // "Today" as a calendar date in the account timezone (YYYY-MM-DD).
+      const [ty, tm, td] = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      })
+        .format(new Date())
+        .split('-')
+        .map(Number);
+
+      // Wall-clock (account tz) → UTC instant. One-pass offset correction; at most
+      // ~1h off across a DST edge, which pacing re-checks and self-corrects.
+      const wallToUtc = (dayOffset: number, minsFromMidnight: number): Date => {
+        const guess = Date.UTC(ty, tm - 1, td + dayOffset, 0, minsFromMidnight, 0);
+        const p: any = new Intl.DateTimeFormat('en-US', {
+          timeZone: tz,
+          hour12: false,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+          .formatToParts(new Date(guess))
+          .reduce((a: any, x) => ((a[x.type] = x.value), a), {});
+        const asUtc = Date.UTC(
+          Number(p.year),
+          Number(p.month) - 1,
+          Number(p.day),
+          Number(p.hour === '24' ? 0 : p.hour),
+          Number(p.minute),
+          Number(p.second),
+        );
+        return new Date(guess - (asUtc - guess));
+      };
 
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
         const dayOffset = Math.floor(i / perDay);
-        const scheduledFor = new Date(today);
-        scheduledFor.setDate(scheduledFor.getDate() + dayOffset);
-        scheduledFor.setHours(9, 0, 0, 0); // Outbound at 9am local timezone-ish
+        const positionInDay = i % perDay;
+        // Spread evenly across the working window: first at the open, then stepped.
+        const minsFromMidnight =
+          perDay > 1 ? startMin + Math.round((windowMin * positionInDay) / perDay) : startMin;
+        const scheduledFor = wallToUtc(dayOffset, minsFromMidnight);
 
         const isToday = dayOffset === 0;
         const status = isToday ? 'queued' : 'scheduled';
@@ -277,7 +342,10 @@ export class JobsService {
 
         const payload = {
           name: row.name || '',
-          target: row.target || row.linkedinUrl || row.email || '',
+          target:
+            kind === 'linkedin'
+              ? withProtocol(row.target || row.linkedinUrl)
+              : row.target || row.linkedinUrl || row.email || '',
           company: row.company || '',
           role: row.role || row.title || '',
           // Template is always filled as the fallback; when AI is on the worker
@@ -291,6 +359,9 @@ export class JobsService {
                 aiGuidance: personalization.aiGuidance || '',
               }
             : {}),
+          // "Send without a note" — independent of AI; the worker drops the note
+          // entirely (direct note-less connect, skips the note-cap check).
+          ...(kind === 'linkedin' && personalization.noNote ? { noNote: true } : {}),
         };
 
         const jobData = {

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { SimulatorDriver } from './simulator.driver';
 import { PlaywrightLinkedInDriver } from './playwright-linkedin.driver';
+import { RemoteAgentDriver } from './remote-agent.driver';
 import { GmailDriver } from './gmail.driver';
 import { LinkedInSessionService } from './linkedin-session.service';
 import { LinkedInSyncService } from './linkedin-sync.service';
@@ -20,15 +21,20 @@ import { IntegrationsModule } from '@/modules/integrations/integrations.module';
   providers: [
     SimulatorDriver,
     PlaywrightLinkedInDriver,
+    RemoteAgentDriver,
     GmailDriver,
     LinkedInSessionService,
     LinkedInSyncService,
     EmailWarmupService,
     {
       provide: LINKEDIN_DRIVER,
-      useFactory: (sim: SimulatorDriver, pw: PlaywrightLinkedInDriver) =>
-        getEnv().LINKEDIN_DRIVER === 'playwright' ? pw : sim,
-      inject: [SimulatorDriver, PlaywrightLinkedInDriver],
+      // 'remote' = dispatch to the user's desktop agent (runs on THEIR IP);
+      // 'playwright' = run the browser here; else the safe simulator.
+      useFactory: (sim: SimulatorDriver, pw: PlaywrightLinkedInDriver, remote: RemoteAgentDriver) => {
+        const d = getEnv().LINKEDIN_DRIVER;
+        return d === 'remote' ? remote : d === 'playwright' ? pw : sim;
+      },
+      inject: [SimulatorDriver, PlaywrightLinkedInDriver, RemoteAgentDriver],
     },
     {
       provide: EMAIL_DRIVER,
@@ -45,6 +51,7 @@ import { IntegrationsModule } from '@/modules/integrations/integrations.module';
     EmailWarmupService,
     SimulatorDriver,
     PlaywrightLinkedInDriver,
+    RemoteAgentDriver,
     GmailDriver,
   ],
 })

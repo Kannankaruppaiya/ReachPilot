@@ -40,8 +40,17 @@ export class LinkedinAccountsService {
    * (password + optional 2FA) are in place.
    */
   private async enqueueLogin(workspaceId: string): Promise<void> {
+    // Scope EXPLICITLY by workspace_id — the DB connection bypasses RLS, so
+    // relying on withWorkspace alone would pick the globally-first account (a
+    // cross-tenant leak). Pick the most recently connected one in THIS workspace.
     const account = await withWorkspace(workspaceId, (db) =>
-      db.selectFrom('linkedin_accounts').select(['id', 'session_secret_id']).limit(1).executeTakeFirst(),
+      db
+        .selectFrom('linkedin_accounts')
+        .select(['id', 'session_secret_id'])
+        .where('workspace_id', '=', workspaceId)
+        .orderBy('connected_at', 'desc')
+        .limit(1)
+        .executeTakeFirst(),
     );
     if (!account) return;
 
@@ -150,6 +159,9 @@ export class LinkedinAccountsService {
     await withWorkspace(workspaceId, (db) =>
       db
         .updateTable('linkedin_accounts')
+        // Explicit workspace scope — the DB role bypasses RLS, so an un-scoped
+        // UPDATE would set twofa/totp on EVERY tenant's accounts.
+        .where('workspace_id', '=', workspaceId)
         .set({ twofa: 'verified', totp_secret_id: secretId })
         .execute(),
     );
@@ -168,6 +180,8 @@ export class LinkedinAccountsService {
     await withWorkspace(workspaceId, (db) =>
       db
         .updateTable('linkedin_accounts')
+        // Explicit workspace scope — the DB role bypasses RLS.
+        .where('workspace_id', '=', workspaceId)
         .set({ twofa: 'skipped' })
         .execute(),
     );
@@ -200,6 +214,9 @@ export class LinkedinAccountsService {
     hoursEnd: string | null;
     timezone: string | null;
     sendWeekends: boolean | null;
+    loginIp: string | null;
+    lastIp: string | null;
+    lastIpAt: string | null;
   }> {
     const acct = await withWorkspace(workspaceId, (db) =>
       db
@@ -217,7 +234,17 @@ export class LinkedinAccountsService {
           'hours_end',
           'timezone',
           'send_weekends',
+          'login_ip',
+          'last_ip',
+          'last_ip_at',
         ])
+        // Explicit workspace scope (the DB connection bypasses RLS) + deterministic
+        // pick: sendable accounts first, then most recently connected.
+        .where('workspace_id', '=', workspaceId)
+        .orderBy((eb) =>
+          eb.case().when('status', 'in', ['paused', 'disconnected', 'checkpoint']).then(1).else(0).end(),
+        )
+        .orderBy('connected_at', 'desc')
         .limit(1)
         .executeTakeFirst(),
     );
@@ -227,6 +254,7 @@ export class LinkedinAccountsService {
         connected: false, loggedIn: false, status: 'none', email: null,
         dailyLimit: null, weeklyInviteCap: null, warmup: null,
         hoursStart: null, hoursEnd: null, timezone: null, sendWeekends: null,
+        loginIp: null, lastIp: null, lastIpAt: null,
       };
     }
 
@@ -243,6 +271,9 @@ export class LinkedinAccountsService {
       hoursEnd: acct.hours_end ? String(acct.hours_end).slice(0, 5) : '18:00',
       timezone: acct.timezone || 'UTC',
       sendWeekends: !!acct.send_weekends,
+      loginIp: (acct as any).login_ip ?? null,
+      lastIp: (acct as any).last_ip ?? null,
+      lastIpAt: (acct as any).last_ip_at ? String((acct as any).last_ip_at) : null,
     };
   }
 
@@ -354,6 +385,10 @@ export class LinkedinAccountsService {
           'linkedin_accounts.id',
           'proxies.ip as proxy_ip',
         ])
+        // Explicit workspace scope (DB connection bypasses RLS) + deterministic pick.
+        .where('linkedin_accounts.workspace_id', '=', workspaceId)
+        .orderBy('linkedin_accounts.connected_at', 'desc')
+        .limit(1)
         .executeTakeFirst(),
     );
   }

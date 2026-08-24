@@ -1453,19 +1453,30 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         (await page.locator(pinSel).count()) > 0;
       if (needs2fa) {
         if (!ctx.totpSecret) return { status: 'checkpoint', error: '2FA required but no TOTP seed stored' };
-        const pin = authenticator.generate(ctx.totpSecret);
         // Pick the VISIBLE input/button (LinkedIn ships hidden duplicates).
         const pinInput = page.locator(pinSel).filter({ visible: true }).first();
-        await pinInput.waitFor({ state: 'visible', timeout: 15000 });
-        await pinInput.fill(pin);
-        await think();
-        const submit = page
-          .locator('#two-step-submit-button, button[type="submit"], button:has-text("Submit")')
-          .filter({ visible: true })
-          .first();
-        await submit.click();
-        await page.waitForLoadState('domcontentloaded').catch(() => undefined);
-        await sleep(rnd(2000, 4000));
+        // The PIN field may never actually appear: LinkedIn can auto-trust this
+        // persistent profile and redirect straight to the feed. Don't hard-fail
+        // on the wait — only enter the PIN if the field truly shows; otherwise
+        // fall through to the li_at capture below (a /feed/ redirect means we're
+        // already signed in). Previously this waitFor threw on timeout and a
+        // SUCCESSFUL login was misreported as "failed".
+        const pinVisible = await pinInput
+          .waitFor({ state: 'visible', timeout: 15000 })
+          .then(() => true)
+          .catch(() => false);
+        if (pinVisible) {
+          const pin = authenticator.generate(ctx.totpSecret);
+          await pinInput.fill(pin);
+          await think();
+          const submit = page
+            .locator('#two-step-submit-button, button[type="submit"], button:has-text("Submit")')
+            .filter({ visible: true })
+            .first();
+          await submit.click().catch(() => undefined);
+          await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+          await sleep(rnd(2000, 4000));
+        }
       }
 
       // Any residual security wall → surface as checkpoint (needs human).

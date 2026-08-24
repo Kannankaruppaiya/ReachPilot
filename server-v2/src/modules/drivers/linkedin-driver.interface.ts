@@ -51,6 +51,8 @@ export interface LinkedInActionResult {
   status: LinkedInOutcome;
   externalId?: string;
   error?: string;
+  /** Public egress IP the desktop agent ran this action from (ipify echo). */
+  reportedIp?: string;
 }
 
 /** Everything needed to log in ONCE and capture the session cookie. */
@@ -71,6 +73,8 @@ export interface LinkedInLoginResult {
   li_at?: string;
   fingerprint?: LinkedInFingerprint;
   error?: string;
+  /** Public egress IP the desktop agent logged in from (ipify echo). */
+  reportedIp?: string;
 }
 
 /** One connection whose invite was accepted since we last synced. */
