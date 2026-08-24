@@ -15,9 +15,11 @@ import {
   Loader2,
   Mail,
   Plug,
+  RefreshCcw,
   ShieldCheck,
 } from "lucide-react"
 import { Badge, Button, Card, Field, LinkedinIcon } from "@/components/ui"
+import { LinkedinUpdateModal } from "./AuthOnboarding"
 import { useToast } from "@/components/Toast"
 import { cx } from "@/lib/utils/cx"
 import { inputCls } from "@/constants"
@@ -244,6 +246,8 @@ export function Integrations() {
   const [apifyToken, setApifyToken] = useState("")
   const [apifyTools, setApifyTools] = useState(APIFY_DEFAULT_TOOLS)
   const [apifyBusy, setApifyBusy] = useState(false)
+  // LinkedIn "update login" modal (reuses the onboarding credentials + 2FA pages)
+  const [showLiUpdate, setShowLiUpdate] = useState(false)
 
   const load = () => {
     api.linkedinAccount().then(setLi).catch(() => setLi(null))
@@ -350,8 +354,23 @@ export function Integrations() {
                 ]
                   .filter(Boolean)
                   .join(" · ")
-              : "Connect a LinkedIn account from onboarding to start sending."}
+              : "Connect a LinkedIn account to start sending."}
           </p>
+          {li?.connected && (
+            <p className="mt-2 text-xs text-sub">
+              Changed your LinkedIn password? Update your login here so ReachPilot can sign in
+              again — same steps as setup.
+            </p>
+          )}
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              variant={li?.connected ? "outline" : undefined}
+              onClick={() => setShowLiUpdate(true)}
+            >
+              <RefreshCcw size={16} />
+              {li?.connected ? "Update LinkedIn login" : "Connect LinkedIn"}
+            </Button>
+          </div>
         </Card>
 
         <Card className="p-5">
@@ -494,6 +513,17 @@ export function Integrations() {
           <Button variant="outline" onClick={() => toast("HubSpot connection coming soon")}>Connect</Button>
         </Card>
       </div>
+
+      {showLiUpdate && (
+        <LinkedinUpdateModal
+          currentEmail={li?.email ?? null}
+          onClose={() => setShowLiUpdate(false)}
+          onUpdated={() => {
+            setShowLiUpdate(false)
+            load()
+          }}
+        />
+      )}
     </div>
   )
 }

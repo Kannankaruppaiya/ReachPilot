@@ -185,6 +185,7 @@ export const api = {
     useAi?: boolean
     useApify?: boolean
     aiGuidance?: string
+    noNote?: boolean
   }) => req<{ batchId: string; total: number; today: number; queuedDays: number }>("/api/send/create", payload),
   listJobs: (batchId: string) => req<SendJob[]>(`/api/send/jobs?batchId=${batchId}`),
   // Cancel one not-yet-sent job (queue "close" button).

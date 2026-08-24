@@ -10,6 +10,7 @@ import {
   Rocket,
   Send,
   Sparkles,
+  StickyNote,
   UploadCloud,
   UserPlus,
   X,
@@ -45,11 +46,15 @@ const detect = (headers: string[], patterns: RegExp[]): string => {
   return ""
 }
 
-function fillTemplate(tpl: string, r: Row) {
+function fillTemplate(tpl: string, r?: Row) {
+  // r can be undefined — the preview calls this with buildRows()[0], which is
+  // undefined right after an upload whose columns aren't mapped yet (all rows
+  // filtered out). Guard so the preview shows the fallback text instead of
+  // crashing the whole page (white screen).
   const filled = tpl
-    .replace(/\{\{firstName\}\}/g, r.firstName || "there")
-    .replace(/\{\{company\}\}/g, r.company || "your company")
-    .replace(/\{\{role\}\}/g, r.role || "your role")
+    .replace(/\{\{firstName\}\}/g, r?.firstName || "there")
+    .replace(/\{\{company\}\}/g, r?.company || "your company")
+    .replace(/\{\{role\}\}/g, r?.role || "your role")
   // Preview spintax like the backend does — but pick the FIRST option so the
   // preview is stable while typing (the real send randomizes per recipient).
   let out = filled
@@ -97,6 +102,10 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
   const [useAi, setUseAi] = useState(false)
   const [useApify, setUseApify] = useState(false)
   const [aiGuidance, setAiGuidance] = useState("")
+  // "Include a personalized note" (LinkedIn only). Off ⇒ requests go out with NO
+  // note — the worker sends straight through the note-less connect flow, which
+  // skips LinkedIn's monthly personalized-note limit entirely.
+  const [withNote, setWithNote] = useState(true)
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -218,9 +227,11 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
         rows: list.map((r) => ({ name: r.name, target: r.target, company: r.company, role: r.role })),
         template,
         subject: mode === "email" ? subject : undefined,
-        ...(mode === "linkedin" && useAi
-          ? { useAi: true, useApify, aiGuidance }
-          : {}),
+        ...(mode === "linkedin" && !withNote
+          ? { noNote: true }
+          : mode === "linkedin" && useAi
+            ? { useAi: true, useApify, aiGuidance }
+            : {}),
       })
       batchId = res.batchId
       toast(
@@ -266,7 +277,8 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
 
   const parsed = rawRows.length > 0
   const valid = parsed && mapping.name && mapping.target
-  const aiMode = mode === "linkedin" && useAi
+  const aiMode = mode === "linkedin" && useAi && withNote
+  const noNoteMode = mode === "linkedin" && !withNote
   const total = valid ? buildRows().length : 0
   const days = total ? Math.ceil(total / cap) : 0
   const sentCount = rows.filter((r) => r.status === "sent").length
@@ -411,6 +423,32 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       <Card className="p-5">
         <h2 className="mb-3 flex items-center gap-2 font-bold">{icon} 2. Message</h2>
 
+        {/* Include-a-note switch — LinkedIn Auto Connect only. Off = note-less send. */}
+        {mode === "linkedin" && (
+          <div className="mb-4 flex flex-col gap-2 rounded-lg border border-line bg-mutedbg/30 p-3">
+            <Toggle
+              on={withNote}
+              onChange={setWithNote}
+              icon={<StickyNote size={15} />}
+              title="Include a personalized note"
+              subtitle="Off → send the connection request with no note. Faster, and it never uses your monthly personalized-note limit."
+            />
+          </div>
+        )}
+
+        {noNoteMode ? (
+          <div className="rounded-md border border-line bg-mutedbg/40 p-3.5 text-sm">
+            <p className="flex items-center gap-1.5 font-semibold">
+              <Send size={14} className="text-accent" /> No note — connection request only
+            </p>
+            <p className="mt-1.5 text-sub">
+              Every request goes out straight through the “Send without a note” flow. This skips
+              LinkedIn's personalized-note check entirely, so free accounts keep sending all the way up
+              to the weekly invite cap. Turn the switch on above to write a note (template or AI).
+            </p>
+          </div>
+        ) : (
+          <>
         {/* Personalization toggles — LinkedIn Auto Connect only */}
         {mode === "linkedin" && (
           <div className="mb-4 flex flex-col gap-2 rounded-lg border border-line bg-mutedbg/30 p-3">
@@ -508,6 +546,8 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
                 <p className="whitespace-pre-line">{fillTemplate(template, buildRows()[0])}</p>
               </div>
             )}
+          </>
+        )}
           </>
         )}
       </Card>
