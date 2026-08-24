@@ -6,6 +6,7 @@ import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
 import { LINKEDIN_DRIVER, EMAIL_DRIVER } from '@/modules/drivers/driver.tokens';
 import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
+import { getLoginQueue } from '@/modules/accounts/linkedin-accounts.service';
 import { connectWithNoteFallback } from '@/modules/drivers/connect-with-fallback';
 import { ConnectionNoteService } from '@/modules/ai/connection-note.service';
 import {
@@ -422,6 +423,44 @@ async function bootstrap() {
       // nets to exactly one send (the re-dispatch re-registers it), and on re-run a
       // send that already went out is detected as pending/already-connected and
       // marked sent. Never throw (don't burn BullMQ attempts) or fail (never lose it).
+      // BUT: 'agent_result_pending' means the agent may have already clicked
+      // Send — for linkedin_message/inmail, sendMessage/sendInMail have no
+      // idempotency check (they click Send unconditionally on every run), so
+      // blindly redispatching this exact case would DM the recipient twice.
+      // connect_request/follow/etc. all detect their own already-done state
+      // (Pending/already_connected/etc.) before acting, so redriving THOSE is
+      // safe either way. Hold the ambiguous message/inmail case for a human to
+      // check LinkedIn instead of auto-resending it.
+      const nonIdempotentPending =
+        res.error === 'agent_result_pending' &&
+        (jobRow.action === 'linkedin_message' || jobRow.action === 'inmail');
+      if (nonIdempotentPending) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        await withWorkspace(workspaceId, async (db) => {
+          await db
+            .updateTable('jobs')
+            .set({ status: 'failed', last_error: 'agent_result_pending_review' })
+            .where('id', '=', jobId)
+            .execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+          await db
+            .insertInto('notifications')
+            .values({
+              workspace_id: workspaceId,
+              kind: 'job_failed',
+              text: `${payload.name}: the desktop agent disconnected before confirming this ${jobRow.action === 'inmail' ? 'InMail' : 'message'} sent — check LinkedIn before retrying, to avoid sending it twice.`,
+            })
+            .execute();
+        });
+        logger.warn(
+          { jobId, accountId, action: jobRow.action },
+          'Agent accepted a non-idempotent action but never confirmed the result — held for manual review, not auto-resent',
+        );
+        return;
+      }
+
       if (res.error === 'agent_unavailable' || res.error === 'agent_result_pending') {
         await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
         const retryAt = new Date(Date.now() + AGENT_OFFLINE_BACKOFF_MS).toISOString();
@@ -475,10 +514,20 @@ async function bootstrap() {
 
   /* ---------- 2. LinkedIn Login Worker (cookie capture) ---------- */
 
+  // How long to wait between retries while the desktop agent hasn't polled yet
+  // (laptop off, app not opened post-onboarding), and how many times to try
+  // before giving up and telling the user to reconnect. ~1 hour total.
+  const LOGIN_AGENT_WAIT_BACKOFF_MS = 3 * 60 * 1000;
+  const LOGIN_AGENT_WAIT_MAX_ATTEMPTS = 20;
+
   const loginWorker = new Worker(
     'linkedin-login',
     async (job: Job) => {
-      const { accountId, workspaceId } = job.data;
+      const { accountId, workspaceId, agentWaitAttempt } = job.data as {
+        accountId: string;
+        workspaceId: string;
+        agentWaitAttempt?: number;
+      };
       logger.info({ accountId }, 'Processing LinkedIn login');
 
       const loginCtx = await sessions.buildLoginContext(accountId, workspaceId);
@@ -527,7 +576,30 @@ async function bootstrap() {
         return;
       }
 
-      // Failed — bad credentials or unreachable.
+      // Desktop agent hasn't polled yet (user hasn't opened the app post-onboarding,
+      // or their laptop is off) — no LinkedIn login was even attempted, so this is
+      // NOT a real failure. Marking 'disconnected' here (as the code used to) left
+      // a user who finishes onboarding before opening the desktop app stuck: no
+      // LinkedIn login attempt was made, but the 6h enqueueLogin cooldown then
+      // blocked a fresh one, and BullMQ's own retry (attempts: 2, ~10s backoff) is
+      // far too short for "hasn't opened the app yet". Re-add a delayed job
+      // instead (bypasses that cooldown, which only guards NEW enqueues) and only
+      // give up — marking disconnected for a real reconnect — after ~1 hour.
+      if (res.error === 'agent_unavailable' || res.error === 'agent_result_pending') {
+        const attempt = (agentWaitAttempt || 0) + 1;
+        if (attempt <= LOGIN_AGENT_WAIT_MAX_ATTEMPTS) {
+          await getLoginQueue().add(
+            'login',
+            { accountId, workspaceId, agentWaitAttempt: attempt },
+            { delay: LOGIN_AGENT_WAIT_BACKOFF_MS, attempts: 1, removeOnComplete: true },
+          );
+          logger.info({ accountId, attempt }, 'Desktop agent not online yet for login — deferred, will retry');
+          return;
+        }
+        logger.warn({ accountId }, 'Desktop agent never came online for login — giving up');
+      }
+
+      // Failed — bad credentials, unreachable, or the agent never showed up.
       await withWorkspace(workspaceId, async (db) => {
         await db.updateTable('linkedin_accounts').set({ status: 'disconnected', ...ipSet }).where('id', '=', accountId).execute();
         await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_failed', text: `Could not connect LinkedIn: ${res.error || 'login failed'}. Please reconnect.` }).execute();

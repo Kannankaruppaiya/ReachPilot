@@ -10,7 +10,7 @@ import { computeWarmup } from '@/modules/engine/warmup';
 
 let loginQueue: Queue | null = null;
 let loginRedis: Redis | null = null;
-function getLoginQueue(): Queue {
+export function getLoginQueue(): Queue {
   if (loginQueue) return loginQueue;
   if (!loginRedis) loginRedis = new Redis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
   loginQueue = new Queue('linkedin-login', { connection: loginRedis as any });

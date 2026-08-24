@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Req, UnauthorizedException, Logger } from '@nestjs/common';
+import { Controller, Get, Post, Body, Req, UnauthorizedException, ForbiddenException, Logger } from '@nestjs/common';
 import { Request } from 'express';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
@@ -17,8 +17,19 @@ export class AgentController {
   private redis = new Redis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
 
   private workspaceId(req: Request): string {
-    const ws = (req as any).user?.workspaceId || (req as any).workspaceId;
+    const user = (req as any).user as { workspaceId?: string; role?: string } | undefined;
+    const ws = user?.workspaceId || (req as any).workspaceId;
     if (!ws) throw new UnauthorizedException('agent not authenticated');
+    // next-job returns the raw decrypted job payload (li_at cookie for an
+    // action, or email/password/TOTP for a login), and job-result accepts an
+    // outcome for it — this must be reachable only by whoever is meant to run
+    // the desktop agent, not by every credential that happens to authenticate
+    // to this workspace. In particular a 'member'-role API key (meant for
+    // read-only integrations) could otherwise race the real desktop client
+    // for this data. Restrict to the account-management roles.
+    if (user?.role !== 'owner' && user?.role !== 'admin') {
+      throw new ForbiddenException('Only a workspace owner/admin can act as the desktop agent.');
+    }
     return ws;
   }
 

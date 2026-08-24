@@ -34,9 +34,9 @@
     <h2>2. Server connection</h2>
     <label>API base</label>
     <input id="cfg-api" placeholder="http://localhost:4000  (or https://api.reachpilot.dpdns.org)" />
-    <label>Bearer token (from your ReachPilot login)</label>
+    <label>Bearer token (from your ReachPilot login — must be a workspace owner/admin)</label>
     <input id="cfg-token" placeholder="paste your access token" />
-    <p class="hint">Used to fetch your account and to pull jobs. Nothing is sent to LinkedIn from the server.</p>
+    <p class="hint">Used to fetch your account and to pull jobs. The agent endpoints reject a 'member'-role login or API key — those jobs carry your raw LinkedIn session/credentials, so only an owner/admin token can pull them. Nothing is sent to LinkedIn from the server.</p>
   </div>
 
   <div class="step">
