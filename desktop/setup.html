@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ReachPilot — Setting up</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0b1220; color: #e6edf6;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .box { text-align: center; max-width: 460px; padding: 32px; }
+    .logo {
+      width: 56px; height: 56px; border-radius: 14px; margin: 0 auto 20px;
+      background: #0a66c2; display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 24px; color: #fff;
+    }
+    h1 { font-size: 20px; margin: 0 0 6px; }
+    p.sub { color: #8ba0be; font-size: 13px; margin: 0 0 26px; }
+    .spinner {
+      width: 34px; height: 34px; margin: 0 auto 18px;
+      border: 3px solid #22304a; border-top-color: #38bdf8; border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #status { font-size: 13px; color: #cdd9ea; min-height: 20px; }
+    #status.err { color: #fca5a5; }
+    .hint { margin-top: 18px; font-size: 12px; color: #6b7f9e; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="logo">in</div>
+    <h1>Setting up ReachPilot</h1>
+    <p class="sub">One-time setup so LinkedIn runs safely on your own connection.</p>
+    <div class="spinner" id="spinner"></div>
+    <div id="status">Checking setup…</div>
+    <div class="hint">This needs an internet connection. It only happens once.</div>
+  </div>
+  <script>
+    // Called from the main process via executeJavaScript.
+    window.setStatus = function (msg, isError) {
+      var el = document.getElementById('status');
+      if (el) { el.textContent = msg; el.className = isError ? 'err' : ''; }
+      if (isError) { var s = document.getElementById('spinner'); if (s) s.style.display = 'none'; }
+    };
+  </script>
+</body>
+</html>

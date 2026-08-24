@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ReachPilot Desktop</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0b1220; color: #e6edf6; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 20px; color: #8ba0be; font-size: 13px; }
+    .step { background: #131c2e; border: 1px solid #22304a; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+    .step h2 { font-size: 14px; margin: 0 0 8px; }
+    button { background: #0369a1; color: #fff; border: 0; border-radius: 7px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+    button:hover { background: #0284c7; }
+    button:disabled { background: #24405a; color: #7d93ad; cursor: default; }
+    label { display: block; font-size: 12px; color: #8ba0be; margin-top: 10px; }
+    input { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px; border-radius: 7px; border: 1px solid #2a3a58; background: #0b1220; color: #e6edf6; font-size: 13px; }
+    .hint { font-size: 12px; color: #8ba0be; }
+    #log { background: #060b16; border: 1px solid #22304a; border-radius: 10px; padding: 12px; height: 150px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; color: #a7f3d0; margin-top: 8px; }
+    .ok { color: #34d399; } .warn { color: #fbbf24; }
+    .acct { font-size: 12px; color: #8ba0be; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>ReachPilot Desktop — LinkedIn Agent</h1>
+  <p class="sub">Your LinkedIn actions run on THIS machine's own IP (no proxy, no datacenter). The browser opens in a separate window.</p>
+
+  <div class="step">
+    <h2>1. Check my egress IP</h2>
+    <button onclick="run('checkIp')">Check IP</button>
+    <span class="hint"> — compare with your real IP (whatismyip). Same = local IP confirmed.</span>
+  </div>
+
+  <div class="step">
+    <h2>2. Server connection</h2>
+    <label>API base</label>
+    <input id="cfg-api" placeholder="http://localhost:4000  (or https://api.reachpilot.dpdns.org)" />
+    <label>Bearer token (from your ReachPilot login)</label>
+    <input id="cfg-token" placeholder="paste your access token" />
+    <p class="hint">Used to fetch your account and to pull jobs. Nothing is sent to LinkedIn from the server.</p>
+  </div>
+
+  <div class="step">
+    <h2>3. Connect LinkedIn (one-time login, on your IP)</h2>
+    <button onclick="loadAccount()">Load my account</button>
+    <span id="acct" class="acct"></span>
+    <label>LinkedIn email</label>
+    <input id="li-email" placeholder="you@example.com" />
+    <label>LinkedIn password</label>
+    <input id="li-pass" type="password" placeholder="your LinkedIn password" />
+    <label>2FA secret (base32, only if 2FA is enabled — optional)</label>
+    <input id="li-totp" placeholder="e.g. JBSWY3DPEHPK3PXP" />
+    <button id="btn-connect" style="margin-top:12px" onclick="connectLinkedin()" disabled>Connect LinkedIn</button>
+    <p class="hint">One-time login only. Your password is typed into LinkedIn locally and never stored or sent to our server. The session persists in this app; we never auto-relogin.</p>
+  </div>
+
+  <div class="step">
+    <h2>4. Run the agent (pull &amp; execute jobs on your IP)</h2>
+    <button onclick="startAgent()">Start agent</button>
+    <button onclick="window.rp.stopAgent()">Stop</button>
+    <span class="hint"> — polls /api/agent/next-job, runs the real driver locally, reports results.</span>
+  </div>
+
+  <div id="log">Ready.</div>
+
+  <script>
+    let currentAccountId = null;
+    const $ = (id) => document.getElementById(id);
+    const cfg = () => ({ apiBase: $('cfg-api').value.trim(), token: $('cfg-token').value.trim() });
+    const log = (msg, cls) => {
+      const el = $('log');
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+      el.appendChild(line); el.scrollTop = el.scrollHeight;
+    };
+
+    async function run(fn) {
+      log('Running ' + fn + '...');
+      try {
+        const r = await window.rp[fn]();
+        if (fn === 'checkIp') log('Egress IP: ' + r.ip + '  (this is the IP LinkedIn sees)', 'ok');
+        else log(JSON.stringify(r), 'ok');
+      } catch (e) { log('ERROR: ' + (e.message || e), 'warn'); }
+    }
+
+    async function loadAccount() {
+      const c = cfg();
+      if (!c.apiBase || !c.token) return log('Enter API base + token in section 2 first.', 'warn');
+      log('Fetching your account...');
+      try {
+        const acct = await window.rp.agentAccount(c);
+        if (!acct) { log('No LinkedIn account found for this workspace. Add one in the dashboard first.', 'warn'); return; }
+        currentAccountId = acct.accountId;
+        if (acct.email && !$('li-email').value) $('li-email').value = acct.email;
+        $('acct').textContent = 'Account: ' + (acct.email || acct.accountId) + '  ·  status ' + acct.status;
+        $('btn-connect').disabled = false;
+        log('Account loaded (' + acct.accountId + ', ' + acct.status + '). Enter your password, then Connect.', 'ok');
+      } catch (e) { log('ERROR: ' + (e.message || e), 'warn'); }
+    }
+
+    async function connectLinkedin() {
+      if (!currentAccountId) return log('Load your account first.', 'warn');
+      const email = $('li-email').value.trim();
+      const password = $('li-pass').value;
+      const totpSecret = $('li-totp').value.trim() || undefined;
+      if (!email || !password) return log('Enter LinkedIn email + password.', 'warn');
+      $('btn-connect').disabled = true;
+      log('Logging in to LinkedIn on your machine (a browser window will open)...');
+      try {
+        const r = await window.rp.agentLogin({ accountId: currentAccountId, email, password, totpSecret });
+        if (r.status === 'connected') {
+          log('LinkedIn connected — session saved for account ' + currentAccountId + '. You can Start the agent.', 'ok');
+        } else {
+          log('Login ' + r.status + (r.error ? ': ' + r.error : ''), 'warn');
+        }
+        $('li-pass').value = ''; // don't keep the password in the field
+      } catch (e) { log('ERROR: ' + (e.message || e), 'warn'); }
+      $('btn-connect').disabled = false;
+    }
+
+    async function startAgent() {
+      const c = cfg();
+      if (!c.apiBase || !c.token) return log('Enter API base + token in section 2.', 'warn');
+      const r = await window.rp.startAgent(c);
+      log('Agent started → ' + r.apiBase + ' (polling for jobs)', 'ok');
+    }
+
+    window.rp.onAgentLog((msg) => log('[agent] ' + msg));
+  </script>
+</body>
+</html>
