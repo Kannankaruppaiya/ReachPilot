@@ -32,7 +32,7 @@ Auto Connect / Campaign
 row** for the account and enforces, in order:
 1. **Working day / weekend** — `send_weekends`, account `timezone` [pacing.service.ts:80-83].
 2. **Working hours** — `hours_start`/`hours_end` (supports overnight wrap) [pacing.service.ts:88-97].
-3. **Inter-action spacing** — randomized 6–14 min gap per account/day, checked BEFORE the
+3. **Inter-action spacing** — randomized 3–6 min gap per account/day, checked BEFORE the
    daily counter so a spacing-defer doesn't burn a slot [pacing.service.ts:105-111].
 4. **Warm-up ramp + daily cap** — `computeWarmup(...)` then ±15% daily jitter; Redis daily
    counter `pacing:linkedin:<acct>:date:<d>:daily` [pacing.service.ts:113-135].

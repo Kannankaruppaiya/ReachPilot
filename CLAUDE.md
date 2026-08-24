@@ -123,7 +123,7 @@ Verified by `scripts/verify-safety.ts`.
   deterministically per account/day (`seed01`), so the count varies day-to-day
   instead of a robotic constant.
 - **Inter-action spacing**: a per-account Redis `lastaction` stamp enforces a
-  6–14 min randomized minimum gap between actions, spreading the day's quota
+  3–6 min randomized minimum gap between actions, spreading the day's quota
   across working hours instead of bursting. Checked BEFORE the daily counter so
   a spacing defer doesn't consume a slot.
 - **Duplicate-invite guard** (scheduler): a `connect_request` to a lead that

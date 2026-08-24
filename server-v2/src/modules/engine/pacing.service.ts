@@ -316,12 +316,12 @@ export class PacingService {
 
   /**
    * Minimum gap between consecutive actions on an account, randomized per
-   * account/day within 6–14 minutes. Spreads the daily quota across working
+   * account/day within 3–6 minutes. Spreads the daily quota across working
    * hours rather than letting it burst.
    */
   private interactionGapMs(accountId: string, dateIso: string): number {
-    const minMin = 6;
-    const spanMin = 8; // → 6–14 min
+    const minMin = 3;
+    const spanMin = 3; // → 3–6 min
     const mins = minMin + this.seed01(accountId, dateIso, 'gap') * spanMin;
     return Math.round(mins * 60_000);
   }
