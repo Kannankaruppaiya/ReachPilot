@@ -92,34 +92,46 @@ Both processes run `npm run start:<api|worker>` with **ts-node** from
 `/opt/ReachPilot/server-v2`, so copying the `.ts` source is enough — there is no
 build step.
 
+🔴 **Use `~/.ssh/oci_reachpilot.key`.** The other two keys on this machine both
+fail, for different reasons, and neither says so obviously:
+- `~/Downloads/ssh-key-2026-08-05.key` (what this runbook used to say) — OpenSSH
+  REFUSES it: on Windows the file inherits Downloads' loose ACL, so you get
+  `WARNING: UNPROTECTED PRIVATE KEY FILE` → `bad permissions` → `Permission
+  denied (publickey)`. Moving a key into `~/.ssh/` is what fixes the ACL; left in
+  Downloads it is not usable at all.
+- `~/.ssh/oracle_reachpilot` — loads fine but the VMs reject it (wrong key).
+
+Verified working 2026-08-25: `ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.68.89`
+→ `reachpilot-worker`.
+
 Run from the repo root. Substitute the path of whatever you changed.
 
 ```bash
-scp -i ~/Downloads/ssh-key-2026-08-05.key server-v2/src/modules/drivers/playwright-linkedin.driver.ts ubuntu@129.225.68.89:/opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts
+scp -i ~/.ssh/oci_reachpilot.key server-v2/src/modules/drivers/playwright-linkedin.driver.ts ubuntu@129.225.68.89:/opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts
 ```
 
 ```bash
-scp -i ~/Downloads/ssh-key-2026-08-05.key server-v2/src/modules/drivers/playwright-linkedin.driver.ts ubuntu@129.225.104.114:/opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts
+scp -i ~/.ssh/oci_reachpilot.key server-v2/src/modules/drivers/playwright-linkedin.driver.ts ubuntu@129.225.104.114:/opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts
 ```
 
 ```bash
-ssh -i ~/Downloads/ssh-key-2026-08-05.key ubuntu@129.225.68.89 "pm2 restart rp-worker --update-env && pm2 list"
+ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.68.89 "pm2 restart rp-worker --update-env && pm2 list"
 ```
 
 ```bash
-ssh -i ~/Downloads/ssh-key-2026-08-05.key ubuntu@129.225.104.114 "pm2 restart rp-api --update-env && pm2 list"
+ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.104.114 "pm2 restart rp-api --update-env && pm2 list"
 ```
 
 Verify the file actually landed (grep a string you just added):
 
 ```bash
-ssh -i ~/Downloads/ssh-key-2026-08-05.key ubuntu@129.225.68.89 "grep -c '<your new string>' /opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts"
+ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.68.89 "grep -c '<your new string>' /opt/ReachPilot/server-v2/src/modules/drivers/playwright-linkedin.driver.ts"
 ```
 
 Logs:
 
 ```bash
-ssh -i ~/Downloads/ssh-key-2026-08-05.key ubuntu@129.225.68.89 "pm2 logs rp-worker --lines 50 --nostream"
+ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.68.89 "pm2 logs rp-worker --lines 50 --nostream"
 ```
 
 ## Runbook B — desktop deploy (required for driver changes)
@@ -161,7 +173,7 @@ vercel --prod --yes --name reachpilot
 | | |
 |---|---|
 | SSH user | `ubuntu` |
-| SSH key | `~/Downloads/ssh-key-2026-08-05.key` |
+| SSH key | `~/.ssh/oci_reachpilot.key` |
 | Server code path | `/opt/ReachPilot/` (rsync'd, not git) |
 | Server env | `/opt/ReachPilot/server-v2/.env` |
 | API | `129.225.104.114`, pm2 `rp-api`, port 4000 |
