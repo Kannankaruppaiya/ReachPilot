@@ -59,7 +59,7 @@ async function main() {
     await clearPacing();
     let allowedCount = 0;
     for (let i = 0; i < 30; i++) {
-      await redis.del(`pacing:linkedin:${acctId}:lastaction`); // bypass spacing to probe daily cap
+      await redis.del(`pacing:linkedin:${acctId}:nextallowed`); // bypass spacing to probe daily cap
       const r = await pacing.checkPacingAndRegister(acctId, 'linkedin', wsId, false);
       if (r.allowed) allowedCount++; else break;
     }
@@ -69,7 +69,7 @@ async function main() {
     await clearPacing();
     let cap2 = 0;
     for (let i = 0; i < 30; i++) {
-      await redis.del(`pacing:linkedin:${acctId}:lastaction`);
+      await redis.del(`pacing:linkedin:${acctId}:nextallowed`);
       const r = await pacing.checkPacingAndRegister(acctId, 'linkedin', wsId, false);
       if (r.allowed) cap2++; else break;
     }

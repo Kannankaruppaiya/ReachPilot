@@ -125,18 +125,20 @@ export class PacingService {
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, dayOffset) };
       }
 
-      // ---- Inter-action spacing (spread the day's quota, don't burst) ----
+      // ---- Inter-action spacing (pace the session, don't burst) ----
       // Expandi-style: a fresh cold account firing its whole daily quota in a
       // 3-minute window is a bot signal. Enforce a minimum gap between actions on
-      // this account; the exact gap is randomized per account/day so it isn't a
-      // mechanical constant. Checked BEFORE the daily counter so a spacing defer
-      // doesn't consume a slot.
-      const lastKey = `pacing:linkedin:${accountId}:lastaction`;
-      const lastActionMs = Number((await redis.get(lastKey)) || 0);
-      const minGapMs = this.interactionGapMs(accountId, localDateIso);
-      if (lastActionMs && now.getTime() - lastActionMs < minGapMs) {
-        const readyAt = new Date(lastActionMs + minGapMs).toISOString();
-        return { allowed: false, nextScheduledAt: readyAt };
+      // this account; the gap is re-rolled for EVERY action (see interactionGapMs)
+      // so the account never settles onto one metronome. Checked BEFORE the daily
+      // counter so a spacing defer doesn't consume a slot.
+      // Stored as the ABSOLUTE instant the next action may run, not as the last
+      // action's timestamp. That distinction is what lets the gap be re-rolled per
+      // action (see interactionGapMs) while a blocked job re-checked minutes later
+      // still gets the same answer instead of a target that drifts on every retry.
+      const nextAllowedKey = `pacing:linkedin:${accountId}:nextallowed`;
+      const nextAllowedMs = Number((await redis.get(nextAllowedKey)) || 0);
+      if (nextAllowedMs && now.getTime() < nextAllowedMs) {
+        return { allowed: false, nextScheduledAt: new Date(nextAllowedMs).toISOString() };
       }
 
       // ---- Warm-up ramp + daily randomization ----
@@ -163,8 +165,15 @@ export class PacingService {
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, 1) };
       }
 
-      // Passed the daily gate → stamp the action time for spacing (2-day TTL).
-      await redis.set(lastKey, String(now.getTime()), 'EX', 86400 * 2);
+      // Passed the daily gate → roll THIS action's cool-down and store when the
+      // next one may run (2-day TTL). dailyCount is the day's action sequence, so
+      // every action draws a different gap.
+      await redis.set(
+        nextAllowedKey,
+        String(now.getTime() + this.interactionGapMs(accountId, localDateIso, dailyCount)),
+        'EX',
+        86400 * 2,
+      );
 
       // Per-campaign daily cap (rolls back the account slot if over).
       const campBlocked = await takeCampaignSlot(
@@ -280,6 +289,10 @@ export class PacingService {
       const tz = account?.timezone || 'UTC';
       const localDateIso = now.toLocaleDateString('en-US', { timeZone: tz });
       await redis.decr(`pacing:linkedin:${accountId}:date:${localDateIso}:daily`).catch(() => undefined);
+      // The action never happened, so its cool-down must not be charged either —
+      // otherwise a deferred job silently spends the spacing budget of a send that
+      // was never made, and the next real action waits for nothing.
+      await redis.del(`pacing:linkedin:${accountId}:nextallowed`).catch(() => undefined);
       // Only give back a weekly-invite slot if we consumed one.
       if (isInvite) await redis.decr(`pacing:linkedin:${accountId}:weekly`).catch(() => undefined);
     } else {
@@ -315,14 +328,24 @@ export class PacingService {
   }
 
   /**
-   * Minimum gap between consecutive actions on an account, randomized per
-   * account/day within 6–14 minutes. Spreads the daily quota across working
-   * hours rather than letting it burst.
+   * Cool-down before this account's NEXT action, re-rolled for EVERY action.
+   *
+   * A gap held constant for a whole day is its own fingerprint: every action on
+   * the account lands on the same metronome, which no human produces. Real
+   * sessions are lumpy — two sends inside two minutes, then a quarter of an hour
+   * away from the keyboard. `seq` (the day's action counter) makes each roll
+   * different while keeping the result deterministic, so re-checking a blocked
+   * job never moves its target time.
    */
-  private interactionGapMs(accountId: string, dateIso: string): number {
-    const minMin = 6;
-    const spanMin = 8; // → 6–14 min
-    const mins = minMin + this.seed01(accountId, dateIso, 'gap') * spanMin;
+  private interactionGapMs(accountId: string, dateIso: string, seq: number): number {
+    const s = String(seq);
+    // ~15% of actions: a long pause, the way a human steps away mid-session.
+    if (this.seed01(accountId, dateIso, 'gaproll', s) < 0.15) {
+      const mins = 8 + this.seed01(accountId, dateIso, 'gapmag', s) * 12; // 8–20 min
+      return Math.round(mins * 60_000);
+    }
+    // Otherwise 90s–7 min, skewed short — most actions follow fairly quickly.
+    const mins = 1.5 + Math.pow(this.seed01(accountId, dateIso, 'gapmag', s), 1.6) * 5.5;
     return Math.round(mins * 60_000);
   }
 

@@ -264,20 +264,29 @@ export class JobsService {
 
       // Schedule in the ACCOUNT's timezone + working hours (NOT the server clock).
       // Old code hardcoded setHours(9) which, on a UTC server, meant 9am UTC =
-      // 2:30pm IST and ignored the account's hours_start entirely. Now each day's
-      // quota starts at the account's working-hours open and is spread evenly
-      // across the [hours_start, hours_end] window so sends trickle through the
-      // day instead of all stacking at one instant (pacing still enforces the
-      // per-action minimum gap at send time).
+      // 2:30pm IST and ignored the account's hours_start entirely.
+      //
+      // Each day's quota is now released AT the window open, all of it, rather
+      // than pinned to a slot grid stepped across [hours_start, hours_end]. The
+      // grid assumed a cloud executor that is always up. Ours is the user's
+      // LAPTOP: a job pinned to 15:40 only sends if the laptop happens to be open
+      // at 15:40, so a grid across a 9-hour window demands a 9-hour session, and
+      // across a 23-hour window it demands sends at 3am. Releasing the quota at
+      // the open instead lets pacing drain it whenever the machine is actually on
+      // — open the laptop once, the queue empties, close it again.
+      //
+      // Nothing is uncapped by this: pacing still enforces the daily limit, the
+      // weekly invite cap, the working-hours window and the per-action gap at
+      // send time. This only decides when a job becomes ELIGIBLE.
       const tz = (kind === 'linkedin' && linkedinAcct?.timezone) || 'UTC';
       const parseMin = (hhmm: any, def: number) => {
         const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || ''));
         return m ? Number(m[1]) * 60 + Number(m[2]) : def;
       };
+      // Only the OPEN matters here — the close is pacing's business. That also
+      // means a window that wraps past midnight (22:00 → 06:00) needs no special
+      // case at this layer, where the old slot-grid math had to clamp it.
       const startMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_start, 9 * 60) : 9 * 60;
-      let endMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_end, 18 * 60) : 18 * 60;
-      if (endMin <= startMin) endMin = startMin + 60; // guard a wrapped/empty window
-      const windowMin = endMin - startMin;
 
       // Ensure every LinkedIn target URL carries a protocol. A bare
       // "linkedin.com/in/x" is treated as a RELATIVE path — the UI "Open" link
@@ -330,11 +339,9 @@ export class JobsService {
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
         const dayOffset = Math.floor(i / perDay);
-        const positionInDay = i % perDay;
-        // Spread evenly across the working window: first at the open, then stepped.
-        const minsFromMidnight =
-          perDay > 1 ? startMin + Math.round((windowMin * positionInDay) / perDay) : startMin;
-        const scheduledFor = wallToUtc(dayOffset, minsFromMidnight);
+        // The day's whole quota becomes DUE at the window open; pacing decides the
+        // actual send times from there. See the note above `tz` for why.
+        const scheduledFor = wallToUtc(dayOffset, startMin);
 
         const isToday = dayOffset === 0;
         const status = isToday ? 'queued' : 'scheduled';

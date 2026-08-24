@@ -26,6 +26,10 @@ import { withWorkspace } from '@/db/rls';
 const NON_SENDABLE_STATUSES = new Set(['checkpoint', 'paused', 'disconnected']);
 /** Lead statuses that suppress all outreach (opt-out / do-not-contact). */
 const SUPPRESSED_LEAD_STATUSES = new Set(['blacklisted', 'unqualified']);
+/** How long to hold a job whose desktop agent is offline. Recovery does NOT wait
+ *  this out: AgentController pulls these forward the moment the agent reappears,
+ *  so the value only decides how often we re-check a laptop that stays shut. */
+const AGENT_OFFLINE_DEFER_MS = 5 * 60_000;
 
 @Injectable()
 export class SchedulerService {
@@ -96,6 +100,9 @@ export class SchedulerService {
     let enqueued = 0;
     let deferred = 0;
     let suppressed = 0;
+    // One heartbeat read per ACCOUNT per tick, not per job — a 100-job backlog on
+    // one account is the normal shape here, and it needs one Redis GET, not 100.
+    const agentOnline = new Map<string, boolean>();
 
     // Pull a bounded batch of due jobs. Ordered oldest-first so backlog drains fairly.
     const due = await withWorkspace(workspaceId, (db) =>
@@ -171,6 +178,38 @@ export class SchedulerService {
             db
               .updateTable('jobs')
               .set({ scheduled_for: retryAt as any, last_error: `account_${acct.status}` })
+              .where('id', '=', job.id)
+              .execute(),
+          );
+          deferred++;
+          continue;
+        }
+      }
+
+      // --- Desktop-agent gate: in remote mode the executor is the USER'S LAPTOP.
+      //     With it closed there is nobody to run the action, so stop here rather
+      //     than dragging the job through BullMQ → worker → pacing → driver only
+      //     to have the driver miss the same heartbeat and defer it anyway. That
+      //     round trip costs a queue add, a worker slot, a pacing register and its
+      //     rollback, and several DB writes — repeated every few minutes, all
+      //     night, for every job in the backlog.
+      //
+      //     `last_error` MUST stay 'agent_unavailable': that is the marker
+      //     AgentController's wake-on-reconnect matches on to pull the backlog
+      //     forward when the laptop comes back. ---
+      if (kind === 'linkedin' && job.linkedin_account_id && getEnv().LINKEDIN_DRIVER === 'remote') {
+        const acctId = job.linkedin_account_id;
+        let online = agentOnline.get(acctId);
+        if (online === undefined) {
+          online = !!(await this.conn().get(`agent:hb:${acctId}`));
+          agentOnline.set(acctId, online);
+        }
+        if (!online) {
+          const retryAt = new Date(Date.now() + AGENT_OFFLINE_DEFER_MS).toISOString();
+          await withWorkspace(workspaceId, (db) =>
+            db
+              .updateTable('jobs')
+              .set({ scheduled_for: retryAt as any, last_error: 'agent_unavailable' })
               .where('id', '=', job.id)
               .execute(),
           );
