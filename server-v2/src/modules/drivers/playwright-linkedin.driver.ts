@@ -26,6 +26,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Randomized "think time" between actions — humans are noisy, bots are periodic. */
 const think = () => sleep(rnd(1500, 5000));
 
+/** The `/in/<slug>` segment of a LinkedIn profile URL, verbatim (no case change). */
+export const slugOf = (u: string): string => u.match(/\/in\/([^/?#]+)/i)?.[1] || '';
+/**
+ * True for LinkedIn's OBFUSCATED member-URN profile slug ("ACwAAC551Qg…") as
+ * opposed to a vanity slug. Scrapers emit this form; LinkedIn serves the profile
+ * but canonicalises the URL to the vanity, so the URN can never match the Connect
+ * anchor's `vanityName` and must not be used as a target-identity guard.
+ * Vanity slugs are lowercase, so the mixed-case "AC?AA" + base64url shape is
+ * unambiguous — real lowercase slugs like "acamahalakshmi" do NOT match.
+ */
+export const isOpaqueSlug = (s: string): boolean => /^AC[A-Za-z0-9]AA[A-Za-z0-9_-]{20,}$/.test(s);
+
 async function typeLikeHuman(page: Page, selector: string, text: string): Promise<void> {
   // Pick the first VISIBLE match (LinkedIn ships hidden duplicate inputs).
   const el = page.locator(selector).filter({ visible: true }).first();
@@ -420,7 +432,18 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // carry their OWN custom-invite anchors; a page-wide match once grabbed a
       // rail person's anchor and, across BullMQ retries, fired invites at several
       // wrong people. We only goto a custom-invite whose vanityName is this slug.
-      const targetSlug = (targetUrl.match(/\/in\/([^/?#]+)/i)?.[1] || '').toLowerCase();
+      //
+      // ⚠️ Scraped leads often carry LinkedIn's OBFUSCATED member-URN form
+      // ("/in/ACwAAC551Qg…") instead of the vanity slug. LinkedIn serves the
+      // profile fine but canonicalises the URL to the real vanity, so the Connect
+      // anchor's vanityName can never equal the pre-redirect ACwAA… string and the
+      // guard below aborted EVERY such invite (`connect_target_mismatch` — observed
+      // live: requested /in/ACwAAC551Qg…, landed /in/ramcacpa, anchor
+      // vanityName=ramcacpa). So: only trust a vanity slug here, and re-read it
+      // from the LANDED url once the page settles (below). A vanity targetUrl is
+      // unaffected — it resolves exactly as before.
+      const requestedSlug = slugOf(targetUrl);
+      let targetSlug = isOpaqueSlug(requestedSlug) ? '' : requestedSlug.toLowerCase();
 
       if (resp && resp.status() === 404) return { status: 'profile_gone' };
       if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
@@ -450,6 +473,19 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         .waitFor({ state: 'visible', timeout: 12000 })
         .catch(() => undefined);
       await sleep(rnd(500, 1200));
+
+      // We arrived via the opaque member-URN form and the URL has now settled —
+      // LinkedIn has canonicalised it to the real vanity, which IS a usable guard.
+      // If it somehow did not, targetSlug stays '' and the deep-link shortcut is
+      // skipped: the click path then acts on the very locator `namesTarget()`
+      // vetted, so identity is still enforced, just without the slug shortcut.
+      if (!targetSlug) {
+        const landedSlug = slugOf(page.url());
+        if (landedSlug && !isOpaqueSlug(landedSlug)) {
+          targetSlug = landedSlug.toLowerCase();
+          this.logger.log({ requestedSlug, targetSlug }, 'Resolved opaque profile URL to vanity slug');
+        }
+      }
 
       // TARGET NAME — read from the PAGE TITLE ("<Name> | LinkedIn", optionally
       // "(N) <Name> | LinkedIn"). This is far more reliable than any DOM selector:
