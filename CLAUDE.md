@@ -237,6 +237,10 @@ sendable" for a test account, and a drain test lost rows to the race).
 - `docs/LINKEDIN_AUTOMATION_FLOW.md` — the working connect flow + 7 invariants that must
   not be broken (pacing defer returns not throws, sent-before-ancillary, etc.). Read before
   touching pacing/scheduler/driver.
+- `docs/PROXY_IP_RESEARCH.md` — why we buy no proxies, and what to check if we ever
+  do. Read before anyone proposes routing LinkedIn traffic through our own VMs:
+  both are AS31898 Oracle (indexed hosting), and one geolocates to Texas. Also
+  carries the India provider matrix and the NetNut/FBI seizure.
 - `AGENTS.md` — vendor-neutral agent guide (portable quick-start).
 - `docs/adr/` — architecture decision records (e.g. 0001 Supabase migration).
 - `server-v2/.env.example` — env template (copy to `.env`).
