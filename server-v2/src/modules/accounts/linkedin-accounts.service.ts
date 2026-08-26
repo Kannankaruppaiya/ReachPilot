@@ -6,7 +6,7 @@ import { getEnv } from '@/config/env';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { ProxiesService } from './proxies.service';
 import { WorkspacesService } from '@/modules/workspaces/workspaces.service';
-import { computeWarmup } from '@/modules/engine/warmup';
+import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
 import { decideLogin } from './login-policy';
 
 let loginQueue: Queue | null = null;
@@ -141,7 +141,11 @@ export class LinkedinAccountsService {
             proxy_id: proxy?.id || null,
             password_secret_id: passwordSecretId,
             status: 'connecting',
-            connected_at: new Date().toISOString(),
+            // NOT connected_at. It marks when this account STARTED running, and
+            // the warm-up ramp measures from it — rewriting it here restarted a
+            // month-old account's ramp at 5/day every time its password was
+            // re-entered. (warmupOrigin() now also guards against this, but the
+            // field should mean what its name says.)
           })
           .where('id', '=', existing.id)
           .execute();
@@ -289,7 +293,7 @@ export class LinkedinAccountsService {
       email: acct.email,
       dailyLimit: acct.warmup_daily_limit,
       weeklyInviteCap: acct.weekly_invite_cap,
-      warmup: computeWarmup(acct.connected_at || acct.created_at, acct.warmup_daily_limit, acct.warmup_target),
+      warmup: computeWarmup(warmupOrigin(acct.connected_at, acct.created_at), acct.warmup_daily_limit, acct.warmup_target),
       // Postgres `time` comes back as "HH:MM:SS" — trim to "HH:MM" for <input type="time">.
       hoursStart: acct.hours_start ? String(acct.hours_start).slice(0, 5) : '09:00',
       hoursEnd: acct.hours_end ? String(acct.hours_end).slice(0, 5) : '18:00',

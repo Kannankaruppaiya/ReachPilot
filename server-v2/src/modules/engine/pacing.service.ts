@@ -5,7 +5,7 @@ import { getEnv } from '@/config/env';
 import { getDb } from '@/db';
 import type { DatabaseSchema } from '@/db';
 import { withWorkspace } from '@/db/rls';
-import { computeWarmup } from './warmup';
+import { computeWarmup, warmupOrigin } from './warmup';
 
 let redisClient: Redis | null = null;
 
@@ -145,7 +145,9 @@ export class PacingService {
       // The ramp curve lives in computeWarmup() (shared with the accounts API so
       // the UI shows the same number we enforce). Then jitter the cap ±15%
       // deterministically per day so it isn't a robotic constant.
-      const connectedAt = account.connected_at || account.created_at;
+      // Anchor to the EARLIER of the two: connected_at is rewritten on every
+      // credential update, so on its own it restarts the ramp at day zero.
+      const connectedAt = warmupOrigin(account.connected_at, account.created_at);
       const baseLimit = computeWarmup(
         connectedAt,
         account.warmup_daily_limit,

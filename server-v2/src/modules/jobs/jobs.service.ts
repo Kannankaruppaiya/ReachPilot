@@ -3,7 +3,7 @@ import { withWorkspace } from '@/db/rls';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
-import { computeWarmup } from '@/modules/engine/warmup';
+import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
 import { spin } from '@/modules/engine/spintax';
 
 let redisClient: Redis | null = null;
@@ -247,7 +247,7 @@ export class JobsService {
       const perDay =
         kind === 'linkedin' && linkedinAcct
           ? computeWarmup(
-              linkedinAcct.connected_at || linkedinAcct.created_at,
+              warmupOrigin(linkedinAcct.connected_at, linkedinAcct.created_at),
               linkedinAcct.warmup_daily_limit,
               linkedinAcct.warmup_target,
             ).todayLimit
