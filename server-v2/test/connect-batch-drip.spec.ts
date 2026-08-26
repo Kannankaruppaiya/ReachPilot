@@ -488,7 +488,10 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
           payload: JSON.stringify({
             name: 'Resolved Slug Person',
             target: 'https://www.linkedin.com/in/ACwAADY3-obfuscated-urn/',
-            resolvedSlug: 'https://www.linkedin.com/in/resolved-slug-person/',
+            // Bare slug, not a URL — this is the actual shape the driver writes
+            // (see playwright-linkedin.driver.ts's slugOf/vanityNameOf, both of
+            // which return a bare slug like 'resolved-slug-person', never a URL).
+            resolvedSlug: 'resolved-slug-person',
           }),
         } as any)
         .execute(),

@@ -7,6 +7,7 @@
  */
 import {
   profileKey,
+  profileKeyFromSlug,
   selectNewRows,
   type UploadRow,
 } from '@/modules/jobs/profile-key';
@@ -61,6 +62,33 @@ describe('profileKey', () => {
     expect(profileKey('')).toBeNull();
     expect(profileKey(null)).toBeNull();
     expect(profileKey(undefined)).toBeNull();
+  });
+});
+
+describe('profileKeyFromSlug', () => {
+  // The LinkedIn driver's slugOf/vanityNameOf both return a bare slug like
+  // 'ramcacpa' — never a URL — and that bare value is what gets stored as
+  // payload.resolvedSlug (see playwright-linkedin.driver.ts). profileKey
+  // itself requires a literal `linkedin.com/in/` segment, so feeding it a
+  // bare slug directly is the exact bug this helper exists to close.
+  it('THE BUG: profileKey alone returns null for a bare slug — no linkedin.com/in/ segment', () => {
+    expect(profileKey('ramcacpa')).toBeNull();
+  });
+
+  it('normalises a bare vanity slug to the identical key the equivalent full URL produces', () => {
+    expect(profileKeyFromSlug('ramcacpa')).toBe(profileKey('https://www.linkedin.com/in/ramcacpa'));
+    expect(profileKeyFromSlug('ramcacpa')).toBe('ramcacpa');
+  });
+
+  it('lowercases and trims like profileKey does', () => {
+    expect(profileKeyFromSlug('Ram-CACPA')).toBe('ram-cacpa');
+    expect(profileKeyFromSlug('  ramcacpa  ')).toBe('ramcacpa');
+  });
+
+  it('returns null for empty or nullish input, same contract as profileKey', () => {
+    expect(profileKeyFromSlug('')).toBeNull();
+    expect(profileKeyFromSlug(null)).toBeNull();
+    expect(profileKeyFromSlug(undefined)).toBeNull();
   });
 });
 

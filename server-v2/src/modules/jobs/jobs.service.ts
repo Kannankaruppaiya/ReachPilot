@@ -4,7 +4,7 @@ import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
 import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
-import { profileKey, selectNewRows } from './profile-key';
+import { profileKey, profileKeyFromSlug, selectNewRows } from './profile-key';
 import { spin } from '@/modules/engine/spintax';
 
 let redisClient: Redis | null = null;
@@ -253,10 +253,14 @@ export class JobsService {
         // Both the URL we were given and the vanity slug LinkedIn actually
         // landed on, so a member invited under an obfuscated URN is recognised
         // when a later list carries their readable URL (see Task 4).
-        for (const candidate of [p.target, p.resolvedSlug]) {
-          const key = profileKey(candidate);
-          if (key) sentKeys.add(key);
-        }
+        // resolvedSlug is a BARE slug ('ramcacpa'), not a URL — profileKey
+        // requires a literal linkedin.com/in/ segment, so it goes through
+        // profileKeyFromSlug instead, which normalises it into the same shape
+        // before comparing.
+        const targetKey = profileKey(p.target);
+        if (targetKey) sentKeys.add(targetKey);
+        const resolvedKey = profileKeyFromSlug(p.resolvedSlug);
+        if (resolvedKey) sentKeys.add(resolvedKey);
       }
 
       const selection = selectNewRows(rows, sentKeys);

@@ -51,6 +51,23 @@ export function profileKey(url: string | null | undefined): string | null {
 }
 
 /**
+ * Same identity as `profileKey`, but for a bare vanity slug instead of a URL —
+ * the shape `resolvedSlug` actually is (see `slugOf`/`vanityNameOf` in
+ * `playwright-linkedin.driver.ts`: both return a bare slug like
+ * `'ramcacpa'`, never a URL). `profileKey` requires a literal
+ * `linkedin.com/in/` segment and returns null for anything else, so a bare
+ * slug passed to it directly is silently dropped — this wraps the slug into
+ * the shape `profileKey` already parses, so a bare slug and the equivalent
+ * full URL land on the identical key. `profileKey` itself is left untouched:
+ * its strictness on unparseable input is load-bearing for `selectNewRows`.
+ */
+export function profileKeyFromSlug(slug: string | null | undefined): string | null {
+  const raw = (slug || '').trim();
+  if (!raw) return null;
+  return profileKey(`https://www.linkedin.com/in/${raw}`);
+}
+
+/**
  * Split an upload into the rows worth queuing and the rows already contacted.
  *
  * A row is skipped when its key is in `sentKeys`, or when an earlier row in the
