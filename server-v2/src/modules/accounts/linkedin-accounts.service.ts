@@ -7,6 +7,7 @@ import { SecretsService } from '@/modules/vault/secrets.service';
 import { ProxiesService } from './proxies.service';
 import { WorkspacesService } from '@/modules/workspaces/workspaces.service';
 import { computeWarmup } from '@/modules/engine/warmup';
+import { decideLogin } from './login-policy';
 
 let loginQueue: Queue | null = null;
 let loginRedis: Redis | null = null;
@@ -20,9 +21,6 @@ function getLoginRedis(): Redis {
   if (!loginRedis) loginRedis = new Redis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
   return loginRedis;
 }
-
-/** Repeated automated logins are the #1 ban trigger — cool down between attempts. */
-const LOGIN_COOLDOWN_SECONDS = 6 * 3600;
 
 @Injectable()
 export class LinkedinAccountsService {
@@ -39,7 +37,10 @@ export class LinkedinAccountsService {
    * and captures + stores the li_at session cookie. Runs after credentials
    * (password + optional 2FA) are in place.
    */
-  private async enqueueLogin(workspaceId: string): Promise<void> {
+  private async enqueueLogin(
+    workspaceId: string,
+    opts: { forced?: boolean } = {},
+  ): Promise<void> {
     // Scope EXPLICITLY by workspace_id — the DB connection bypasses RLS, so
     // relying on withWorkspace alone would pick the globally-first account (a
     // cross-tenant leak). Pick the most recently connected one in THIS workspace.
@@ -54,22 +55,45 @@ export class LinkedinAccountsService {
     );
     if (!account) return;
 
-    // Already logged in → the cookie IS the session; never re-login for it.
-    if (account.session_secret_id) {
-      this.logger.log(`Account ${account.id} already has a session — skipping login`);
+    // Is a login already rate-limited? Peek first so the decision below sees the
+    // real state (the SET NX that claims the window happens once we've decided).
+    const cdKey = `login:cooldown:${account.id}`;
+    const cooldownActive = !!(await getLoginRedis().get(cdKey).catch(() => null));
+
+    const decision = decideLogin({
+      hasSession: !!account.session_secret_id,
+      forced: !!opts.forced,
+      cooldownActive,
+    });
+
+    if (!decision.enqueue) {
+      this.logger.warn(`Not logging in ${account.id} — ${decision.reason}`);
       return;
     }
 
-    // Login cooldown: SET NX with TTL. If the key already exists, a login was
-    // attempted within the cooldown window — don't hammer LinkedIn again.
-    const cdKey = `login:cooldown:${account.id}`;
-    const fresh = await getLoginRedis()
-      .set(cdKey, String(Date.now()), 'EX', LOGIN_COOLDOWN_SECONDS, 'NX')
-      .catch(() => 'OK'); // Redis down → don't block the connect flow
-    if (fresh === null) {
-      this.logger.warn(`Login cooldown active for ${account.id} — skipping re-login`);
-      return;
+    // A forced login means the user just re-entered their credentials, so the
+    // stored cookie is by definition suspect. Drop it BEFORE enqueuing: while it
+    // is still there it blocks the very login meant to replace it, which is how
+    // a signed-out account became unrecoverable (three "Update login" presses,
+    // three stored credential sets, zero logins). See `login-policy.ts`.
+    if (decision.clearStoredSession) {
+      await withWorkspace(workspaceId, (db) =>
+        db
+          .updateTable('linkedin_accounts')
+          // Explicit workspace scope — the DB role bypasses RLS.
+          .where('workspace_id', '=', workspaceId)
+          .where('id', '=', account.id)
+          .set({ session_secret_id: null })
+          .execute(),
+      );
+      this.logger.log(`Cleared the stale stored session for ${account.id} before re-login`);
     }
+
+    // Claim the cool-down window. SET NX so two concurrent presses still yield
+    // one login; Redis down → don't block the connect flow.
+    await getLoginRedis()
+      .set(cdKey, String(Date.now()), 'EX', decision.cooldownSeconds, 'NX')
+      .catch(() => 'OK');
 
     await getLoginQueue().add(
       'login',
@@ -169,7 +193,7 @@ export class LinkedinAccountsService {
     await this.workspaces.updateOnboardingStep(workspaceId, 3);
 
     // Credentials + 2FA in place → capture the session cookie.
-    await this.enqueueLogin(workspaceId).catch((e) =>
+    await this.enqueueLogin(workspaceId, { forced: true }).catch((e) =>
       this.logger.error(`Failed to enqueue login: ${e.message}`),
     );
 
@@ -189,7 +213,7 @@ export class LinkedinAccountsService {
     await this.workspaces.updateOnboardingStep(workspaceId, 3);
 
     // No 2FA, but password is in place → attempt login / cookie capture.
-    await this.enqueueLogin(workspaceId).catch((e) =>
+    await this.enqueueLogin(workspaceId, { forced: true }).catch((e) =>
       this.logger.error(`Failed to enqueue login: ${e.message}`),
     );
 

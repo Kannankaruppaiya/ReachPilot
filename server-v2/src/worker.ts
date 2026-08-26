@@ -15,7 +15,9 @@ import {
   SKIP_OUTCOMES,
   ACCOUNT_HALT_OUTCOMES,
   TERMINAL_FAIL_OUTCOMES,
+  DEFER_OUTCOMES,
 } from '@/modules/drivers/linkedin-driver.interface';
+import { serializeSession } from '@/modules/drivers/linkedin-session-store';
 import { EmailDriver } from '@/modules/drivers/email-driver.interface';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { PacingService } from '@/modules/engine/pacing.service';
@@ -226,6 +228,10 @@ async function bootstrap() {
   // by the scheduler after this backoff — short enough to resume within minutes of
   // the agent coming back, long enough to avoid hot-looping while it stays offline.
   const AGENT_OFFLINE_BACKOFF_MS = 3 * 60 * 1000;
+  // Same idea for a page that never loaded, but a slower beat: a bad link tends
+  // to stay bad for a while, and unlike an offline agent there is no heartbeat to
+  // tell us it recovered — so back off further rather than re-driving into it.
+  const NETWORK_BACKOFF_MS = 10 * 60 * 1000;
 
   const linkedinWorker = new Worker(
     'linkedin-actions',
@@ -474,6 +480,26 @@ async function bootstrap() {
         return;
       }
 
+      // The profile page never loaded on the user's own link. Same shape as the
+      // agent-offline case: the account is fine, the lead is fine, the CONNECTION
+      // was down. The driver only reports this from an action's FIRST navigation,
+      // so nothing was clicked and nothing was sent — safe to re-drive. Defer;
+      // never mark 'failed' (which would surface a healthy lead as dead in the UI)
+      // and never throw (which would burn the BullMQ attempts on a bad-network
+      // window and lose the job for good).
+      if (DEFER_OUTCOMES.includes(res.status)) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        const retryAt = new Date(Date.now() + NETWORK_BACKOFF_MS).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.error || res.status }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.warn({ jobId, accountId, retryAt, reason: res.error }, 'Page never loaded (network) — deferred to scheduler, lead NOT failed');
+        return;
+      }
+
       // Terminal per-lead failures — mark failed, no retry. No invite left our
       // account, so give the pacing slot back.
       if (TERMINAL_FAIL_OUTCOMES.includes(res.status)) {
@@ -547,9 +573,15 @@ async function bootstrap() {
         : {};
 
       if (res.status === 'connected' && res.li_at) {
-        // Store the captured session cookie encrypted; the password stays put but
-        // is no longer needed for actions — the cookie IS the login now.
-        const sessionSecretId = await secrets.encrypt(res.li_at, 'linkedin_session', { workspaceId });
+        // Store the captured session encrypted. Prefer the WHOLE jar: `li_at`
+        // alone cannot restore a session on a fresh profile (it redirect-loops
+        // without JSESSIONID/bcookie/liap), so storing only that left us with a
+        // "backup" that could never actually bring an account back.
+        const sessionSecretId = await secrets.encrypt(
+          res.cookies?.length ? serializeSession(res.cookies) : res.li_at,
+          'linkedin_session',
+          { workspaceId },
+        );
         await withWorkspace(workspaceId, async (db) => {
           await db
             .updateTable('linkedin_accounts')

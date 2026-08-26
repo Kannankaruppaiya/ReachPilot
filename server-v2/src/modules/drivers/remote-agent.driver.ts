@@ -132,7 +132,7 @@ export class RemoteAgentDriver implements LinkedInDriver {
       // Forward the session cookie so the desktop agent acts as the logged-in
       // user. proxy/fingerprint are intentionally NOT sent — actions run on the
       // user's own residential IP + persistent profile, same as the login did.
-      { token: randomUUID(), action, accountId, workspaceId: ctx?.workspaceId, li_at: ctx?.li_at, ...payload },
+      { token: randomUUID(), action, accountId, workspaceId: ctx?.workspaceId, li_at: ctx?.li_at, cookies: ctx?.cookies, ...payload },
       { pickupMs: 120_000, hardCapMs: 420_000 },
     );
     if (res.result) return res.result as LinkedInActionResult;

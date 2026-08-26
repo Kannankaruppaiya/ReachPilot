@@ -146,10 +146,18 @@ function getDriver() {
 // accountId so the persistent profile (session) is shared across login + actions.
 async function runJob(job) {
   const d = getDriver();
-  // li_at = the logged-in session cookie forwarded by the server; the driver's
-  // action methods require it (otherwise NO_SESSION). Actions reuse the account's
+  // The session the server holds for this account, forwarded per job. `cookies`
+  // is the full captured jar; `li_at` is the same session in the older one-cookie
+  // form, kept so an older server still works. The driver only SEEDS a profile
+  // that has no session of its own — it never overwrites a live one (that bug
+  // destroyed hand-made logins on the next job). Actions reuse the account's
   // persistent profile on the user's own IP.
-  const ctx = { accountId: job.accountId, workspaceId: job.workspaceId, li_at: job.li_at };
+  const ctx = {
+    accountId: job.accountId,
+    workspaceId: job.workspaceId,
+    li_at: job.li_at,
+    cookies: job.cookies,
+  };
   switch (job.action) {
     case 'login':
       // One-time login on the user's own IP — populates the accountId profile.

@@ -8,6 +8,9 @@
  * The worker selects one at runtime via the LINKEDIN_DRIVER env var and the
  * LINKEDIN_DRIVER DI token (see drivers.module.ts).
  */
+import type { StoredCookie } from './linkedin-session-store';
+
+export type { StoredCookie };
 
 /** Every action resolves to exactly ONE known outcome — never an unclassified crash. */
 export type LinkedInOutcome =
@@ -19,7 +22,8 @@ export type LinkedInOutcome =
   | 'limit_reached' // LinkedIn weekly/daily limit hit — pause account
   | 'checkpoint' // CAPTCHA / security challenge — STOP, pause account
   | 'profile_gone' // 404 / deactivated — mark lead dead
-  | 'blocked'; // we've been blocked by the target — skip
+  | 'blocked' // we've been blocked by the target — skip
+  | 'network_error'; // the page never loaded — nothing was clicked, defer and re-drive
 
 export interface ProxyConfig {
   /** host:port or http://host:port — the egress the browser routes through. */
@@ -41,8 +45,13 @@ export interface LinkedInFingerprint {
 export interface LinkedInActionContext {
   accountId?: string;
   workspaceId?: string;
-  /** The li_at session cookie — the "logged-in" state. */
+  /** The li_at session cookie — the "logged-in" state. Kept for the desktop
+   *  agent wire and for accounts stored before `cookies` existed. */
   li_at?: string;
+  /** The FULL captured jar. `li_at` alone cannot hold a LinkedIn session (it
+   *  redirect-loops without JSESSIONID/bcookie/liap), so this is what actually
+   *  restores one on a fresh profile. See `linkedin-session-store.ts`. */
+  cookies?: StoredCookie[];
   proxy?: ProxyConfig;
   fingerprint?: LinkedInFingerprint;
 }
@@ -71,6 +80,9 @@ export interface LinkedInLoginResult {
   status: 'connected' | 'checkpoint' | 'failed';
   /** Captured session cookie on success. Caller encrypts + stores it. */
   li_at?: string;
+  /** The whole jar captured alongside `li_at` — what the caller should actually
+   *  persist, so a fresh profile can be restored rather than redirect-looping. */
+  cookies?: StoredCookie[];
   fingerprint?: LinkedInFingerprint;
   error?: string;
   /** Public egress IP the desktop agent logged in from (ipify echo). */
@@ -111,12 +123,19 @@ export interface LinkedInSyncResult {
 export const SKIP_OUTCOMES: LinkedInOutcome[] = ['already_connected', 'pending'];
 /** Outcomes that must pause the whole account, not just fail the one job. */
 export const ACCOUNT_HALT_OUTCOMES: LinkedInOutcome[] = ['checkpoint', 'limit_reached'];
-/** Terminal per-lead failures — mark failed but do NOT retry. */
+/** Terminal per-lead failures — mark failed but do NOT retry.
+ *  `network_error` is deliberately NOT here: it means we never got a usable page,
+ *  so nothing was clicked and nothing was sent. Treating a bad connection as a
+ *  terminal verdict about the LEAD is how a slow link permanently burned live
+ *  prospects — the worker defers it instead (see DEFER_OUTCOMES). */
 export const TERMINAL_FAIL_OUTCOMES: LinkedInOutcome[] = [
   'no_connect_button',
   'profile_gone',
   'blocked',
 ];
+/** Outcomes that mean "the executor couldn't run, not that the lead is bad" —
+ *  reschedule with a backoff; never fail the job, never burn a BullMQ attempt. */
+export const DEFER_OUTCOMES: LinkedInOutcome[] = ['network_error'];
 
 export interface LinkedInDriver {
   /** Perform a connection request; optionally with a personalized note. */

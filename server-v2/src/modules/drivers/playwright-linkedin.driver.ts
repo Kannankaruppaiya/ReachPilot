@@ -18,6 +18,12 @@ import {
   LinkedInFingerprint,
 } from './linkedin-driver.interface';
 import { CONNECT_NAME, SELECTORS, resolveFirst, type SelectorScope } from './linkedin-selectors';
+import {
+  parseStoredSession,
+  cookiesToInject,
+  classifyPinChallenge,
+  type StoredCookie,
+} from './linkedin-session-store';
 
 /* ---------------- human-like helpers ---------------- */
 
@@ -55,6 +61,96 @@ async function humanScroll(page: Page): Promise<void> {
     await page.mouse.wheel(0, rnd(200, 600));
     await sleep(rnd(300, 900));
   }
+}
+
+/* ---------------- navigation on a slow link ---------------- */
+
+/** Budget for committing a profile navigation (response headers only). */
+const NAV_COMMIT_TIMEOUT_MS = 45_000;
+/** Budget for the page to become USABLE once the navigation has committed. */
+const NAV_READY_TIMEOUT_MS = 45_000;
+/** Navigation attempts. Two, because packet loss drops the odd request outright. */
+const NAV_ATTEMPTS = 2;
+/**
+ * How long the lazily-hydrated top-card action bar gets to appear. Raised from
+ * 12 s: on a slow link those buttons arrive by XHR well after the HTML, and a
+ * premature scan reports a false `no_connect_button` — which is TERMINAL, so a
+ * momentary slowdown permanently burned the lead.
+ */
+const ACTION_BAR_TIMEOUT_MS = 30_000;
+
+/** The bit of a navigation response {@link gotoProfile} reads. */
+export interface NavResponse {
+  status(): number;
+}
+/**
+ * The slice of a Playwright `Page` that {@link gotoProfile} touches. A real
+ * `Page` satisfies it structurally, and so does a plain object — which is what
+ * makes the navigation policy unit-testable without launching a browser.
+ */
+export interface NavigablePage {
+  goto(url: string, opts: { waitUntil: 'commit'; timeout: number }): Promise<NavResponse | null>;
+  waitForLoadState(state: 'domcontentloaded', opts: { timeout: number }): Promise<void>;
+  locator(selector: string): {
+    first(): { waitFor(opts: { state: 'attached'; timeout: number }): Promise<void> };
+  };
+}
+
+/**
+ * Navigate to a LinkedIn profile over a link that may be SLOW.
+ *
+ * The previous gate — `waitUntil: 'domcontentloaded'` with a 30 s cap — was the
+ * single biggest source of lost leads on a poor connection. A profile document
+ * is 1–2 MB, so at a few tens of kB/s the parse does not FINISH inside 30 s even
+ * though the page has already painted and Connect is on screen. Observed live on
+ * a 15 kB/s link: the tab visibly showed the target's Connect button while
+ * `page.goto` threw `Timeout 30000ms exceeded`, the driver's `finally` closed the
+ * context (the "tab closes by itself" symptom), and a good lead was recorded as
+ * failed.
+ *
+ * Document-complete is simply the wrong signal — what the caller needs is a
+ * rendered body. So: commit the navigation (headers only, unaffected by a slow
+ * tail), then wait on that real condition with a generous budget. Neither wait is
+ * fatal on its own, so a slow tail can no longer fail a page that has rendered.
+ *
+ * Callers must use this only for the FIRST navigation of an action: a failure
+ * here proves nothing was clicked and nothing was sent, which is exactly what
+ * makes re-driving a `network_error` safe.
+ */
+export async function gotoProfile(
+  page: NavigablePage,
+  url: string,
+  onRetry?: (reason: string) => void,
+): Promise<{ resp: NavResponse | null; error?: string }> {
+  let lastErr = '';
+  for (let attempt = 0; attempt < NAV_ATTEMPTS; attempt++) {
+    if (attempt) {
+      onRetry?.(lastErr);
+      await sleep(rnd(2000, 5000));
+    }
+    let resp: NavResponse | null = null;
+    try {
+      resp = await page.goto(url, { waitUntil: 'commit', timeout: NAV_COMMIT_TIMEOUT_MS });
+    } catch (err: any) {
+      lastErr = String(err?.message || err).split('\n')[0].trim();
+      continue;
+    }
+    // A 404 is a real answer, not a slow page. Hand it straight back so the
+    // caller can classify the profile as gone instead of retrying a dead URL.
+    if (resp && resp.status() === 404) return { resp };
+    await page
+      .waitForLoadState('domcontentloaded', { timeout: NAV_READY_TIMEOUT_MS })
+      .catch(() => undefined);
+    const rendered = await page
+      .locator('main, h1')
+      .first()
+      .waitFor({ state: 'attached', timeout: NAV_READY_TIMEOUT_MS })
+      .then(() => true)
+      .catch(() => false);
+    if (rendered) return { resp };
+    lastErr = 'body never rendered';
+  }
+  return { resp: null, error: lastErr || 'navigation_failed' };
 }
 
 const DEFAULT_UA =
@@ -217,6 +313,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
     proxy?: ProxyConfig;
     fingerprint?: LinkedInFingerprint;
     li_at?: string;
+    cookies?: StoredCookie[];
   }): Promise<BrowserContext> {
     const { chromium } = await import('playwright');
     const env = getEnv();
@@ -285,10 +382,26 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
     await this.applyStealth(context, langs);
 
-    if (opts.li_at) {
-      await context.addCookies([
-        { name: 'li_at', value: opts.li_at, domain: '.linkedin.com', path: '/' },
-      ]);
+    // Restore the stored session ONLY into a profile that has none.
+    //
+    // The old code injected our stored `li_at` unconditionally, over whatever the
+    // profile already had. That is backwards: the profile's cookie is what
+    // LinkedIn last handed THIS browser, while the vault's was captured at the
+    // last login and never refreshed. Observed live — the two had diverged, and
+    // the injection replaced a working cookie with a revoked one, so a session
+    // the user had just signed in by hand was destroyed by the next job.
+    const stored = opts.cookies?.length ? opts.cookies : parseStoredSession(opts.li_at);
+    if (stored.length) {
+      const existing = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+      const inject = cookiesToInject(existing, stored);
+      if (inject.length) {
+        await context.addCookies(inject as Parameters<BrowserContext['addCookies']>[0]);
+      } else {
+        this.logger.log(
+          { accountId: opts.accountId },
+          'Profile already holds a LinkedIn session — keeping it, not injecting the stored copy',
+        );
+      }
     }
     return context;
   }
@@ -421,10 +534,21 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
-      const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const nav = await gotoProfile(page, targetUrl, (reason) =>
+        this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+      );
+      if (nav.error) {
+        this.logger.warn(
+          { targetUrl, error: nav.error },
+          'Profile never loaded — deferring as a network failure (nothing was sent)',
+        );
+        return { status: 'network_error', error: `nav_failed: ${nav.error}` };
+      }
+      const resp = nav.resp;
       await think();
 
       // The /in/<slug> of the INTENDED target — a hard guard on the custom-invite
@@ -470,7 +594,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       await main
         .getByRole('button', { name: /^(Connect|Message|Follow|Following|More|More actions|Pending)$/i })
         .first()
-        .waitFor({ state: 'visible', timeout: 12000 })
+        .waitFor({ state: 'visible', timeout: ACTION_BAR_TIMEOUT_MS })
         .catch(() => undefined);
       await sleep(rnd(500, 1200));
 
@@ -517,10 +641,14 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
           { requested: targetUrl, landedUrl, title: pageTitle, redirected, nameHeading },
           'Target name unreadable — aborting, no page-wide Connect fallback',
         );
-        return {
-          status: 'no_connect_button',
-          error: redirected ? 'redirected_off_profile' : 'profile_not_loaded',
-        };
+        // A redirect OFF the profile is a real answer about this URL (auth wall,
+        // gone) and stays terminal. An unreadable name on a profile URL is not —
+        // it means we never got a usable page. Classifying that as
+        // `no_connect_button` (TERMINAL, never retried) is how a slow link turned
+        // live prospects into permanent failures; defer it instead.
+        return redirected
+          ? { status: 'no_connect_button', error: 'redirected_off_profile' }
+          : { status: 'network_error', error: 'profile_not_loaded' };
       }
 
       // Precise, name-constrained matchers. LinkedIn labels each Connect control
@@ -1072,10 +1200,17 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
-      const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const nav = await gotoProfile(page, targetUrl, (reason) =>
+        this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+      );
+      // Failing HERE is before anything is typed or clicked, so the message
+      // provably did not go out and re-driving it cannot double-send.
+      if (nav.error) return { status: 'network_error', error: `nav_failed: ${nav.error}` };
+      const resp = nav.resp;
       await think();
       if (resp && resp.status() === 404) return { status: 'profile_gone' };
       if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
@@ -1120,9 +1255,16 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       proxy: ctx.proxy,
       fingerprint: ctx.fingerprint,
       li_at: ctx.li_at,
+      cookies: ctx.cookies,
     });
     const page = context.pages()[0] || (await context.newPage());
-    const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const nav = await gotoProfile(page, targetUrl, (reason) =>
+      this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+    );
+    if (nav.error) {
+      return { ok: false, context, result: { status: 'network_error', error: `nav_failed: ${nav.error}` } };
+    }
+    const resp = nav.resp;
     await think();
     if (resp && resp.status() === 404) return { ok: false, context, result: { status: 'profile_gone' } };
     if (await this.isCheckpoint(page)) return { ok: false, context, result: { status: 'checkpoint' } };
@@ -1309,6 +1451,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
@@ -1384,6 +1527,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
       await page.goto('https://www.linkedin.com/mynetwork/invitation-manager/sent/', {
@@ -1445,11 +1589,15 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
       // If the persistent profile is already signed in, reuse it — no
       // re-login (repeated logins are the #1 bot-detection trigger).
-      const existing = (await context.cookies('https://www.linkedin.com')).find(
-        (c) => c.name === 'li_at',
-      );
+      const jar = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+      const existing = jar.find((c) => c.name === 'li_at');
       if (existing?.value) {
-        return { status: 'connected', li_at: existing.value, fingerprint: ctx.fingerprint };
+        return {
+          status: 'connected',
+          li_at: existing.value,
+          cookies: jar,
+          fingerprint: ctx.fingerprint,
+        };
       }
 
       await page.goto('https://www.linkedin.com/login', {
@@ -1460,8 +1608,11 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
       // Already authenticated (redirected to feed)? Capture and stop.
       if (/\/feed|\/checkpoint\/lg\/login-submit/.test(page.url())) {
-        const c = (await context.cookies('https://www.linkedin.com')).find((x) => x.name === 'li_at');
-        if (c?.value) return { status: 'connected', li_at: c.value, fingerprint: ctx.fingerprint };
+        const j2 = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+        const c = j2.find((x) => x.name === 'li_at');
+        if (c?.value) {
+          return { status: 'connected', li_at: c.value, cookies: j2, fingerprint: ctx.fingerprint };
+        }
       }
 
       // LinkedIn serves several login layouts — try robust selectors.
@@ -1489,6 +1640,27 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         (await page.locator(pinSel).count()) > 0;
       if (needs2fa) {
         if (!ctx.totpSecret) return { status: 'checkpoint', error: '2FA required but no TOTP seed stored' };
+
+        // WHICH code is LinkedIn asking for? A stored seed can only answer the
+        // authenticator challenge. Typing that code into an email/SMS challenge
+        // submits a WRONG pin — a failed login attempt, which is exactly the
+        // signal that gets an account challenged harder. Stop instead of
+        // guessing, and say which factor is needed so the UI can explain it.
+        const challengeText = (await page.locator('body').innerText().catch(() => '')) || '';
+        const challenge = classifyPinChallenge(challengeText);
+        if (challenge !== 'totp') {
+          this.logger.warn(
+            { accountId: ctx.accountId, challenge },
+            'LinkedIn asked for a code we cannot generate — not guessing with the TOTP seed',
+          );
+          return {
+            status: 'checkpoint',
+            error:
+              challenge === 'unknown'
+                ? 'unrecognised_pin_challenge'
+                : `${challenge}_pin_required`,
+          };
+        }
         // Pick the VISIBLE input/button (LinkedIn ships hidden duplicates).
         const pinInput = page.locator(pinSel).filter({ visible: true }).first();
         // The PIN field may never actually appear: LinkedIn can auto-trust this
@@ -1520,8 +1692,10 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         return { status: 'checkpoint', error: 'Security checkpoint during login' };
       }
 
-      // Capture the li_at cookie — this IS the logged-in session.
-      const cookies = await context.cookies('https://www.linkedin.com');
+      // Capture the WHOLE jar. `li_at` names the session, but it cannot hold one
+      // on its own: replayed alone into a fresh profile it redirect-loops, because
+      // LinkedIn also needs JSESSIONID / bcookie / bscookie / liap alongside it.
+      const cookies = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
       const liAt = cookies.find((c) => c.name === 'li_at');
       if (!liAt?.value) {
         return { status: 'failed', error: 'Login did not yield a session cookie (bad credentials?)' };
@@ -1530,6 +1704,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       return {
         status: 'connected',
         li_at: liAt.value,
+        cookies,
         fingerprint: ctx.fingerprint,
       };
     } catch (err: any) {

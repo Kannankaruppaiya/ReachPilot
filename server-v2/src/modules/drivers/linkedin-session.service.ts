@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
+import { parseStoredSession } from './linkedin-session-store';
 import { getEnv } from '@/config/env';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import {
@@ -110,17 +111,24 @@ export class LinkedInSessionService {
       return null;
     }
 
-    let li_at: string | undefined;
+    let secret: string | undefined;
     if (acct.session_secret_id) {
-      li_at = await this.secrets
+      secret = await this.secrets
         .decrypt(acct.session_secret_id, { workspaceId: acct.workspace_id })
         .catch(() => undefined);
     }
+    // The vault may hold either the full jar (current) or a bare li_at (accounts
+    // connected before the jar existed) — `parseStoredSession` normalises both.
+    // `li_at` is still populated because the desktop-agent wire and older bundles
+    // read that field.
+    const cookies = parseStoredSession(secret);
+    const li_at = cookies.find((c) => c.name === 'li_at')?.value;
 
     return {
       accountId: acct.id,
       workspaceId: acct.workspace_id,
       li_at,
+      cookies,
       proxy: this.proxyFor({ ip: acct.proxy_ip as string | null, provider: (acct as any).proxy_provider }),
       fingerprint: this.fingerprintFor(acct.id, acct.country, acct.timezone),
     };
