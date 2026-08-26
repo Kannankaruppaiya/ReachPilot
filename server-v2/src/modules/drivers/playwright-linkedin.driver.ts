@@ -36,6 +36,16 @@ const think = () => sleep(rnd(1500, 5000));
 /** The `/in/<slug>` segment of a LinkedIn profile URL, verbatim (no case change). */
 export const slugOf = (u: string): string => u.match(/\/in\/([^/?#]+)/i)?.[1] || '';
 /**
+ * The `vanityName` query parameter of a LinkedIn custom-invite deep-link
+ * ("/preload/custom-invite/?vanityName=<slug>"), verbatim (no case change,
+ * no decoding) — the SAME normalised shape `slugOf` produces, so both feed
+ * `profileKey` identically. On the fast confirm path (toast / Pending flip),
+ * the page never navigates back to an `/in/<slug>` URL — this is the only
+ * slug LinkedIn has handed us at that point, and it's already on the current
+ * URL, so no extra navigation is needed to read it.
+ */
+export const vanityNameOf = (u: string): string => u.match(/[?&]vanityName=([^&]+)/i)?.[1] || '';
+/**
  * True for LinkedIn's OBFUSCATED member-URN profile slug ("ACwAAC551Qg…") as
  * opposed to a vanity slug. Scrapers emit this form; LinkedIn serves the profile
  * but canonicalises the URL to the vanity, so the URN can never match the Connect
@@ -1177,7 +1187,10 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
       }
 
-      const landedSlug = slugOf(page.url());
+      // The fast confirm path (toast / Pending flip) never navigates back to an
+      // /in/<slug> URL — the page is still on the custom-invite deep-link, so
+      // fall back to its vanityName param rather than losing the slug.
+      const landedSlug = slugOf(page.url()) || vanityNameOf(page.url());
       const externalId = 'li_inv_' + Date.now().toString(36);
       return {
         status: 'sent',
