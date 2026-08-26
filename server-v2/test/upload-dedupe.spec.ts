@@ -90,6 +90,23 @@ describe('profileKeyFromSlug', () => {
     expect(profileKeyFromSlug(null)).toBeNull();
     expect(profileKeyFromSlug(undefined)).toBeNull();
   });
+
+  // Defence in depth. Today every producer of resolvedSlug returns a BARE slug,
+  // so this cannot happen — but the helper concatenates its argument into
+  // `https://www.linkedin.com/in/<slug>`, and a full URL passed in would build
+  // `.../in/https://www.linkedin.com/in/john-doe`, whose first path segment is
+  // `https:`. That is not a miss, it is a WRONG key that would silently match
+  // any other doubled URL and never match the real person. Accept either shape.
+  it('a full URL that reaches it anyway yields the same key, not the garbage `https:`', () => {
+    expect(profileKeyFromSlug('https://www.linkedin.com/in/john-doe')).toBe('john-doe');
+    expect(profileKeyFromSlug('https://www.linkedin.com/in/John-Doe/')).toBe('john-doe');
+    expect(profileKeyFromSlug('linkedin.com/in/john-doe')).toBe('john-doe');
+    expect(profileKeyFromSlug('https://in.linkedin.com/in/john-doe?utm=x')).toBe('john-doe');
+  });
+
+  it('a slug that merely CONTAINS the word linkedin is still treated as a slug', () => {
+    expect(profileKeyFromSlug('linkedin-expert')).toBe('linkedin-expert');
+  });
 });
 
 describe('selectNewRows', () => {

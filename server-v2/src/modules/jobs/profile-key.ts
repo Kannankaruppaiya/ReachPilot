@@ -64,6 +64,13 @@ export function profileKey(url: string | null | undefined): string | null {
 export function profileKeyFromSlug(slug: string | null | undefined): string | null {
   const raw = (slug || '').trim();
   if (!raw) return null;
+  // Defence in depth: every producer of `resolvedSlug` today returns a bare
+  // slug, but if one ever stored a full URL the concatenation below would build
+  // `.../in/https://www.linkedin.com/in/john-doe` and `profileKey` would take
+  // `https:` as the slug. That is worse than a miss — it is a wrong key that
+  // matches any other doubled URL and never matches the real person. Anything
+  // already carrying a `linkedin.com/in/` segment goes straight to `profileKey`.
+  if (/linkedin\.com\/in\//i.test(raw)) return profileKey(raw);
   return profileKey(`https://www.linkedin.com/in/${raw}`);
 }
 
