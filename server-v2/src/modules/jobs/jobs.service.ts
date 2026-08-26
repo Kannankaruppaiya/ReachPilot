@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
 import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
+import { profileKey, selectNewRows } from './profile-key';
 import { spin } from '@/modules/engine/spintax';
 
 let redisClient: Redis | null = null;
@@ -212,12 +213,61 @@ export class JobsService {
     template: string,
     subject?: string,
     personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string; noNote?: boolean } = {},
-  ): Promise<{ batchId: string; total: number; today: number; queuedDays: number }> {
+  ): Promise<{ batchId: string; total: number; today: number; queuedDays: number; skipped: number }> {
     if (kind !== 'linkedin' && kind !== 'email') {
       throw new BadRequestException('Invalid channel.');
     }
     if (!Array.isArray(rows) || rows.length === 0) {
       throw new BadRequestException('No profiles to send to.');
+    }
+
+    // Drop profiles this workspace has already sent a connection request to.
+    // Re-inviting someone spends weekly invite allowance a new prospect needed,
+    // and repeat invites to the same member are what automation detection looks
+    // for. Only SENT jobs count: a queued one has not happened yet, and a failed
+    // one is usually a bad network window rather than a verdict about the person.
+    let skipped = 0;
+    if (kind === 'linkedin') {
+      const sentJobs = await withWorkspace(workspaceId, (db) =>
+        db
+          .selectFrom('jobs')
+          .select('payload')
+          .where('workspace_id', '=', workspaceId)
+          .where('action', '=', 'connect_request')
+          .where('status', '=', 'sent')
+          .execute(),
+      );
+
+      const sentKeys = new Set<string>();
+      for (const j of sentJobs) {
+        const p: any =
+          typeof j.payload === 'string'
+            ? (() => {
+                try {
+                  return JSON.parse(j.payload);
+                } catch {
+                  return {};
+                }
+              })()
+            : j.payload || {};
+        // Both the URL we were given and the vanity slug LinkedIn actually
+        // landed on, so a member invited under an obfuscated URN is recognised
+        // when a later list carries their readable URL (see Task 4).
+        for (const candidate of [p.target, p.resolvedSlug]) {
+          const key = profileKey(candidate);
+          if (key) sentKeys.add(key);
+        }
+      }
+
+      const selection = selectNewRows(rows, sentKeys);
+      skipped = selection.skipped.length;
+      rows = selection.kept;
+
+      if (rows.length === 0) {
+        // Uploading a list of people you have already contacted is a normal
+        // outcome, not an error — do not fall through to the empty-input throw.
+        return { batchId: '', total: 0, today: 0, queuedDays: 0, skipped };
+      }
     }
 
     const batchId = crypto.randomUUID();
@@ -406,12 +456,14 @@ export class JobsService {
         .insertInto('activity')
         .values({
           workspace_id: workspaceId,
-          text: `Queued ${totalCount} ${kind === 'linkedin' ? 'connection requests' : 'emails'} (${todayCount} today)`,
+          text:
+            `Queued ${totalCount} ${kind === 'linkedin' ? 'connection requests' : 'emails'} (${todayCount} today)` +
+            (skipped ? ` · skipped ${skipped} already contacted` : ''),
           tone: 'accent',
         })
         .execute();
 
-      return { batchId, total: totalCount, today: todayCount, queuedDays };
+      return { batchId, total: totalCount, today: todayCount, queuedDays, skipped };
     });
 
     // Transaction has committed — the rows are now visible to the worker's
