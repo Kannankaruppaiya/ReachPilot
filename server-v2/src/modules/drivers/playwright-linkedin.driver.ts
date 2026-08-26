@@ -24,6 +24,7 @@ import {
   classifyPinChallenge,
   type StoredCookie,
 } from './linkedin-session-store';
+import { classifyLoginForm, rememberedAccountMatches } from './linkedin-login-form';
 
 /* ---------------- human-like helpers ---------------- */
 
@@ -1616,17 +1617,61 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       }
 
       // LinkedIn serves several login layouts — try robust selectors.
-      await typeLikeHuman(
-        page,
-        '#username, input[autocomplete="username"], input[name="session_key"], input[type="email"]',
-        ctx.email,
-      );
-      await sleep(rnd(400, 900));
-      await typeLikeHuman(
-        page,
-        '#password, input[autocomplete="current-password"], input[name="session_password"], input[type="password"]',
-        ctx.password,
-      );
+      const USERNAME_SEL =
+        '#username, input[autocomplete="username"], input[name="session_key"], input[type="email"]';
+      const PASSWORD_SEL =
+        '#password, input[autocomplete="current-password"], input[name="session_password"], input[type="password"]';
+
+      // A profile LinkedIn RECOGNISES gets the "Welcome back" page: the account's
+      // name, a masked email, and a password field only — no username input. We
+      // use persistent profiles deliberately, so that page is the norm for a
+      // re-login, yet the old code always typed the email first and waited 15s on
+      // a selector that would never appear, threw, and closed the browser. Every
+      // re-login through an established profile died there.
+      const visible = (sel: string) =>
+        page.locator(sel).filter({ visible: true }).count().catch(() => 0);
+      let variant = classifyLoginForm({
+        hasUsernameField: (await visible(USERNAME_SEL)) > 0,
+        hasPasswordField: (await visible(PASSWORD_SEL)) > 0,
+      });
+
+      if (variant === 'remembered') {
+        // Whose account does this profile remember? A mismatch must NOT get this
+        // account's password: that is a failed login attempt against someone
+        // else's identity. Fall back to the full form via "another account".
+        const masked = (
+          (await page
+            .locator('text=/\\S+@\\S+/')
+            .first()
+            .innerText()
+            .catch(() => '')) || ''
+        ).trim();
+        if (!rememberedAccountMatches(masked, ctx.email)) {
+          this.logger.warn(
+            { accountId: ctx.accountId },
+            'Profile remembers a different account — switching to the full sign-in form',
+          );
+          await page
+            .getByRole('button', { name: /sign in using another account/i })
+            .or(page.getByRole('link', { name: /sign in using another account/i }))
+            .first()
+            .click({ timeout: 8000 })
+            .catch(() => undefined);
+          await sleep(rnd(1200, 2200));
+          variant = (await visible(USERNAME_SEL)) > 0 ? 'full' : 'unknown';
+        }
+      }
+
+      if (variant === 'unknown') {
+        return { status: 'checkpoint', error: 'unrecognised_login_page' };
+      }
+
+      if (variant === 'full') {
+        await typeLikeHuman(page, USERNAME_SEL, ctx.email);
+        await sleep(rnd(400, 900));
+      }
+      // Both layouts end the same way: password, then Sign in.
+      await typeLikeHuman(page, PASSWORD_SEL, ctx.password);
       await think();
       await page.getByRole('button', { name: /^Sign in$/ }).first().click();
       await page.waitForLoadState('domcontentloaded').catch(() => undefined);
