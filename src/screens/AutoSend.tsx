@@ -186,6 +186,19 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       })
       .filter((r) => r.name && r.target)
 
+  // Key a row against its backend job. The server normalizes every LinkedIn
+  // target with its own `withProtocol` before storing it on the job payload
+  // (`jobs.service.ts` — keep the two in step), so a CSV carrying a bare
+  // "linkedin.com/in/x" comes back as "https://linkedin.com/in/x". Matching on
+  // the raw client value missed EVERY such row, and reconciliation drops rows
+  // with no matching job — the whole table would empty out. Idempotent, so
+  // applying it to both sides is safe.
+  const targetKey = (t: string): string => {
+    const s = String(t || "").trim()
+    if (!s || mode !== "linkedin") return s
+    return /^https?:\/\//i.test(s) ? s : `https://${s.replace(/^\/+/, "")}`
+  }
+
   // Map a backend job status → the row status shown in the queue.
   const jobToRowStatus = (s: string): Row["status"] => {
     if (s === "sent") return "sent"
@@ -282,7 +295,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       ticks++
       try {
         const jobs = await api.listJobs(batchId)
-        const byTarget = new Map(jobs.map((j) => [j.target, j]))
+        const byTarget = new Map(jobs.map((j) => [targetKey(j.target), j]))
         // An empty listing is a transient read, not proof the batch vanished —
         // createSend already told us total > 0. Never reconcile against it.
         if (jobs.length > 0) {
@@ -295,7 +308,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
             rs.flatMap((r) => {
               // Keep a locally-canceled row canceled even if a stale poll returns.
               if (r.status === "canceled") return [r]
-              const j = byTarget.get(r.target)
+              const j = byTarget.get(targetKey(r.target))
               if (!j) return firstPass ? [] : [r]
               return [{ ...r, jobId: j.id, day: j.day, status: jobToRowStatus(j.status) }]
             }),
