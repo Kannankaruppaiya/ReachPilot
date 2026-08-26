@@ -299,3 +299,269 @@ describe('Auto Connect — 100 profiles in one shot, 20/day drip', () => {
     for (const r of future) expect(r.status).toBe('scheduled');
   });
 });
+
+/**
+ * createBatch() dedupe — already-invited profiles are dropped from a new
+ * upload before any rows are queued.
+ *
+ * WHY IT MATTERS
+ *   The dedupe reads prior SENT connect_request jobs and builds its
+ *   exclusion set from BOTH payload fields (`target`, the URL we were given,
+ *   and `resolvedSlug`, the vanity slug LinkedIn actually landed on — see
+ *   profile-key.ts). A regression that drops the workspace_id predicate would
+ *   leak another tenant's sent history into this one's exclusion set; a
+ *   regression that breaks the "everything skipped" early return would fall
+ *   through to crypto.randomUUID() and mint a batch for zero rows. This
+ *   suite uses its own throwaway workspace/account so it never collides with
+ *   the drip suite above.
+ */
+const WS2 = '00000000-0000-0000-0000-0000000000f3';
+const ACCT2 = '00000000-0000-0000-0000-0000000000f4';
+const OTHER_WS = '00000000-0000-0000-0000-0000000000f5';
+
+let jobs2: JobsService;
+let reachable2 = false;
+let skipReason2 = '';
+
+const t2 = (name: string, fn: () => Promise<void>, timeout = 60_000) =>
+  it(
+    name,
+    async () => {
+      if (!reachable2) {
+        console.warn(`  ↳ skipped (${skipReason2})`);
+        return;
+      }
+      await fn();
+    },
+    timeout,
+  );
+
+describe('createBatch — already-invited profiles are excluded from a new upload', () => {
+  beforeAll(async () => {
+    try {
+      assertLocalServices(getEnv());
+      await getDb().selectFrom('workspaces').select('id').limit(1).execute();
+      reachable2 = true;
+    } catch (e: any) {
+      skipReason2 = e?.message || String(e);
+      console.warn(`\n[connect-batch-drip:dedupe] SKIPPED — ${skipReason2}\n`);
+      return;
+    }
+
+    await getDb()
+      .insertInto('workspaces')
+      .values([
+        { id: WS2, name: 'TEST dedupe', goal: 'automated test' } as any,
+        { id: OTHER_WS, name: 'TEST dedupe (other tenant)', goal: 'automated test' } as any,
+      ])
+      .onConflict((oc) => oc.column('id').doNothing())
+      .execute();
+
+    // warmup_target well above the 3 rows this suite sends, so nothing spills
+    // into a second day and every kept row is "today" — keeps assertions simple.
+    await withWorkspace(WS2, (db) =>
+      db
+        .insertInto('linkedin_accounts')
+        .values({
+          id: ACCT2,
+          workspace_id: WS2,
+          email: 'dedupe-test@example.invalid',
+          country: 'IN',
+          status: 'active',
+          warmup_daily_limit: 50,
+          warmup_target: 50,
+          weekly_invite_cap: 100,
+          hours_start: '09:00',
+          hours_end: '18:00',
+          send_weekends: true,
+          timezone: 'UTC',
+          connected_at: new Date(Date.now() - 60 * 86400_000).toISOString(),
+        } as any)
+        .onConflict((oc) => oc.column('id').doNothing())
+        .execute(),
+    );
+
+    jobs2 = new JobsService();
+  }, 60_000);
+
+  afterAll(async () => {
+    if (reachable2) {
+      await withWorkspace(WS2, (db) =>
+        db.deleteFrom('jobs').where('workspace_id', '=', WS2).execute(),
+      ).catch(() => undefined);
+      await withWorkspace(WS2, (db) =>
+        db.deleteFrom('activity').where('workspace_id', '=', WS2).execute(),
+      ).catch(() => undefined);
+      await withWorkspace(WS2, (db) =>
+        db.deleteFrom('linkedin_accounts').where('id', '=', ACCT2).execute(),
+      ).catch(() => undefined);
+      await withWorkspace(OTHER_WS, (db) =>
+        db.deleteFrom('jobs').where('workspace_id', '=', OTHER_WS).execute(),
+      ).catch(() => undefined);
+      await getDb()
+        .deleteFrom('workspaces')
+        .where('id', 'in', [WS2, OTHER_WS])
+        .execute()
+        .catch(() => undefined);
+    }
+  }, 60_000);
+
+  t2('G1: a row matching a SENT job by target URL is excluded, and skipped counts it', async () => {
+    // Pre-seed a sent connect_request whose payload.target is the profile the
+    // new upload will also carry.
+    await withWorkspace(WS2, (db) =>
+      db
+        .insertInto('jobs')
+        .values({
+          id: crypto.randomUUID(),
+          workspace_id: WS2,
+          kind: 'linkedin',
+          action: 'connect_request',
+          status: 'sent',
+          scheduled_for: new Date(Date.now() - 86400_000).toISOString() as any,
+          payload: JSON.stringify({
+            name: 'Already Invited',
+            target: 'https://www.linkedin.com/in/already-invited/',
+          }),
+        } as any)
+        .execute(),
+    );
+
+    const rows = [
+      { name: 'Already Invited', target: 'https://www.linkedin.com/in/already-invited/' },
+      { name: 'Fresh Prospect', target: 'https://www.linkedin.com/in/fresh-prospect/' },
+    ];
+
+    const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
+      noNote: true,
+    });
+
+    // Would fail if the dedupe were removed: total/today would be 2, skipped 0.
+    expect(result.skipped).toBe(1);
+    expect(result.total).toBe(1);
+    expect(result.today).toBe(1);
+    expect(result.batchId).toBeTruthy();
+
+    const created = await withWorkspace(WS2, (db) =>
+      db
+        .selectFrom('jobs')
+        .select(['payload'])
+        .where('workspace_id', '=', WS2)
+        .where('batch_id', '=', result.batchId)
+        .execute(),
+    );
+    expect(created).toHaveLength(1);
+    const p = typeof created[0].payload === 'string' ? JSON.parse(created[0].payload as any) : created[0].payload;
+    expect((p as any).target).toBe('https://www.linkedin.com/in/fresh-prospect/');
+  });
+
+  t2('G2: a row matching a SENT job only by resolvedSlug is also excluded', async () => {
+    // The sent job's payload.target was an obfuscated URN; LinkedIn resolved it
+    // to a readable slug at send time, recorded as payload.resolvedSlug. A later
+    // upload carrying that readable URL must still be recognised as the same
+    // person (this is exactly what Task 4's resolvedSlug field exists for).
+    await withWorkspace(WS2, (db) =>
+      db
+        .insertInto('jobs')
+        .values({
+          id: crypto.randomUUID(),
+          workspace_id: WS2,
+          kind: 'linkedin',
+          action: 'connect_request',
+          status: 'sent',
+          scheduled_for: new Date(Date.now() - 86400_000).toISOString() as any,
+          payload: JSON.stringify({
+            name: 'Resolved Slug Person',
+            target: 'https://www.linkedin.com/in/ACwAADY3-obfuscated-urn/',
+            resolvedSlug: 'https://www.linkedin.com/in/resolved-slug-person/',
+          }),
+        } as any)
+        .execute(),
+    );
+
+    const rows = [
+      { name: 'Resolved Slug Person', target: 'https://www.linkedin.com/in/resolved-slug-person/' },
+    ];
+
+    const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
+      noNote: true,
+    });
+
+    expect(result.skipped).toBe(1);
+    expect(result.total).toBe(0);
+    expect(result.batchId).toBe('');
+  });
+
+  t2('G3: workspace scoping — a SENT job in another tenant never excludes this one\'s rows', async () => {
+    await withWorkspace(OTHER_WS, (db) =>
+      db
+        .insertInto('jobs')
+        .values({
+          id: crypto.randomUUID(),
+          workspace_id: OTHER_WS,
+          kind: 'linkedin',
+          action: 'connect_request',
+          status: 'sent',
+          scheduled_for: new Date(Date.now() - 86400_000).toISOString() as any,
+          payload: JSON.stringify({
+            name: 'Other Tenant Contact',
+            target: 'https://www.linkedin.com/in/cross-tenant-prospect/',
+          }),
+        } as any)
+        .execute(),
+    );
+
+    const rows = [
+      { name: 'Cross Tenant Prospect', target: 'https://www.linkedin.com/in/cross-tenant-prospect/' },
+    ];
+
+    // Same URL was marked SENT in OTHER_WS, but this call runs as WS2 — a
+    // dropped workspace_id predicate would incorrectly exclude it here.
+    const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
+      noNote: true,
+    });
+
+    expect(result.skipped).toBe(0);
+    expect(result.total).toBe(1);
+    expect(result.batchId).toBeTruthy();
+  });
+
+  t2('G4: every row already contacted — early return with skipped=N, no throw, no batch id', async () => {
+    const target = 'https://www.linkedin.com/in/all-skipped-prospect/';
+    await withWorkspace(WS2, (db) =>
+      db
+        .insertInto('jobs')
+        .values({
+          id: crypto.randomUUID(),
+          workspace_id: WS2,
+          kind: 'linkedin',
+          action: 'connect_request',
+          status: 'sent',
+          scheduled_for: new Date(Date.now() - 86400_000).toISOString() as any,
+          payload: JSON.stringify({ name: 'All Skipped', target }),
+        } as any)
+        .execute(),
+    );
+
+    const rows = [{ name: 'All Skipped', target }];
+
+    // If the early return were broken and fell through to the empty-input
+    // guard, this would throw BadRequestException instead of resolving.
+    const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
+      noNote: true,
+    });
+
+    expect(result).toEqual({ batchId: '', total: 0, today: 0, queuedDays: 0, skipped: 1 });
+
+    // And no batch id means no rows were inserted at all.
+    const anyRowsForThisUpload = await withWorkspace(WS2, (db) =>
+      db
+        .selectFrom('jobs')
+        .select(['id'])
+        .where('workspace_id', '=', WS2)
+        .where('status', '!=', 'sent')
+        .execute(),
+    );
+    expect(anyRowsForThisUpload).toHaveLength(0);
+  });
+});
