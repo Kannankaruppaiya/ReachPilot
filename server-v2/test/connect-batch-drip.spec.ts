@@ -373,6 +373,8 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
 
     // warmup_target well above the 3 rows this suite sends, so nothing spills
     // into a second day and every kept row is "today" — keeps assertions simple.
+    // 45 is the ceiling: linkedin_accounts CHECKs warmup_daily_limit BETWEEN 1
+    // AND 45 (migration 0001), and a higher value aborts this whole beforeAll.
     await withWorkspace(WS2, (db) =>
       db
         .insertInto('linkedin_accounts')
@@ -382,8 +384,8 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
           email: 'dedupe-test@example.invalid',
           country: 'IN',
           status: 'active',
-          warmup_daily_limit: 50,
-          warmup_target: 50,
+          warmup_daily_limit: 45,
+          warmup_target: 45,
           weekly_invite_cap: 100,
           hours_start: '09:00',
           hours_end: '18:00',
@@ -417,6 +419,14 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
         .where('id', 'in', [WS2, OTHER_WS])
         .execute()
         .catch(() => undefined);
+
+      // G1 and G3 each queue a day-one job, which createBatch pushes onto the
+      // LOCAL BullMQ queue for real. Drop it, exactly as the F-suite above does
+      // — otherwise this suite leaves orphaned jobs on the developer's queue
+      // pointing at workspace rows it has just deleted.
+      await redis2?.del('bull:linkedin-actions:meta').catch(() => undefined);
+      const keys2 = await redis2?.keys('bull:linkedin-actions:*').catch(() => []);
+      if (keys2?.length) await redis2.del(...keys2).catch(() => undefined);
     }
     await redis2?.quit().catch(() => undefined);
   }, 60_000);
@@ -563,6 +573,18 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
 
     const rows = [{ name: 'All Skipped', target }];
 
+    // Count WS2's rows immediately before the call. G1 and G3 each left a KEPT
+    // job behind in this same workspace (status 'queued' — nothing runs a worker
+    // here to advance them), so an absolute "no non-sent rows exist" assertion
+    // would be order-dependent and fail. A delta is the honest assertion: if the
+    // early return were removed, createBatch would insert a job for this row and
+    // the count would go up by one.
+    const countRows = () =>
+      withWorkspace(WS2, (db) =>
+        db.selectFrom('jobs').select(['id']).where('workspace_id', '=', WS2).execute(),
+      );
+    const before = (await countRows()).length;
+
     // If the early return were broken and fell through to the empty-input
     // guard, this would throw BadRequestException instead of resolving.
     const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
@@ -571,15 +593,23 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
 
     expect(result).toEqual({ batchId: '', total: 0, today: 0, queuedDays: 0, skipped: 1 });
 
-    // And no batch id means no rows were inserted at all.
-    const anyRowsForThisUpload = await withWorkspace(WS2, (db) =>
+    // No batch id means no rows were inserted at all: WS2's job count is unchanged…
+    expect((await countRows()).length).toBe(before);
+
+    // …and specifically, THIS upload's target has no unsent job of its own — the
+    // only job carrying it is the pre-seeded 'sent' one.
+    const forThisTarget = await withWorkspace(WS2, (db) =>
       db
         .selectFrom('jobs')
-        .select(['id'])
+        .select(['id', 'status', 'payload'])
         .where('workspace_id', '=', WS2)
         .where('status', '!=', 'sent')
         .execute(),
     );
-    expect(anyRowsForThisUpload).toHaveLength(0);
+    const unsentWithThisTarget = forThisTarget.filter((j) => {
+      const p = typeof j.payload === 'string' ? JSON.parse(j.payload as any) : (j.payload as any);
+      return p?.target === target;
+    });
+    expect(unsentWithThisTarget).toHaveLength(0);
   });
 });
