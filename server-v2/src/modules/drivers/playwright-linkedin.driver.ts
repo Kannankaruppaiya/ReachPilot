@@ -1177,8 +1177,13 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
       }
 
+      const landedSlug = slugOf(page.url());
       const externalId = 'li_inv_' + Date.now().toString(36);
-      return { status: 'sent', externalId };
+      return {
+        status: 'sent',
+        externalId,
+        ...(landedSlug ? { resolvedSlug: landedSlug } : {}),
+      };
     } catch (err: any) {
       return { status: 'failed', error: String(err?.message || err) };
     } finally {

@@ -357,8 +357,14 @@ async function bootstrap() {
 
       // Success — commit "sent" first, then best-effort bookkeeping.
       if (res.status === 'sent') {
+        // Record the slug LinkedIn served so a later upload recognises this
+        // member under either URL form. Merged into payload because the app DB
+        // role has no DDL rights — a new column is not available to us.
+        const storedPayload = res.resolvedSlug
+          ? JSON.stringify({ ...payload, resolvedSlug: res.resolvedSlug })
+          : null;
         await withWorkspace(workspaceId, (db) =>
-          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso() }).where('id', '=', jobId).execute(),
+          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso(), ...(storedPayload ? { payload: storedPayload } : {}) }).where('id', '=', jobId).execute(),
         );
         try {
           await withWorkspace(workspaceId, async (db) => {

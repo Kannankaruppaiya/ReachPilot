@@ -62,6 +62,14 @@ export interface LinkedInActionResult {
   error?: string;
   /** Public egress IP the desktop agent ran this action from (ipify echo). */
   reportedIp?: string;
+  /**
+   * The vanity slug LinkedIn actually served, when the requested URL was an
+   * obfuscated member URN. Captured free at send time — resolving it later would
+   * mean loading one profile per row, which is exactly the traffic shape that
+   * gets an account challenged. Lets a future upload recognise this member under
+   * either URL form.
+   */
+  resolvedSlug?: string;
 }
 
 /** Everything needed to log in ONCE and capture the session cookie. */
