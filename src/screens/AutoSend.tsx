@@ -235,9 +235,21 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       })
       batchId = res.batchId
       toast(
-        `Queued ${res.total} ${mode === "linkedin" ? "connection requests" : "emails"} — ${res.today} today` +
-          (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
+        res.total === 0
+          ? `Everyone on that list has already been contacted — nothing queued (${res.skipped} skipped)`
+          : `Queued ${res.total} ${mode === "linkedin" ? "connection requests" : "emails"} — ${res.today} today` +
+              (res.skipped ? ` · ${res.skipped} already contacted, skipped` : "") +
+              (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
       )
+      if (res.total === 0) {
+        // Nothing was actually queued — clear the client-side rows we
+        // speculatively set at the top of start() (line ~218), otherwise the
+        // queue table below would show these leads stuck on "pending"/
+        // "scheduled" forever (no jobs exist for polling to resolve them).
+        setRows([])
+        setRunning(false)
+        return
+      }
     } catch (e) {
       setRunning(false)
       toast(e instanceof Error ? e.message : "Couldn't start the send")
