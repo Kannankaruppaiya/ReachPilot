@@ -320,6 +320,7 @@ const ACCT2 = '00000000-0000-0000-0000-0000000000f4';
 const OTHER_WS = '00000000-0000-0000-0000-0000000000f5';
 
 let jobs2: JobsService;
+let redis2: Redis;
 let reachable2 = false;
 let skipReason2 = '';
 
@@ -340,6 +341,19 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
   beforeAll(async () => {
     try {
       assertLocalServices(getEnv());
+      // G1/G3 both produce a "today: 1" job, which createBatch pushes onto
+      // BullMQ for real (new Redis(...) with maxRetriesPerRequest: null does
+      // NOT fail fast). Without this check, Postgres-up-but-Redis-down would
+      // hang this suite against an unreachable queue instead of skipping —
+      // mirrors the F-suite's reachability check above.
+      redis2 = new Redis(getEnv().REDIS_URL, {
+        maxRetriesPerRequest: 1,
+        lazyConnect: true,
+        connectTimeout: 4000,
+      });
+      redis2.on('error', () => undefined);
+      await redis2.connect();
+      await redis2.ping();
       await getDb().selectFrom('workspaces').select('id').limit(1).execute();
       reachable2 = true;
     } catch (e: any) {
@@ -404,6 +418,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
         .execute()
         .catch(() => undefined);
     }
+    await redis2?.quit().catch(() => undefined);
   }, 60_000);
 
   t2('G1: a row matching a SENT job by target URL is excluded, and skipped counts it', async () => {
