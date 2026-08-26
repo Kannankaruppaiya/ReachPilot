@@ -46,6 +46,21 @@ export const slugOf = (u: string): string => u.match(/\/in\/([^/?#]+)/i)?.[1] ||
  */
 export const vanityNameOf = (u: string): string => u.match(/[?&]vanityName=([^&]+)/i)?.[1] || '';
 /**
+ * The slug a CONFIRMED invite resolved to, read from whatever URL the page is
+ * sitting on — `/in/<slug>` if we navigated back to a profile (the slow
+ * "reload and check" confirmation), otherwise the custom-invite deep-link's
+ * `vanityName`. Returns '' when the URL carries neither.
+ *
+ * This is a named export rather than an inline `||` at the call site so the
+ * fallback is directly testable: with the expression inlined, deleting
+ * `|| vanityNameOf(...)` left `test/resolved-slug-fallback.spec.ts` green,
+ * because the spec could only assert against its own copy of the logic. That
+ * fallback is the ONLY thing producing a cross-form key on the fast path.
+ *
+ * Reads the CURRENT url — it never navigates.
+ */
+export const resolvedSlugFrom = (url: string): string => slugOf(url) || vanityNameOf(url);
+/**
  * True for LinkedIn's OBFUSCATED member-URN profile slug ("ACwAAC551Qg…") as
  * opposed to a vanity slug. Scrapers emit this form; LinkedIn serves the profile
  * but canonicalises the URL to the vanity, so the URN can never match the Connect
@@ -1190,7 +1205,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // The fast confirm path (toast / Pending flip) never navigates back to an
       // /in/<slug> URL — the page is still on the custom-invite deep-link, so
       // fall back to its vanityName param rather than losing the slug.
-      const landedSlug = slugOf(page.url()) || vanityNameOf(page.url());
+      const landedSlug = resolvedSlugFrom(page.url());
       const externalId = 'li_inv_' + Date.now().toString(36);
       return {
         status: 'sent',

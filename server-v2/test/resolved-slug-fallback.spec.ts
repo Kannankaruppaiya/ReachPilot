@@ -16,12 +16,18 @@
  *
  * Pure logic — no DB, no Redis, no browser.
  */
-import { slugOf, vanityNameOf } from '../src/modules/drivers/playwright-linkedin.driver';
+import { resolvedSlugFrom, slugOf, vanityNameOf } from '../src/modules/drivers/playwright-linkedin.driver';
 
-/** Mirrors the driver's return-site fallback: /in/ first, then vanityName. */
-function resolvedSlugOf(url: string): string {
-  return slugOf(url) || vanityNameOf(url);
-}
+/**
+ * THE PRODUCTION FUNCTION — not a local reimplementation.
+ *
+ * An earlier version of this spec defined its own `slugOf(url) || vanityNameOf(url)`
+ * helper and asserted on that, which meant deleting the fallback from the driver
+ * left the whole suite green: the one line that produces a cross-form key on the
+ * fast path had no test at all. `sendConnectRequest` now calls
+ * `resolvedSlugFrom` at its return site, so these assertions run the real code.
+ */
+const resolvedSlugOf = resolvedSlugFrom;
 
 describe('vanityNameOf', () => {
   it('extracts the vanityName query param from a custom-invite URL', () => {
