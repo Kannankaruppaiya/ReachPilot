@@ -242,35 +242,65 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
               (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
       )
       if (res.total === 0) {
-        // Nothing was actually queued — clear the client-side rows we
-        // speculatively set at the top of start() (line ~218), otherwise the
-        // queue table below would show these leads stuck on "pending"/
-        // "scheduled" forever (no jobs exist for polling to resolve them).
+        // Nothing was queued at all, so there is no batch to poll and nothing
+        // will ever reconcile the speculative rows. Clear them here; the
+        // partial case is reconciled against the first poll below.
         setRows([])
         setRunning(false)
         return
       }
     } catch (e) {
+      // The request failed, so NOTHING was queued and no polling starts — the
+      // speculative rows would sit on "pending" forever. Same reconciliation
+      // rule as everywhere else: a row with no job behind it is not in the
+      // queue and must not be shown as if it were.
+      setRows([])
       setRunning(false)
       toast(e instanceof Error ? e.message : "Couldn't start the send")
       return
     }
 
     // Poll the backend for real job statuses (worker paces sends with jitter).
+    //
+    // RECONCILIATION — why the first poll rewrites the table rather than just
+    // updating statuses. The backend now drops rows whose profile was already
+    // sent a connection request, so a 106-row upload can queue 18 jobs. The
+    // speculative setRows(list) at the top of start() listed all 106, and
+    // createSend answers with COUNTS only (total/today/skipped) — never which
+    // rows survived — so the counts alone cannot tell us what to remove. The
+    // batch listing is the first and only thing that names the surviving
+    // targets. Until we apply it, the table shows 88 rows that no job will ever
+    // resolve (stuck on "pending" forever) and the header's todayTotal is
+    // client-side `Math.floor(i / cap)` arithmetic over rows the server never
+    // accepted — it would claim ~20 today while 5 were really queued, and
+    // disagree with the toast. So: drop every row with no matching job, and take
+    // `day` from the server instead of recomputing it. The first poll runs
+    // immediately rather than after the 3s interval, to keep that window short.
     let ticks = 0
-    timerRef.current = setInterval(async () => {
+    let reconciled = false
+    const poll = async () => {
       ticks++
       try {
         const jobs = await api.listJobs(batchId)
         const byTarget = new Map(jobs.map((j) => [j.target, j]))
-        setRows((rs) =>
-          rs.map((r) => {
-            // Keep a locally-canceled row canceled even if a stale poll returns.
-            if (r.status === "canceled") return r
-            const j = byTarget.get(r.target)
-            return j ? { ...r, jobId: j.id, status: jobToRowStatus(j.status) } : r
-          }),
-        )
+        // An empty listing is a transient read, not proof the batch vanished —
+        // createSend already told us total > 0. Never reconcile against it.
+        if (jobs.length > 0) {
+          // Read the flag HERE, not inside the updater: React runs the updater
+          // on the next render, by which point `reconciled` is already true —
+          // the drop would never happen.
+          const firstPass = !reconciled
+          reconciled = true
+          setRows((rs) =>
+            rs.flatMap((r) => {
+              // Keep a locally-canceled row canceled even if a stale poll returns.
+              if (r.status === "canceled") return [r]
+              const j = byTarget.get(r.target)
+              if (!j) return firstPass ? [] : [r]
+              return [{ ...r, jobId: j.id, day: j.day, status: jobToRowStatus(j.status) }]
+            }),
+          )
+        }
         const todayJobs = jobs.filter((j) => j.day === 0)
         const settled = todayJobs.every((j) => ["sent", "failed", "canceled"].includes(j.status))
         if ((todayJobs.length > 0 && settled) || ticks > 60) {
@@ -284,7 +314,9 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       } catch {
         /* transient — keep polling */
       }
-    }, 3000)
+    }
+    timerRef.current = setInterval(poll, 3000)
+    void poll()
   }
 
   const parsed = rawRows.length > 0
