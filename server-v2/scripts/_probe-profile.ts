@@ -52,9 +52,13 @@ const URL_ARG = process.argv[2] || 'https://in.linkedin.com/in/darshana-karnik-3
     viewport: ctx.fingerprint?.viewport,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
   } as any);
-  if (ctx.li_at) {
-    await context.addCookies([{ name: 'li_at', value: ctx.li_at, domain: '.linkedin.com', path: '/' }]);
-  }
+  // Inject the FULL stored jar exactly like the driver does — li_at alone makes
+  // LinkedIn bounce the request (ERR_TOO_MANY_REDIRECTS), which is not what the
+  // real automation sees.
+  const { cookiesToInject, parseStoredSession } = await import('../src/modules/drivers/linkedin-session-store');
+  const stored: any[] = (ctx as any).cookies?.length ? (ctx as any).cookies : parseStoredSession(ctx.li_at as string);
+  const existing: any[] = (await context.cookies('https://www.linkedin.com')) as any[];
+  await context.addCookies(cookiesToInject(existing, stored) as any);
 
   const page = context.pages()[0] || (await context.newPage());
   const resp = await page.goto(URL_ARG, { waitUntil: 'domcontentloaded', timeout: 30000 });

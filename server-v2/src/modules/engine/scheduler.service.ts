@@ -4,6 +4,7 @@ import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
+import { profileKey, invitedProfileKeys } from '@/modules/jobs/profile-key';
 
 /**
  * The missing heart of the outreach engine.
@@ -118,6 +119,34 @@ export class SchedulerService {
 
     if (due.length === 0) return { enqueued, deferred, suppressed };
 
+    const payloadOf = (j: any): { target?: string; resolvedSlug?: string } => {
+      if (!j?.payload) return {};
+      if (typeof j.payload !== 'string') return j.payload;
+      try {
+        return JSON.parse(j.payload);
+      } catch {
+        return {};
+      }
+    };
+
+    // Built once per drain, and only when something in this batch could need it —
+    // not once per job, which would re-read the whole sent history each time.
+    let invited: Set<string> | null = null;
+    const invitedKeys = async (): Promise<Set<string>> => {
+      if (!invited) {
+        const sent = await withWorkspace(workspaceId, (db) =>
+          db
+            .selectFrom('jobs')
+            .select('payload')
+            .where('action', '=', 'connect_request')
+            .where('status', '=', 'sent')
+            .execute(),
+        );
+        invited = invitedProfileKeys(sent.map(payloadOf));
+      }
+      return invited;
+    };
+
     for (const job of due) {
       const kind = (job.kind === 'email' ? 'email' : 'linkedin') as 'linkedin' | 'email';
 
@@ -138,27 +167,26 @@ export class SchedulerService {
           continue;
         }
 
-        // --- Duplicate-invite guard: never send a second connection request to
-        //     a lead we've already invited (a classic double-touch that annoys
-        //     prospects and wastes weekly-invite quota). ---
-        if (job.action === 'connect_request') {
-          const already = await withWorkspace(workspaceId, (db) =>
-            db
-              .selectFrom('jobs')
-              .select('id')
-              .where('lead_id', '=', job.lead_id!)
-              .where('action', '=', 'connect_request')
-              .where('status', '=', 'sent')
-              .where('id', '!=', job.id)
-              .executeTakeFirst(),
+      }
+
+      // --- Duplicate-invite guard: never send a second connection request to
+      //     someone we've already invited (a double-touch that annoys prospects
+      //     and wastes weekly-invite quota).
+      //
+      // 🔴 Deliberately OUTSIDE the `job.lead_id` block above. This used to live
+      // inside it and look the lead up by id — but connect jobs carry `lead_id`
+      // NULL (366 of 366 on live data), so the block was skipped entirely and the
+      // guard never fired once. Dinesh M ended up with three jobs on one target;
+      // one sent, and a later duplicate still ran. The profile key is always in
+      // the payload, so match on that. ---
+      if (job.action === 'connect_request') {
+        const key = profileKey(payloadOf(job).target);
+        if (key && (await invitedKeys()).has(key)) {
+          await withWorkspace(workspaceId, (db) =>
+            db.updateTable('jobs').set({ status: 'canceled', last_error: 'duplicate_invite' }).where('id', '=', job.id).execute(),
           );
-          if (already) {
-            await withWorkspace(workspaceId, (db) =>
-              db.updateTable('jobs').set({ status: 'canceled', last_error: 'duplicate_invite' }).where('id', '=', job.id).execute(),
-            );
-            suppressed++;
-            continue;
-          }
+          suppressed++;
+          continue;
         }
       }
 

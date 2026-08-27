@@ -143,6 +143,102 @@ export interface NavigablePage {
  * here proves nothing was clicked and nothing was sent, which is exactly what
  * makes re-driving a `network_error` safe.
  */
+/**
+ * THIS target's Connect control, however LinkedIn chose to render it.
+ *
+ * 🔴 Role alone cannot find it. Observed live on a profile whose Connect was
+ * plainly on screen while the driver reported `no_connect_button`:
+ *
+ *   <a role="menuitem" aria-label=""                      // own label EMPTY
+ *      href="/preload/custom-invite/?vanityName=<slug>">
+ *     <div aria-label="Invite <Name> to connect">Connect</div>   // label, NO role
+ *   </a>
+ *
+ * `getByRole('button'|'link')` can never resolve either node: the labelled <div>
+ * has no role at all, and the anchor's explicit role="menuitem" overrides the
+ * implicit `link`. The miss is about ROLE and WHERE THE LABEL SITS, so it hits a
+ * top-card Connect exactly as hard as one inside the "More" menu.
+ *
+ * So match the invite ANCHOR by href. Its `vanityName` is the same identity guard
+ * the deep-link path already applies, which makes this tier both role-independent
+ * and strictly target-scoped — the "People also viewed" rail carries its own
+ * custom-invite anchors and must never resolve here.
+ *
+ * Returns the UNION, not `.first()`: callers pick, and the spec can assert that
+ * nothing belonging to a rail person is in the set.
+ */
+export function connectControl(
+  page: Page,
+  { nameHeading, targetSlug }: { nameHeading: string; targetSlug: string },
+): Locator {
+  const nameRe = new RegExp(
+    `^invite\\s+${nameHeading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')}\\s+to connect$`,
+    'i',
+  );
+  // Tier 1 — the shapes that already worked: a real <button>, or an <a> that kept
+  // its implicit link role. Name-constrained, so never a rail person's control.
+  let loc = page.getByRole('button', { name: nameRe }).or(page.getByRole('link', { name: nameRe }));
+
+  // Tier 2 — the invite anchor, identified by the slug in its own href.
+  if (/^[a-z0-9._-]+$/i.test(targetSlug)) {
+    loc = loc.or(page.locator(`a[href*="custom-invite"][href*="vanityName=${targetSlug}"]`));
+  } else {
+    // No usable slug (canonicalisation failed). Fall back to the anchor that
+    // CONTAINS this target's label — still target-scoped, just without the slug.
+    const label = `Invite ${nameHeading} to connect`.replace(/"/g, '\\"');
+    loc = loc.or(page.locator('a[href*="custom-invite"]').filter({ has: page.locator(`[aria-label="${label}"]`) }));
+  }
+  return loc;
+}
+
+/**
+ * The "invite already outstanding" control for THIS target.
+ *
+ * 🔴 It is an <a>, not a <button>, and its label names the person:
+ *
+ *   <a aria-label="Pending, click to withdraw invitation sent to Karthik Athreyan">
+ *     Pending
+ *   </a>
+ *
+ * `getByRole('button', { name: /^Pending$/i })` therefore matched NOTHING — page-wide,
+ * not just inside the top card (measured live: zero Pending *buttons* on a profile
+ * that plainly shows Pending). Since LinkedIn REPLACES Connect with Pending once an
+ * invite is out, missing this made the driver report `no_connect_button` — which is
+ * TERMINAL — for leads whose invite had actually been delivered. Observed on
+ * Karthik Athreyan: LinkedIn showed Pending, the job read `failed`.
+ *
+ * Matched on the aria-label, role-agnostically, and constrained to this target's
+ * name so a rail person's control can never satisfy it.
+ */
+export function pendingControl(page: Page, nameHeading: string): Locator {
+  const name = nameHeading.replace(/["\\]/g, '\\$&');
+  return page
+    .locator(`[aria-label^="Pending" i][aria-label*="${name}" i]`)
+    .or(page.getByRole('button', { name: /^Pending$/i }))
+    .filter({ visible: true });
+}
+
+/**
+ * The "already connected to this target" control.
+ *
+ * 🔴 Message is an <a href="/messaging/compose/…">, not a <button>, so the
+ * button-only check read 0 on every modern profile. Combined with the fact that
+ * an ACCEPTED connection has neither Connect nor Pending, that turned a won lead
+ * into a terminal failure. Observed on Dinesh M: the invite went out at 14:12, he
+ * ACCEPTED it (profile now reads "· 1st"), and a duplicate job at 14:42 recorded
+ * `no_connect_button` — a failure row for a connection we had already earned.
+ *
+ * Scoping matters as much as the role: the same page renders "Message <other
+ * person>" anchors for every rail suggestion. Only the TARGET's compose link is
+ * unlabelled, so rail controls are excluded by their own aria-label.
+ */
+export function connectedControl(page: Page): Locator {
+  return page
+    .locator('a[href*="/messaging/compose"]:not([aria-label*="Message" i])')
+    .or(page.getByRole('button', { name: /^Message$/i }))
+    .filter({ visible: true });
+}
+
 export async function gotoProfile(
   page: NavigablePage,
   url: string,
@@ -617,11 +713,28 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // buttons (Message / Connect / Follow / More / Pending) are lazy-loaded a
       // beat after the profile HTML; scanning too early finds nothing and wrongly
       // reports `no_connect_button`. Wait for ANY primary action to appear.
-      await main
+      // DIAGNOSTIC: this wait matches a <button> anywhere in <main> — and <main>
+      // includes the activity feed, whose posts render their OWN "Follow" button.
+      // If a feed button satisfies it first, the wait returns while the top card
+      // is still empty and the scan below finds nothing. Record what actually
+      // satisfied it (and whether it timed out) so that race is visible in the log.
+      const actionBarBtn = main
         .getByRole('button', { name: /^(Connect|Message|Follow|Following|More|More actions|Pending)$/i })
-        .first()
+        .first();
+      const barOk = await actionBarBtn
         .waitFor({ state: 'visible', timeout: ACTION_BAR_TIMEOUT_MS })
-        .catch(() => undefined);
+        .then(() => true)
+        .catch(() => false);
+      const barWho = barOk
+        ? await actionBarBtn
+            .evaluate((el) => ({
+              text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24),
+              label: el.getAttribute('aria-label') || '',
+              inTopCard: !el.closest('[class*="feed"], article'),
+            }))
+            .catch(() => null)
+        : null;
+      this.logger.log({ barOk, barWho }, 'Action-bar wait settled');
       await sleep(rnd(500, 1200));
 
       // We arrived via the opaque member-URN form and the URL has now settled —
@@ -711,13 +824,15 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       const card: Locator = (await topCard.count().catch(() => 0)) > 0 ? topCard : main;
 
       // Message button in the target's card ⇒ already connected.
-      const hasMessageBtn = async () =>
-        (await card.getByRole('button', { name: /^Message$/i }).count().catch(() => 0)) > 0;
+      const hasMessageBtn = async () => (await connectedControl(page).count().catch(() => 0)) > 0;
 
       const scope: SelectorScope = { page, card };
 
-      // Pending invite already out? (Pending button in the target's card.)
-      if ((await card.getByRole('button', { name: /^Pending$/i }).count().catch(() => 0)) > 0) {
+      // Pending invite already out? Must be checked BEFORE the Connect lookup —
+      // once an invite is outstanding LinkedIn REPLACES Connect with Pending, so
+      // missing this reports the lead as `no_connect_button`, which is terminal.
+      // That is how leads whose invite had genuinely gone out were recorded failed.
+      if ((await pendingControl(page, nameHeading).count().catch(() => 0)) > 0) {
         return { status: 'pending' };
       }
 
@@ -740,11 +855,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // ONLY was the bug: it missed the anchor top-card Connect and matched a rail
       // button instead. Match either role, name-constrained so only THIS target's
       // control resolves — never a rail person's.
-      const directConnect = () =>
-        page
-          .getByRole('button', { name: targetConnectRe })
-          .or(page.getByRole('link', { name: targetConnectRe }))
-          .first();
+      const directConnect = () => connectControl(page, { nameHeading, targetSlug }).first();
       await directConnect()
         .waitFor({ state: 'visible', timeout: 8000 })
         .catch(() => undefined);
@@ -757,17 +868,43 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // how THIS profile's own Connect is labelled (vs the rail buttons) — and can
       // match it with certainty instead of guessing. Read-only, no click.
       if (!connect) {
-        const bs = page.getByRole('button', { name: /connect/i });
-        const n = Math.min(await bs.count().catch(() => 0), 12);
-        const dump: { text: string; label: string }[] = [];
-        for (let i = 0; i < n; i++) {
-          const b = bs.nth(i);
-          dump.push({
-            text: ((await b.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim(),
-            label: ((await b.getAttribute('aria-label').catch(() => '')) || '').trim(),
-          });
-        }
-        this.logger.log({ nameHeading, connectButtons: dump }, 'Connect-candidate buttons (diagnostic)');
+        // Scan the DOM directly, not via getByRole('button'). The top-card Connect
+        // is commonly an <a> (role=link), so a button-only scan is blind to the very
+        // element this diagnostic exists to find — it would log an empty list and be
+        // misread as "no Connect on the page". Report every connect-ish control with
+        // its exact accessible label, whether it is on screen, and whether the
+        // name-anchored matcher accepted it. That is what separates "Connect is not
+        // there" from "Connect is there under a name we failed to match".
+        const dump = await page
+          .evaluate(() => {
+            const out: { tag: string; role: string; text: string; label: string; href: string; shown: boolean }[] = [];
+            document
+              .querySelectorAll('button, a, [role="button"], [role="menuitem"], [aria-label*="to connect" i]')
+              .forEach((el) => {
+                const label = el.getAttribute('aria-label') || '';
+                const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/connect/i.test(label) && !/^connect$/i.test(text)) return;
+                const r = (el as HTMLElement).getBoundingClientRect();
+                out.push({
+                  tag: el.tagName.toLowerCase(),
+                  role: el.getAttribute('role') || '',
+                  text: text.slice(0, 30),
+                  label,
+                  href: (el.getAttribute('href') || '').slice(0, 60),
+                  shown: r.width > 0 && r.height > 0,
+                });
+              });
+            return out.slice(0, 12);
+          })
+          .catch(() => [] as { tag: string; role: string; text: string; label: string; href: string; shown: boolean }[]);
+        this.logger.log(
+          {
+            nameHeading,
+            targetConnectRe: String(targetConnectRe),
+            candidates: dump.map((d) => ({ ...d, matches: targetConnectRe.test(d.label) })),
+          },
+          'Connect-candidate controls (diagnostic)',
+        );
       }
       // Track whether Connect lives inside the "More" dropdown: a dropdown item
       // is position-anchored, so a PAGE scroll or a force-click-by-coordinate

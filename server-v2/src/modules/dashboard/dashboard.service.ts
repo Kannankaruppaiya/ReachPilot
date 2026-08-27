@@ -2,6 +2,19 @@ import { Injectable } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
 import { LinkedinAccountsService } from '@/modules/accounts/linkedin-accounts.service';
 
+/**
+ * The only job states that still represent OUTSTANDING work.
+ *
+ * 🔴 `failed`, `sent` and `canceled` must never be in here. A failed invite is
+ * finished — counting it as pending tells the operator work is coming that never
+ * will, and every terminal `no_connect_button` would inflate the queue forever.
+ *
+ * `queued` alone is not a queue either: it is the momentary BullMQ handoff, held
+ * for seconds, so a counter built on it reads 0 essentially always — which is
+ * exactly what "Sending today" showed while 71 jobs were due and overdue.
+ */
+export const PENDING_JOB_STATUSES = ['scheduled', 'queued', 'running'] as const;
+
 @Injectable()
 export class DashboardService {
   constructor(private readonly linkedin: LinkedinAccountsService) {}
@@ -22,8 +35,19 @@ export class DashboardService {
 
       const invitesSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent'));
       const emailsSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'email').where('status', '=', 'sent'));
-      const queuedToday = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('status', '=', 'queued'));
-      const scheduled = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('status', '=', 'scheduled'));
+      // Split OUTSTANDING work by when it is due, not by which internal state it
+      // happens to be parked in. Both sides share PENDING_JOB_STATUSES, so a
+      // failed / sent / canceled job can never appear in either number.
+      const endOfToday = new Date(startOfToday);
+      endOfToday.setDate(endOfToday.getDate() + 1);
+      const pending = (q: any) =>
+        q.where('workspace_id', '=', workspaceId).where('status', 'in', PENDING_JOB_STATUSES as any);
+      const queuedToday = await jobCount((q) =>
+        pending(q).where('scheduled_for', '<', endOfToday.toISOString()),
+      );
+      const scheduled = await jobCount((q) =>
+        pending(q).where('scheduled_for', '>=', endOfToday.toISOString()),
+      );
       const sentToday = await jobCount((q) =>
         q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent').where('sent_at', '>=', startOfToday.toISOString()),
       );

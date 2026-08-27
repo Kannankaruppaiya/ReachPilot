@@ -79,6 +79,10 @@ export const SELECTORS = {
     (s) => scoped(s).getByRole('button', { name: /^More actions$/i }),
     (s) => scoped(s).getByRole('button', { name: /^More$/i }),
     (s) => s.page.getByRole('button', { name: /^More actions$/i }),
+    // Page-wide `^More$` too. The card-scoped tiers miss whenever the top-card
+    // scope resolves wrong, and the observed button is labelled "More" — not
+    // "More actions" — so without this the whole overflow path was unreachable.
+    (s) => s.page.getByRole('button', { name: /^More$/i }),
   ] as Candidate[],
 
   /** The Connect item inside the opened overflow dropdown. LinkedIn A/B-tests the

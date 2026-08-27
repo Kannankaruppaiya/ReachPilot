@@ -20,6 +20,9 @@ process.on('uncaughtException', (err: any) => {
   logger.error(`Uncaught exception (kept alive): ${err?.message || err}`);
 });
 
+import { assertTenantIsolation } from '@/db/tenant-isolation';
+import { getDb } from '@/db';
+
 async function bootstrap() {
   const env = getEnv();
   const app = await NestFactory.create(AppModule);
@@ -36,6 +39,10 @@ async function bootstrap() {
     const authService = app.get(AuthService);
     await authService.ensureBypassUser();
   }
+
+  // Verify tenant isolation actually bites for the role we connect with. It did
+  // not, silently, for the whole life of this deployment — see tenant-isolation.ts.
+  await assertTenantIsolation(getDb());
 
   await app.listen(env.PORT);
   logger.info(`ReachPilot Production Backend listening on http://localhost:${env.PORT}`);

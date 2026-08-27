@@ -25,6 +25,8 @@ import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { CampaignRunnerService } from '@/modules/engine/campaign-runner.service';
 import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
+import { assertTenantIsolation } from '@/db/tenant-isolation';
+import { getDb } from '@/db';
 import { EmailWarmupService } from '@/modules/drivers/email-warmup.service';
 import { LeadScraperService } from '@/modules/scraping/lead-scraper.service';
 import { ScrapeCursorService } from '@/modules/scraping/scrape-cursor.service';
@@ -88,6 +90,11 @@ async function bootstrap() {
   logger.info('Starting ReachPilot background worker fleet...');
 
   const app = await NestFactory.createApplicationContext(AppModule);
+
+  // Same gate as the API. The worker is the bigger risk: its scheduler tick
+  // enumerates EVERY workspace, so with isolation off one tenant's tick drains
+  // another tenant's jobs.
+  await assertTenantIsolation(getDb());
   const env = getEnv();
 
   const linkedinDriver = app.get<LinkedInDriver>(LINKEDIN_DRIVER);

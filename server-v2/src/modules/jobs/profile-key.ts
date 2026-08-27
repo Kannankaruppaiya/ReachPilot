@@ -107,3 +107,32 @@ export function selectNewRows<T extends UploadRow>(
 
   return { kept, skipped };
 }
+
+/**
+ * Every profile we have ALREADY sent a connection request to, as comparable keys.
+ *
+ * 🔴 The scheduler's duplicate-invite guard used to look this up by `lead_id` —
+ * and every connect job ships with `lead_id` NULL (366 of 366 measured on live
+ * data), so the lookup compared `lead_id = NULL`, which SQL never reports true.
+ * The guard therefore never fired once, and the same person could be invited
+ * repeatedly: Dinesh M held three jobs on one target, one of which sent while a
+ * later duplicate ran anyway. Key on the profile instead — that identity is
+ * always present in the payload.
+ *
+ * Both forms are indexed: the target as uploaded (often the obfuscated member
+ * URN) and, when the send recorded one, the vanity slug LinkedIn redirected to.
+ * A later job carrying either form then matches.
+ */
+export function invitedProfileKeys(
+  payloads: Iterable<{ target?: string | null; resolvedSlug?: string | null } | null | undefined>,
+): Set<string> {
+  const keys = new Set<string>();
+  for (const p of payloads) {
+    if (!p) continue;
+    const fromTarget = profileKey(p.target);
+    if (fromTarget) keys.add(fromTarget);
+    const fromSlug = profileKeyFromSlug(p.resolvedSlug);
+    if (fromSlug) keys.add(fromSlug);
+  }
+  return keys;
+}
