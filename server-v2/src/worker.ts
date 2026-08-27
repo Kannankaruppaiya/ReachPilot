@@ -395,7 +395,17 @@ async function bootstrap() {
       }
 
       // Skip — already connected / pending. Advance without counting as a send.
+      //
+      // 🔴 "Without counting as a send" has to include the PACING SLOT. Nothing
+      // left the account here, so give it back exactly as the terminal-fail path
+      // does. Measured live: the Redis daily counter read 21 against a jittered
+      // cap of 21 while only 19 invites had actually gone out — the two leads that
+      // resolved as `pending` had each burned a slot, and the day's last real send
+      // was refused because of it. Before Pending was detected these same leads
+      // failed with `no_connect_button`, which DID release, so the leak arrived
+      // with that fix.
       if (SKIP_OUTCOMES.includes(res.status)) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso(), last_error: res.status }).where('id', '=', jobId).execute();
           if (leadId && res.status === 'already_connected') {
