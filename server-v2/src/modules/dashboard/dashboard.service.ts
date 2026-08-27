@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
 import { LinkedinAccountsService } from '@/modules/accounts/linkedin-accounts.service';
+import { PacingService } from '@/modules/engine/pacing.service';
 
 /**
  * The only job states that still represent OUTSTANDING work.
@@ -39,7 +40,10 @@ export function splitQueue(input: {
 
 @Injectable()
 export class DashboardService {
-  constructor(private readonly linkedin: LinkedinAccountsService) {}
+  constructor(
+    private readonly linkedin: LinkedinAccountsService,
+    private readonly pacing: PacingService,
+  ) {}
 
   async getDashboardData(workspaceId: string): Promise<any> {
     const startOfToday = new Date();
@@ -99,12 +103,16 @@ export class DashboardService {
     const state = await this.linkedin.getAccountState(workspaceId);
     const detail = await this.linkedin.getForWorkspace(workspaceId);
 
-    // The cap here is the LinkedIn warm-up; email jobs are paced separately and
-    // are not bounded by it.
+    // Use the ceiling PACING ENFORCES, not the ramp figure. The daily cap is
+    // jittered +/-15% per account/day (anti-fingerprinting), so a 20/day ramp can
+    // be 19 today — and reading the un-jittered 20 against 19 sent advertised one
+    // more send that pacing had already refused. Same class of error twice over:
+    // the panel must quote the number the sender obeys.
+    // (The cap is the LinkedIn warm-up; email jobs are paced separately.)
     const { sendingToday: queuedToday, scheduledLater: scheduled } = splitQueue({
       dueToday: counts.dueToday,
       outstanding: counts.outstanding,
-      dailyLimit: state.warmup?.todayLimit,
+      dailyLimit: this.effectiveDailyLimit(state.warmup?.todayLimit, detail),
       sentToday: counts.sentToday,
     });
 
@@ -134,6 +142,13 @@ export class DashboardService {
         time: this.formatTimeDiff(new Date(a.created_at)),
       })),
     };
+  }
+
+  /** The jittered ceiling pacing will actually enforce for this account today. */
+  private effectiveDailyLimit(base: number | null | undefined, account: any): number {
+    if (!base || !account?.id) return base ?? 0;
+    const dateIso = new Date().toLocaleDateString('en-US', { timeZone: account.timezone || 'UTC' });
+    return this.pacing.jitterDailyLimit(base, account.id, dateIso);
   }
 
   private formatTimeDiff(d: Date): string {

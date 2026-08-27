@@ -324,7 +324,7 @@ export class PacingService {
    * of actions varies day-to-day (12, then 14, then 11…) instead of a robotic
    * constant. Deterministic so repeated pacing checks the same day agree.
    */
-  private jitterDailyLimit(base: number, accountId: string, dateIso: string): number {
+  public jitterDailyLimit(base: number, accountId: string, dateIso: string): number {
     const factor = 0.85 + this.seed01(accountId, dateIso, 'daily') * 0.3; // 0.85–1.15
     return Math.max(1, Math.round(base * factor));
   }
