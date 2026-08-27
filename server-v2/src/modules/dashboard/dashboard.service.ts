@@ -15,6 +15,28 @@ import { LinkedinAccountsService } from '@/modules/accounts/linkedin-accounts.se
  */
 export const PENDING_JOB_STATUSES = ['scheduled', 'queued', 'running'] as const;
 
+/**
+ * Split outstanding work into "going out today" and "later".
+ *
+ * 🔴 Being DUE today is not the same as GOING today. The warm-up cap bounds what
+ * can actually leave: 53 jobs were due against a 20/day cap with 19 already sent,
+ * so the honest answer was 1. Reporting 53 promises sends that pacing will refuse
+ * — the mirror image of the 0 this panel used to show unconditionally.
+ *
+ * Nothing is dropped: whatever is not going today is counted as later, so the two
+ * numbers always sum to the outstanding total.
+ */
+export function splitQueue(input: {
+  dueToday: number;
+  outstanding: number;
+  dailyLimit: number | null | undefined;
+  sentToday: number;
+}): { sendingToday: number; scheduledLater: number } {
+  const remaining = Math.max(0, (input.dailyLimit ?? 0) - input.sentToday);
+  const sendingToday = Math.max(0, Math.min(input.dueToday, remaining, input.outstanding));
+  return { sendingToday, scheduledLater: Math.max(0, input.outstanding - sendingToday) };
+}
+
 @Injectable()
 export class DashboardService {
   constructor(private readonly linkedin: LinkedinAccountsService) {}
@@ -42,12 +64,10 @@ export class DashboardService {
       endOfToday.setDate(endOfToday.getDate() + 1);
       const pending = (q: any) =>
         q.where('workspace_id', '=', workspaceId).where('status', 'in', PENDING_JOB_STATUSES as any);
-      const queuedToday = await jobCount((q) =>
+      const dueToday = await jobCount((q) =>
         pending(q).where('scheduled_for', '<', endOfToday.toISOString()),
       );
-      const scheduled = await jobCount((q) =>
-        pending(q).where('scheduled_for', '>=', endOfToday.toISOString()),
-      );
+      const outstanding = await jobCount((q) => pending(q));
       const sentToday = await jobCount((q) =>
         q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent').where('sent_at', '>=', startOfToday.toISOString()),
       );
@@ -70,7 +90,7 @@ export class DashboardService {
         .limit(20)
         .execute();
 
-      return { invitesSent, emailsSent, queuedToday, scheduled, sentToday, totalLeads, accepted, replies, activity };
+      return { invitesSent, emailsSent, dueToday, outstanding, sentToday, totalLeads, accepted, replies, activity };
     });
 
     const acceptanceRate = counts.invitesSent > 0 ? Math.round((counts.accepted / counts.invitesSent) * 100) : 0;
@@ -79,6 +99,15 @@ export class DashboardService {
     const state = await this.linkedin.getAccountState(workspaceId);
     const detail = await this.linkedin.getForWorkspace(workspaceId);
 
+    // The cap here is the LinkedIn warm-up; email jobs are paced separately and
+    // are not bounded by it.
+    const { sendingToday: queuedToday, scheduledLater: scheduled } = splitQueue({
+      dueToday: counts.dueToday,
+      outstanding: counts.outstanding,
+      dailyLimit: state.warmup?.todayLimit,
+      sentToday: counts.sentToday,
+    });
+
     return {
       invitesSent: counts.invitesSent,
       emailsSent: counts.emailsSent,
@@ -86,8 +115,8 @@ export class DashboardService {
       replies: counts.replies,
       meetings: 0, // no meetings source yet — honest zero, not a fake number
       totalLeads: counts.totalLeads,
-      queuedToday: counts.queuedToday,
-      scheduled: counts.scheduled,
+      queuedToday,
+      scheduled,
       sentToday: counts.sentToday,
       account: state.connected
         ? {

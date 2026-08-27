@@ -25,7 +25,7 @@
  *
  * Pure logic — no DB, no Redis, no browser.
  */
-import { PENDING_JOB_STATUSES } from '../src/modules/dashboard/dashboard.service';
+import { PENDING_JOB_STATUSES, splitQueue } from '../src/modules/dashboard/dashboard.service';
 
 describe("dashboard \"Today's queue\" buckets", () => {
   it('never counts finished work', () => {
@@ -54,5 +54,52 @@ describe("dashboard \"Today's queue\" buckets", () => {
     expect(isToday('2026-08-26T09:00:00+05:30')).toBe(true); // overdue — still owed today
     expect(isToday('2026-08-28T00:00:00+05:30')).toBe(false); // tomorrow
     expect(isToday('2026-09-04T10:00:00+05:30')).toBe(false); // next week
+  });
+});
+
+/**
+ * Second correction, from the operator: being DUE today is not GOING today.
+ *
+ * OBSERVED 2026-08-27, after the first fix landed: the panel read "Sending today
+ * 53 / Scheduled for later 84" while account health read "Today's invites 19/20".
+ * Only ONE more invite could leave that day — pacing would defer the other 52. So
+ * 53 promised sends that would not happen, the mirror image of the 0 the panel
+ * used to show unconditionally. Both numbers were wrong; only the direction
+ * changed.
+ */
+describe('splitQueue', () => {
+  it('reports what can actually go out, not what is merely due', () => {
+    // The exact live case: 53 due, 137 outstanding, 20/day cap, 19 already sent.
+    expect(splitQueue({ dueToday: 53, outstanding: 137, dailyLimit: 20, sentToday: 19 })).toEqual({
+      sendingToday: 1,
+      scheduledLater: 136,
+    });
+  });
+
+  it('never loses work — the two numbers always sum to the outstanding total', () => {
+    for (const c of [
+      { dueToday: 53, outstanding: 137, dailyLimit: 20, sentToday: 19 },
+      { dueToday: 0, outstanding: 137, dailyLimit: 20, sentToday: 0 },
+      { dueToday: 137, outstanding: 137, dailyLimit: 20, sentToday: 0 },
+      { dueToday: 5, outstanding: 5, dailyLimit: 20, sentToday: 20 },
+    ]) {
+      const r = splitQueue(c);
+      expect(r.sendingToday + r.scheduledLater).toBe(c.outstanding);
+    }
+  });
+
+  it('shows nothing going today once the cap is spent', () => {
+    expect(splitQueue({ dueToday: 40, outstanding: 90, dailyLimit: 20, sentToday: 20 }).sendingToday).toBe(0);
+    // Over-sent (a cap lowered mid-day) must not produce a negative.
+    expect(splitQueue({ dueToday: 40, outstanding: 90, dailyLimit: 20, sentToday: 25 }).sendingToday).toBe(0);
+  });
+
+  it('promises nothing when there is no connected account to send from', () => {
+    expect(splitQueue({ dueToday: 40, outstanding: 90, dailyLimit: null, sentToday: 0 }).sendingToday).toBe(0);
+  });
+
+  it('is bounded by what is due, not just by the cap', () => {
+    // Plenty of headroom, but only 3 jobs are actually due today.
+    expect(splitQueue({ dueToday: 3, outstanding: 90, dailyLimit: 20, sentToday: 0 }).sendingToday).toBe(3);
   });
 });
