@@ -67,6 +67,9 @@ export class IntegrationsService {
       const existing = await db
         .selectFrom('email_accounts')
         .select(['id', 'credentials_secret_id'])
+        // Explicit workspace scope — the DB role bypasses RLS, so never rely on
+        // withWorkspace context alone to isolate tenants.
+        .where('workspace_id', '=', workspaceId)
         .where('email', '=', email)
         .executeTakeFirst();
 
@@ -83,6 +86,7 @@ export class IntegrationsService {
             status: 'active',
             connected_at: new Date().toISOString(),
           })
+          .where('workspace_id', '=', workspaceId)
           .where('id', '=', existing.id)
           .execute();
       } else {
@@ -118,6 +122,9 @@ export class IntegrationsService {
       const accounts = await db
         .selectFrom('email_accounts')
         .select(['email', 'provider', 'daily_limit', 'status', 'connected_at', 'spf_status', 'dkim_status', 'dmarc_status'])
+        // Explicit workspace scope — the DB role bypasses RLS, so filtering by
+        // provider alone leaks other tenants' mailboxes onto this page.
+        .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'gmail')
         .orderBy((eb) => eb.case().when('status', '=', 'active').then(0).else(1).end())
         .orderBy('connected_at', 'desc')
@@ -127,6 +134,9 @@ export class IntegrationsService {
       const others = await db
         .selectFrom('integrations')
         .select(['provider', 'active', 'created_at', 'config'])
+        // Explicit workspace scope — without this the Apify token (and any other
+        // integration) from another tenant leaks onto this page.
+        .where('workspace_id', '=', workspaceId)
         .execute();
 
       const apifyRow = others.find((i) => i.provider === 'apify' && i.active);
@@ -192,6 +202,9 @@ export class IntegrationsService {
       const existing = await db
         .selectFrom('integrations')
         .select(['id', 'credentials_secret_id'])
+        // Explicit workspace scope — otherwise this can match/overwrite another
+        // tenant's apify row since the DB role bypasses RLS.
+        .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .executeTakeFirst();
 
@@ -202,6 +215,7 @@ export class IntegrationsService {
         await db
           .updateTable('integrations')
           .set({ active: true, credentials_secret_id: secretId, config: JSON.stringify({ enabledTools: tools }) })
+          .where('workspace_id', '=', workspaceId)
           .where('id', '=', existing.id)
           .execute();
       } else {
@@ -233,6 +247,8 @@ export class IntegrationsService {
       const row = await db
         .selectFrom('integrations')
         .select(['id', 'credentials_secret_id'])
+        // Explicit workspace scope — the DB role bypasses RLS.
+        .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .executeTakeFirst();
       if (!row) return;
@@ -243,6 +259,7 @@ export class IntegrationsService {
       await db
         .updateTable('integrations')
         .set({ active: false, credentials_secret_id: null })
+        .where('workspace_id', '=', workspaceId)
         .where('id', '=', row.id)
         .execute();
     });
@@ -255,6 +272,8 @@ export class IntegrationsService {
       const acct = await db
         .selectFrom('email_accounts')
         .select(['id', 'credentials_secret_id'])
+        // Explicit workspace scope — the DB role bypasses RLS.
+        .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'gmail')
         .executeTakeFirst();
       if (!acct) return;
@@ -270,6 +289,7 @@ export class IntegrationsService {
       await db
         .updateTable('email_accounts')
         .set({ status: 'disconnected', credentials_secret_id: null })
+        .where('workspace_id', '=', workspaceId)
         .where('id', '=', acct.id)
         .execute();
     });

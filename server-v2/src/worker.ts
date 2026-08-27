@@ -6,6 +6,7 @@ import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
 import { LINKEDIN_DRIVER, EMAIL_DRIVER } from '@/modules/drivers/driver.tokens';
 import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
+import { getLoginQueue } from '@/modules/accounts/linkedin-accounts.service';
 import { connectWithNoteFallback } from '@/modules/drivers/connect-with-fallback';
 import { ConnectionNoteService } from '@/modules/ai/connection-note.service';
 import {
@@ -14,7 +15,9 @@ import {
   SKIP_OUTCOMES,
   ACCOUNT_HALT_OUTCOMES,
   TERMINAL_FAIL_OUTCOMES,
+  DEFER_OUTCOMES,
 } from '@/modules/drivers/linkedin-driver.interface';
+import { serializeSession } from '@/modules/drivers/linkedin-session-store';
 import { EmailDriver } from '@/modules/drivers/email-driver.interface';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { PacingService } from '@/modules/engine/pacing.service';
@@ -22,6 +25,8 @@ import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { CampaignRunnerService } from '@/modules/engine/campaign-runner.service';
 import { LinkedInSyncService } from '@/modules/drivers/linkedin-sync.service';
+import { assertTenantIsolation } from '@/db/tenant-isolation';
+import { getDb } from '@/db';
 import { EmailWarmupService } from '@/modules/drivers/email-warmup.service';
 import { LeadScraperService } from '@/modules/scraping/lead-scraper.service';
 import { ScrapeCursorService } from '@/modules/scraping/scrape-cursor.service';
@@ -85,6 +90,11 @@ async function bootstrap() {
   logger.info('Starting ReachPilot background worker fleet...');
 
   const app = await NestFactory.createApplicationContext(AppModule);
+
+  // Same gate as the API. The worker is the bigger risk: its scheduler tick
+  // enumerates EVERY workspace, so with isolation off one tenant's tick drains
+  // another tenant's jobs.
+  await assertTenantIsolation(getDb());
   const env = getEnv();
 
   const linkedinDriver = app.get<LinkedInDriver>(LINKEDIN_DRIVER);
@@ -221,6 +231,15 @@ async function bootstrap() {
 
   /* ---------- 1. LinkedIn Actions Worker ---------- */
 
+  // When the desktop agent is offline the job is deferred (not failed) and re-driven
+  // by the scheduler after this backoff — short enough to resume within minutes of
+  // the agent coming back, long enough to avoid hot-looping while it stays offline.
+  const AGENT_OFFLINE_BACKOFF_MS = 3 * 60 * 1000;
+  // Same idea for a page that never loaded, but a slower beat: a bad link tends
+  // to stay bad for a while, and unlike an offline agent there is no heartbeat to
+  // tell us it recovered — so back off further rather than re-driving into it.
+  const NETWORK_BACKOFF_MS = 10 * 60 * 1000;
+
   const linkedinWorker = new Worker(
     'linkedin-actions',
     async (job: Job) => {
@@ -329,12 +348,30 @@ async function bootstrap() {
 
       logger.info({ jobId, outcome: res.status }, 'LinkedIn action outcome');
 
+      // Record the residential IP the desktop agent ran this action from — a
+      // rolling "last seen from" per account (also surfaces the split-brain case
+      // where the same account runs from two different IPs). Best-effort only.
+      if (res.reportedIp) {
+        await withWorkspace(workspaceId, (db) =>
+          db.updateTable('linkedin_accounts')
+            .set({ last_ip: res.reportedIp, last_ip_at: nowIso() })
+            .where('id', '=', accountId)
+            .execute(),
+        ).catch(() => undefined);
+      }
+
       /* ----- classify the outcome (each block commits before any throw) ----- */
 
       // Success — commit "sent" first, then best-effort bookkeeping.
       if (res.status === 'sent') {
+        // Record the slug LinkedIn served so a later upload recognises this
+        // member under either URL form. Merged into payload because the app DB
+        // role has no DDL rights — a new column is not available to us.
+        const storedPayload = res.resolvedSlug
+          ? JSON.stringify({ ...payload, resolvedSlug: res.resolvedSlug })
+          : null;
         await withWorkspace(workspaceId, (db) =>
-          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso() }).where('id', '=', jobId).execute(),
+          db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso(), ...(storedPayload ? { payload: storedPayload } : {}) }).where('id', '=', jobId).execute(),
         );
         try {
           await withWorkspace(workspaceId, async (db) => {
@@ -358,7 +395,17 @@ async function bootstrap() {
       }
 
       // Skip — already connected / pending. Advance without counting as a send.
+      //
+      // 🔴 "Without counting as a send" has to include the PACING SLOT. Nothing
+      // left the account here, so give it back exactly as the terminal-fail path
+      // does. Measured live: the Redis daily counter read 21 against a jittered
+      // cap of 21 while only 19 invites had actually gone out — the two leads that
+      // resolved as `pending` had each burned a slot, and the day's last real send
+      // was refused because of it. Before Pending was detected these same leads
+      // failed with `no_connect_button`, which DID release, so the leak arrived
+      // with that fix.
       if (SKIP_OUTCOMES.includes(res.status)) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'sent', sent_at: nowIso(), last_error: res.status }).where('id', '=', jobId).execute();
           if (leadId && res.status === 'already_connected') {
@@ -388,6 +435,91 @@ async function bootstrap() {
           }
         });
         // Do NOT throw — avoid a retry storm against a paused account.
+        return;
+      }
+
+      // Desktop agent offline (laptop off/asleep/not polling). This is NOT a real
+      // send failure — the account is healthy, the executor is just temporarily
+      // gone. Treat it like the pacing / account-unavailable cases: release the
+      // slot and DEFER to the scheduler. Never throw (so BullMQ attempts aren't
+      // burned) and never mark 'failed' (so the job is never lost), and use a short
+      // backoff so it resumes within minutes of the agent returning instead of
+      // being bumped a whole window forward.
+      // 'agent_unavailable' = the agent never took the job (offline/busy) → nothing
+      // was sent. 'agent_result_pending' = the agent DID take it but no result came
+      // back before the hard cap (rare — agent died mid-job); the action may have
+      // gone out. Both are safe to defer: releasing the pacing slot then re-driving
+      // nets to exactly one send (the re-dispatch re-registers it), and on re-run a
+      // send that already went out is detected as pending/already-connected and
+      // marked sent. Never throw (don't burn BullMQ attempts) or fail (never lose it).
+      // BUT: 'agent_result_pending' means the agent may have already clicked
+      // Send — for linkedin_message/inmail, sendMessage/sendInMail have no
+      // idempotency check (they click Send unconditionally on every run), so
+      // blindly redispatching this exact case would DM the recipient twice.
+      // connect_request/follow/etc. all detect their own already-done state
+      // (Pending/already_connected/etc.) before acting, so redriving THOSE is
+      // safe either way. Hold the ambiguous message/inmail case for a human to
+      // check LinkedIn instead of auto-resending it.
+      const nonIdempotentPending =
+        res.error === 'agent_result_pending' &&
+        (jobRow.action === 'linkedin_message' || jobRow.action === 'inmail');
+      if (nonIdempotentPending) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        await withWorkspace(workspaceId, async (db) => {
+          await db
+            .updateTable('jobs')
+            .set({ status: 'failed', last_error: 'agent_result_pending_review' })
+            .where('id', '=', jobId)
+            .execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+          await db
+            .insertInto('notifications')
+            .values({
+              workspace_id: workspaceId,
+              kind: 'job_failed',
+              text: `${payload.name}: the desktop agent disconnected before confirming this ${jobRow.action === 'inmail' ? 'InMail' : 'message'} sent — check LinkedIn before retrying, to avoid sending it twice.`,
+            })
+            .execute();
+        });
+        logger.warn(
+          { jobId, accountId, action: jobRow.action },
+          'Agent accepted a non-idempotent action but never confirmed the result — held for manual review, not auto-resent',
+        );
+        return;
+      }
+
+      if (res.error === 'agent_unavailable' || res.error === 'agent_result_pending') {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        const retryAt = new Date(Date.now() + AGENT_OFFLINE_BACKOFF_MS).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.error }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.info({ jobId, accountId, retryAt, reason: res.error }, 'Desktop agent did not return a result — deferred to scheduler');
+        return;
+      }
+
+      // The profile page never loaded on the user's own link. Same shape as the
+      // agent-offline case: the account is fine, the lead is fine, the CONNECTION
+      // was down. The driver only reports this from an action's FIRST navigation,
+      // so nothing was clicked and nothing was sent — safe to re-drive. Defer;
+      // never mark 'failed' (which would surface a healthy lead as dead in the UI)
+      // and never throw (which would burn the BullMQ attempts on a bad-network
+      // window and lose the job for good).
+      if (DEFER_OUTCOMES.includes(res.status)) {
+        await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        const retryAt = new Date(Date.now() + NETWORK_BACKOFF_MS).toISOString();
+        await withWorkspace(workspaceId, async (db) => {
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.error || res.status }).where('id', '=', jobId).execute();
+          if (jobRow.enrollment_id) {
+            await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
+          }
+        });
+        logger.warn({ jobId, accountId, retryAt, reason: res.error }, 'Page never loaded (network) — deferred to scheduler, lead NOT failed');
         return;
       }
 
@@ -423,15 +555,28 @@ async function bootstrap() {
       });
       throw new Error(res.error || 'LinkedIn driver failed');
     },
-    { connection: connection as any, concurrency: 1 },
+    // concurrency 3: different tenants' jobs run in parallel (remote dispatch just
+    // awaits each account's desktop agent; the agent still serialises its own
+    // account's jobs). Bump higher as accounts scale.
+    { connection: connection as any, concurrency: 3 },
   );
 
   /* ---------- 2. LinkedIn Login Worker (cookie capture) ---------- */
 
+  // How long to wait between retries while the desktop agent hasn't polled yet
+  // (laptop off, app not opened post-onboarding), and how many times to try
+  // before giving up and telling the user to reconnect. ~1 hour total.
+  const LOGIN_AGENT_WAIT_BACKOFF_MS = 3 * 60 * 1000;
+  const LOGIN_AGENT_WAIT_MAX_ATTEMPTS = 20;
+
   const loginWorker = new Worker(
     'linkedin-login',
     async (job: Job) => {
-      const { accountId, workspaceId } = job.data;
+      const { accountId, workspaceId, agentWaitAttempt } = job.data as {
+        accountId: string;
+        workspaceId: string;
+        agentWaitAttempt?: number;
+      };
       logger.info({ accountId }, 'Processing LinkedIn login');
 
       const loginCtx = await sessions.buildLoginContext(accountId, workspaceId);
@@ -441,16 +586,35 @@ async function bootstrap() {
       }
 
       const res = await linkedinDriver.login(loginCtx);
-      logger.info({ accountId, status: res.status }, 'Login outcome');
+      logger.info({ accountId, status: res.status, reportedIp: res.reportedIp }, 'Login outcome');
+
+      // The desktop agent reports the residential IP it actually ran from. Record
+      // it on every outcome (last_ip) so we can see which IP even a FAILED login
+      // came from; login_ip is stamped only on a real successful login.
+      const ipSet: Record<string, string> = res.reportedIp
+        ? { last_ip: res.reportedIp, last_ip_at: nowIso() }
+        : {};
 
       if (res.status === 'connected' && res.li_at) {
-        // Store the captured session cookie encrypted; the password stays put but
-        // is no longer needed for actions — the cookie IS the login now.
-        const sessionSecretId = await secrets.encrypt(res.li_at, 'linkedin_session', { workspaceId });
+        // Store the captured session encrypted. Prefer the WHOLE jar: `li_at`
+        // alone cannot restore a session on a fresh profile (it redirect-loops
+        // without JSESSIONID/bcookie/liap), so storing only that left us with a
+        // "backup" that could never actually bring an account back.
+        const sessionSecretId = await secrets.encrypt(
+          res.cookies?.length ? serializeSession(res.cookies) : res.li_at,
+          'linkedin_session',
+          { workspaceId },
+        );
         await withWorkspace(workspaceId, async (db) => {
           await db
             .updateTable('linkedin_accounts')
-            .set({ session_secret_id: sessionSecretId, status: 'warming_up', last_sync_at: nowIso() })
+            .set({
+              session_secret_id: sessionSecretId,
+              status: 'warming_up',
+              last_sync_at: nowIso(),
+              ...(res.reportedIp ? { login_ip: res.reportedIp } : {}),
+              ...ipSet,
+            })
             .where('id', '=', accountId)
             .execute();
           await db.insertInto('activity').values({ workspace_id: workspaceId, text: 'LinkedIn account connected — session secured', tone: 'success' }).execute();
@@ -461,15 +625,38 @@ async function bootstrap() {
 
       if (res.status === 'checkpoint') {
         await withWorkspace(workspaceId, async (db) => {
-          await db.updateTable('linkedin_accounts').set({ status: 'checkpoint' }).where('id', '=', accountId).execute();
+          await db.updateTable('linkedin_accounts').set({ status: 'checkpoint', ...ipSet }).where('id', '=', accountId).execute();
           await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_checkpoint', text: 'LinkedIn asked for extra verification during login. Please complete it to finish connecting.' }).execute();
         });
         return;
       }
 
-      // Failed — bad credentials or unreachable.
+      // Desktop agent hasn't polled yet (user hasn't opened the app post-onboarding,
+      // or their laptop is off) — no LinkedIn login was even attempted, so this is
+      // NOT a real failure. Marking 'disconnected' here (as the code used to) left
+      // a user who finishes onboarding before opening the desktop app stuck: no
+      // LinkedIn login attempt was made, but the 6h enqueueLogin cooldown then
+      // blocked a fresh one, and BullMQ's own retry (attempts: 2, ~10s backoff) is
+      // far too short for "hasn't opened the app yet". Re-add a delayed job
+      // instead (bypasses that cooldown, which only guards NEW enqueues) and only
+      // give up — marking disconnected for a real reconnect — after ~1 hour.
+      if (res.error === 'agent_unavailable' || res.error === 'agent_result_pending') {
+        const attempt = (agentWaitAttempt || 0) + 1;
+        if (attempt <= LOGIN_AGENT_WAIT_MAX_ATTEMPTS) {
+          await getLoginQueue().add(
+            'login',
+            { accountId, workspaceId, agentWaitAttempt: attempt },
+            { delay: LOGIN_AGENT_WAIT_BACKOFF_MS, attempts: 1, removeOnComplete: true },
+          );
+          logger.info({ accountId, attempt }, 'Desktop agent not online yet for login — deferred, will retry');
+          return;
+        }
+        logger.warn({ accountId }, 'Desktop agent never came online for login — giving up');
+      }
+
+      // Failed — bad credentials, unreachable, or the agent never showed up.
       await withWorkspace(workspaceId, async (db) => {
-        await db.updateTable('linkedin_accounts').set({ status: 'disconnected' }).where('id', '=', accountId).execute();
+        await db.updateTable('linkedin_accounts').set({ status: 'disconnected', ...ipSet }).where('id', '=', accountId).execute();
         await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'account_failed', text: `Could not connect LinkedIn: ${res.error || 'login failed'}. Please reconnect.` }).execute();
       });
     },

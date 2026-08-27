@@ -18,6 +18,13 @@ import {
   LinkedInFingerprint,
 } from './linkedin-driver.interface';
 import { CONNECT_NAME, SELECTORS, resolveFirst, type SelectorScope } from './linkedin-selectors';
+import {
+  parseStoredSession,
+  cookiesToInject,
+  classifyPinChallenge,
+  type StoredCookie,
+} from './linkedin-session-store';
+import { classifyLoginForm, rememberedAccountMatches } from './linkedin-login-form';
 
 /* ---------------- human-like helpers ---------------- */
 
@@ -25,6 +32,43 @@ const rnd = (min: number, max: number) => Math.floor(Math.random() * (max - min 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Randomized "think time" between actions — humans are noisy, bots are periodic. */
 const think = () => sleep(rnd(1500, 5000));
+
+/** The `/in/<slug>` segment of a LinkedIn profile URL, verbatim (no case change). */
+export const slugOf = (u: string): string => u.match(/\/in\/([^/?#]+)/i)?.[1] || '';
+/**
+ * The `vanityName` query parameter of a LinkedIn custom-invite deep-link
+ * ("/preload/custom-invite/?vanityName=<slug>"), verbatim (no case change,
+ * no decoding) — the SAME normalised shape `slugOf` produces, so both feed
+ * `profileKey` identically. On the fast confirm path (toast / Pending flip),
+ * the page never navigates back to an `/in/<slug>` URL — this is the only
+ * slug LinkedIn has handed us at that point, and it's already on the current
+ * URL, so no extra navigation is needed to read it.
+ */
+export const vanityNameOf = (u: string): string => u.match(/[?&]vanityName=([^&]+)/i)?.[1] || '';
+/**
+ * The slug a CONFIRMED invite resolved to, read from whatever URL the page is
+ * sitting on — `/in/<slug>` if we navigated back to a profile (the slow
+ * "reload and check" confirmation), otherwise the custom-invite deep-link's
+ * `vanityName`. Returns '' when the URL carries neither.
+ *
+ * This is a named export rather than an inline `||` at the call site so the
+ * fallback is directly testable: with the expression inlined, deleting
+ * `|| vanityNameOf(...)` left `test/resolved-slug-fallback.spec.ts` green,
+ * because the spec could only assert against its own copy of the logic. That
+ * fallback is the ONLY thing producing a cross-form key on the fast path.
+ *
+ * Reads the CURRENT url — it never navigates.
+ */
+export const resolvedSlugFrom = (url: string): string => slugOf(url) || vanityNameOf(url);
+/**
+ * True for LinkedIn's OBFUSCATED member-URN profile slug ("ACwAAC551Qg…") as
+ * opposed to a vanity slug. Scrapers emit this form; LinkedIn serves the profile
+ * but canonicalises the URL to the vanity, so the URN can never match the Connect
+ * anchor's `vanityName` and must not be used as a target-identity guard.
+ * Vanity slugs are lowercase, so the mixed-case "AC?AA" + base64url shape is
+ * unambiguous — real lowercase slugs like "acamahalakshmi" do NOT match.
+ */
+export const isOpaqueSlug = (s: string): boolean => /^AC[A-Za-z0-9]AA[A-Za-z0-9_-]{20,}$/.test(s);
 
 async function typeLikeHuman(page: Page, selector: string, text: string): Promise<void> {
   // Pick the first VISIBLE match (LinkedIn ships hidden duplicate inputs).
@@ -43,6 +87,192 @@ async function humanScroll(page: Page): Promise<void> {
     await page.mouse.wheel(0, rnd(200, 600));
     await sleep(rnd(300, 900));
   }
+}
+
+/* ---------------- navigation on a slow link ---------------- */
+
+/** Budget for committing a profile navigation (response headers only). */
+const NAV_COMMIT_TIMEOUT_MS = 45_000;
+/** Budget for the page to become USABLE once the navigation has committed. */
+const NAV_READY_TIMEOUT_MS = 45_000;
+/** Navigation attempts. Two, because packet loss drops the odd request outright. */
+const NAV_ATTEMPTS = 2;
+/**
+ * How long the lazily-hydrated top-card action bar gets to appear. Raised from
+ * 12 s: on a slow link those buttons arrive by XHR well after the HTML, and a
+ * premature scan reports a false `no_connect_button` — which is TERMINAL, so a
+ * momentary slowdown permanently burned the lead.
+ */
+const ACTION_BAR_TIMEOUT_MS = 30_000;
+
+/** The bit of a navigation response {@link gotoProfile} reads. */
+export interface NavResponse {
+  status(): number;
+}
+/**
+ * The slice of a Playwright `Page` that {@link gotoProfile} touches. A real
+ * `Page` satisfies it structurally, and so does a plain object — which is what
+ * makes the navigation policy unit-testable without launching a browser.
+ */
+export interface NavigablePage {
+  goto(url: string, opts: { waitUntil: 'commit'; timeout: number }): Promise<NavResponse | null>;
+  waitForLoadState(state: 'domcontentloaded', opts: { timeout: number }): Promise<void>;
+  locator(selector: string): {
+    first(): { waitFor(opts: { state: 'attached'; timeout: number }): Promise<void> };
+  };
+}
+
+/**
+ * Navigate to a LinkedIn profile over a link that may be SLOW.
+ *
+ * The previous gate — `waitUntil: 'domcontentloaded'` with a 30 s cap — was the
+ * single biggest source of lost leads on a poor connection. A profile document
+ * is 1–2 MB, so at a few tens of kB/s the parse does not FINISH inside 30 s even
+ * though the page has already painted and Connect is on screen. Observed live on
+ * a 15 kB/s link: the tab visibly showed the target's Connect button while
+ * `page.goto` threw `Timeout 30000ms exceeded`, the driver's `finally` closed the
+ * context (the "tab closes by itself" symptom), and a good lead was recorded as
+ * failed.
+ *
+ * Document-complete is simply the wrong signal — what the caller needs is a
+ * rendered body. So: commit the navigation (headers only, unaffected by a slow
+ * tail), then wait on that real condition with a generous budget. Neither wait is
+ * fatal on its own, so a slow tail can no longer fail a page that has rendered.
+ *
+ * Callers must use this only for the FIRST navigation of an action: a failure
+ * here proves nothing was clicked and nothing was sent, which is exactly what
+ * makes re-driving a `network_error` safe.
+ */
+/**
+ * THIS target's Connect control, however LinkedIn chose to render it.
+ *
+ * 🔴 Role alone cannot find it. Observed live on a profile whose Connect was
+ * plainly on screen while the driver reported `no_connect_button`:
+ *
+ *   <a role="menuitem" aria-label=""                      // own label EMPTY
+ *      href="/preload/custom-invite/?vanityName=<slug>">
+ *     <div aria-label="Invite <Name> to connect">Connect</div>   // label, NO role
+ *   </a>
+ *
+ * `getByRole('button'|'link')` can never resolve either node: the labelled <div>
+ * has no role at all, and the anchor's explicit role="menuitem" overrides the
+ * implicit `link`. The miss is about ROLE and WHERE THE LABEL SITS, so it hits a
+ * top-card Connect exactly as hard as one inside the "More" menu.
+ *
+ * So match the invite ANCHOR by href. Its `vanityName` is the same identity guard
+ * the deep-link path already applies, which makes this tier both role-independent
+ * and strictly target-scoped — the "People also viewed" rail carries its own
+ * custom-invite anchors and must never resolve here.
+ *
+ * Returns the UNION, not `.first()`: callers pick, and the spec can assert that
+ * nothing belonging to a rail person is in the set.
+ */
+export function connectControl(
+  page: Page,
+  { nameHeading, targetSlug }: { nameHeading: string; targetSlug: string },
+): Locator {
+  const nameRe = new RegExp(
+    `^invite\\s+${nameHeading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')}\\s+to connect$`,
+    'i',
+  );
+  // Tier 1 — the shapes that already worked: a real <button>, or an <a> that kept
+  // its implicit link role. Name-constrained, so never a rail person's control.
+  let loc = page.getByRole('button', { name: nameRe }).or(page.getByRole('link', { name: nameRe }));
+
+  // Tier 2 — the invite anchor, identified by the slug in its own href.
+  if (/^[a-z0-9._-]+$/i.test(targetSlug)) {
+    loc = loc.or(page.locator(`a[href*="custom-invite"][href*="vanityName=${targetSlug}"]`));
+  } else {
+    // No usable slug (canonicalisation failed). Fall back to the anchor that
+    // CONTAINS this target's label — still target-scoped, just without the slug.
+    const label = `Invite ${nameHeading} to connect`.replace(/"/g, '\\"');
+    loc = loc.or(page.locator('a[href*="custom-invite"]').filter({ has: page.locator(`[aria-label="${label}"]`) }));
+  }
+  return loc;
+}
+
+/**
+ * The "invite already outstanding" control for THIS target.
+ *
+ * 🔴 It is an <a>, not a <button>, and its label names the person:
+ *
+ *   <a aria-label="Pending, click to withdraw invitation sent to Karthik Athreyan">
+ *     Pending
+ *   </a>
+ *
+ * `getByRole('button', { name: /^Pending$/i })` therefore matched NOTHING — page-wide,
+ * not just inside the top card (measured live: zero Pending *buttons* on a profile
+ * that plainly shows Pending). Since LinkedIn REPLACES Connect with Pending once an
+ * invite is out, missing this made the driver report `no_connect_button` — which is
+ * TERMINAL — for leads whose invite had actually been delivered. Observed on
+ * Karthik Athreyan: LinkedIn showed Pending, the job read `failed`.
+ *
+ * Matched on the aria-label, role-agnostically, and constrained to this target's
+ * name so a rail person's control can never satisfy it.
+ */
+export function pendingControl(page: Page, nameHeading: string): Locator {
+  const name = nameHeading.replace(/["\\]/g, '\\$&');
+  return page
+    .locator(`[aria-label^="Pending" i][aria-label*="${name}" i]`)
+    .or(page.getByRole('button', { name: /^Pending$/i }))
+    .filter({ visible: true });
+}
+
+/**
+ * The "already connected to this target" control.
+ *
+ * 🔴 Message is an <a href="/messaging/compose/…">, not a <button>, so the
+ * button-only check read 0 on every modern profile. Combined with the fact that
+ * an ACCEPTED connection has neither Connect nor Pending, that turned a won lead
+ * into a terminal failure. Observed on Dinesh M: the invite went out at 14:12, he
+ * ACCEPTED it (profile now reads "· 1st"), and a duplicate job at 14:42 recorded
+ * `no_connect_button` — a failure row for a connection we had already earned.
+ *
+ * Scoping matters as much as the role: the same page renders "Message <other
+ * person>" anchors for every rail suggestion. Only the TARGET's compose link is
+ * unlabelled, so rail controls are excluded by their own aria-label.
+ */
+export function connectedControl(page: Page): Locator {
+  return page
+    .locator('a[href*="/messaging/compose"]:not([aria-label*="Message" i])')
+    .or(page.getByRole('button', { name: /^Message$/i }))
+    .filter({ visible: true });
+}
+
+export async function gotoProfile(
+  page: NavigablePage,
+  url: string,
+  onRetry?: (reason: string) => void,
+): Promise<{ resp: NavResponse | null; error?: string }> {
+  let lastErr = '';
+  for (let attempt = 0; attempt < NAV_ATTEMPTS; attempt++) {
+    if (attempt) {
+      onRetry?.(lastErr);
+      await sleep(rnd(2000, 5000));
+    }
+    let resp: NavResponse | null = null;
+    try {
+      resp = await page.goto(url, { waitUntil: 'commit', timeout: NAV_COMMIT_TIMEOUT_MS });
+    } catch (err: any) {
+      lastErr = String(err?.message || err).split('\n')[0].trim();
+      continue;
+    }
+    // A 404 is a real answer, not a slow page. Hand it straight back so the
+    // caller can classify the profile as gone instead of retrying a dead URL.
+    if (resp && resp.status() === 404) return { resp };
+    await page
+      .waitForLoadState('domcontentloaded', { timeout: NAV_READY_TIMEOUT_MS })
+      .catch(() => undefined);
+    const rendered = await page
+      .locator('main, h1')
+      .first()
+      .waitFor({ state: 'attached', timeout: NAV_READY_TIMEOUT_MS })
+      .then(() => true)
+      .catch(() => false);
+    if (rendered) return { resp };
+    lastErr = 'body never rendered';
+  }
+  return { resp: null, error: lastErr || 'navigation_failed' };
 }
 
 const DEFAULT_UA =
@@ -205,6 +435,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
     proxy?: ProxyConfig;
     fingerprint?: LinkedInFingerprint;
     li_at?: string;
+    cookies?: StoredCookie[];
   }): Promise<BrowserContext> {
     const { chromium } = await import('playwright');
     const env = getEnv();
@@ -273,10 +504,26 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
     await this.applyStealth(context, langs);
 
-    if (opts.li_at) {
-      await context.addCookies([
-        { name: 'li_at', value: opts.li_at, domain: '.linkedin.com', path: '/' },
-      ]);
+    // Restore the stored session ONLY into a profile that has none.
+    //
+    // The old code injected our stored `li_at` unconditionally, over whatever the
+    // profile already had. That is backwards: the profile's cookie is what
+    // LinkedIn last handed THIS browser, while the vault's was captured at the
+    // last login and never refreshed. Observed live — the two had diverged, and
+    // the injection replaced a working cookie with a revoked one, so a session
+    // the user had just signed in by hand was destroyed by the next job.
+    const stored = opts.cookies?.length ? opts.cookies : parseStoredSession(opts.li_at);
+    if (stored.length) {
+      const existing = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+      const inject = cookiesToInject(existing, stored);
+      if (inject.length) {
+        await context.addCookies(inject as Parameters<BrowserContext['addCookies']>[0]);
+      } else {
+        this.logger.log(
+          { accountId: opts.accountId },
+          'Profile already holds a LinkedIn session — keeping it, not injecting the stored copy',
+        );
+      }
     }
     return context;
   }
@@ -409,10 +656,21 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
-      const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const nav = await gotoProfile(page, targetUrl, (reason) =>
+        this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+      );
+      if (nav.error) {
+        this.logger.warn(
+          { targetUrl, error: nav.error },
+          'Profile never loaded — deferring as a network failure (nothing was sent)',
+        );
+        return { status: 'network_error', error: `nav_failed: ${nav.error}` };
+      }
+      const resp = nav.resp;
       await think();
 
       // The /in/<slug> of the INTENDED target — a hard guard on the custom-invite
@@ -420,7 +678,18 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // carry their OWN custom-invite anchors; a page-wide match once grabbed a
       // rail person's anchor and, across BullMQ retries, fired invites at several
       // wrong people. We only goto a custom-invite whose vanityName is this slug.
-      const targetSlug = (targetUrl.match(/\/in\/([^/?#]+)/i)?.[1] || '').toLowerCase();
+      //
+      // ⚠️ Scraped leads often carry LinkedIn's OBFUSCATED member-URN form
+      // ("/in/ACwAAC551Qg…") instead of the vanity slug. LinkedIn serves the
+      // profile fine but canonicalises the URL to the real vanity, so the Connect
+      // anchor's vanityName can never equal the pre-redirect ACwAA… string and the
+      // guard below aborted EVERY such invite (`connect_target_mismatch` — observed
+      // live: requested /in/ACwAAC551Qg…, landed /in/ramcacpa, anchor
+      // vanityName=ramcacpa). So: only trust a vanity slug here, and re-read it
+      // from the LANDED url once the page settles (below). A vanity targetUrl is
+      // unaffected — it resolves exactly as before.
+      const requestedSlug = slugOf(targetUrl);
+      let targetSlug = isOpaqueSlug(requestedSlug) ? '' : requestedSlug.toLowerCase();
 
       if (resp && resp.status() === 404) return { status: 'profile_gone' };
       if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
@@ -444,12 +713,42 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // buttons (Message / Connect / Follow / More / Pending) are lazy-loaded a
       // beat after the profile HTML; scanning too early finds nothing and wrongly
       // reports `no_connect_button`. Wait for ANY primary action to appear.
-      await main
+      // DIAGNOSTIC: this wait matches a <button> anywhere in <main> — and <main>
+      // includes the activity feed, whose posts render their OWN "Follow" button.
+      // If a feed button satisfies it first, the wait returns while the top card
+      // is still empty and the scan below finds nothing. Record what actually
+      // satisfied it (and whether it timed out) so that race is visible in the log.
+      const actionBarBtn = main
         .getByRole('button', { name: /^(Connect|Message|Follow|Following|More|More actions|Pending)$/i })
-        .first()
-        .waitFor({ state: 'visible', timeout: 12000 })
-        .catch(() => undefined);
+        .first();
+      const barOk = await actionBarBtn
+        .waitFor({ state: 'visible', timeout: ACTION_BAR_TIMEOUT_MS })
+        .then(() => true)
+        .catch(() => false);
+      const barWho = barOk
+        ? await actionBarBtn
+            .evaluate((el) => ({
+              text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24),
+              label: el.getAttribute('aria-label') || '',
+              inTopCard: !el.closest('[class*="feed"], article'),
+            }))
+            .catch(() => null)
+        : null;
+      this.logger.log({ barOk, barWho }, 'Action-bar wait settled');
       await sleep(rnd(500, 1200));
+
+      // We arrived via the opaque member-URN form and the URL has now settled —
+      // LinkedIn has canonicalised it to the real vanity, which IS a usable guard.
+      // If it somehow did not, targetSlug stays '' and the deep-link shortcut is
+      // skipped: the click path then acts on the very locator `namesTarget()`
+      // vetted, so identity is still enforced, just without the slug shortcut.
+      if (!targetSlug) {
+        const landedSlug = slugOf(page.url());
+        if (landedSlug && !isOpaqueSlug(landedSlug)) {
+          targetSlug = landedSlug.toLowerCase();
+          this.logger.log({ requestedSlug, targetSlug }, 'Resolved opaque profile URL to vanity slug');
+        }
+      }
 
       // TARGET NAME — read from the PAGE TITLE ("<Name> | LinkedIn", optionally
       // "(N) <Name> | LinkedIn"). This is far more reliable than any DOM selector:
@@ -481,10 +780,14 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
           { requested: targetUrl, landedUrl, title: pageTitle, redirected, nameHeading },
           'Target name unreadable — aborting, no page-wide Connect fallback',
         );
-        return {
-          status: 'no_connect_button',
-          error: redirected ? 'redirected_off_profile' : 'profile_not_loaded',
-        };
+        // A redirect OFF the profile is a real answer about this URL (auth wall,
+        // gone) and stays terminal. An unreadable name on a profile URL is not —
+        // it means we never got a usable page. Classifying that as
+        // `no_connect_button` (TERMINAL, never retried) is how a slow link turned
+        // live prospects into permanent failures; defer it instead.
+        return redirected
+          ? { status: 'no_connect_button', error: 'redirected_off_profile' }
+          : { status: 'network_error', error: 'profile_not_loaded' };
       }
 
       // Precise, name-constrained matchers. LinkedIn labels each Connect control
@@ -521,13 +824,15 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       const card: Locator = (await topCard.count().catch(() => 0)) > 0 ? topCard : main;
 
       // Message button in the target's card ⇒ already connected.
-      const hasMessageBtn = async () =>
-        (await card.getByRole('button', { name: /^Message$/i }).count().catch(() => 0)) > 0;
+      const hasMessageBtn = async () => (await connectedControl(page).count().catch(() => 0)) > 0;
 
       const scope: SelectorScope = { page, card };
 
-      // Pending invite already out? (Pending button in the target's card.)
-      if ((await card.getByRole('button', { name: /^Pending$/i }).count().catch(() => 0)) > 0) {
+      // Pending invite already out? Must be checked BEFORE the Connect lookup —
+      // once an invite is outstanding LinkedIn REPLACES Connect with Pending, so
+      // missing this reports the lead as `no_connect_button`, which is terminal.
+      // That is how leads whose invite had genuinely gone out were recorded failed.
+      if ((await pendingControl(page, nameHeading).count().catch(() => 0)) > 0) {
         return { status: 'pending' };
       }
 
@@ -550,11 +855,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // ONLY was the bug: it missed the anchor top-card Connect and matched a rail
       // button instead. Match either role, name-constrained so only THIS target's
       // control resolves — never a rail person's.
-      const directConnect = () =>
-        page
-          .getByRole('button', { name: targetConnectRe })
-          .or(page.getByRole('link', { name: targetConnectRe }))
-          .first();
+      const directConnect = () => connectControl(page, { nameHeading, targetSlug }).first();
       await directConnect()
         .waitFor({ state: 'visible', timeout: 8000 })
         .catch(() => undefined);
@@ -567,17 +868,43 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // how THIS profile's own Connect is labelled (vs the rail buttons) — and can
       // match it with certainty instead of guessing. Read-only, no click.
       if (!connect) {
-        const bs = page.getByRole('button', { name: /connect/i });
-        const n = Math.min(await bs.count().catch(() => 0), 12);
-        const dump: { text: string; label: string }[] = [];
-        for (let i = 0; i < n; i++) {
-          const b = bs.nth(i);
-          dump.push({
-            text: ((await b.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim(),
-            label: ((await b.getAttribute('aria-label').catch(() => '')) || '').trim(),
-          });
-        }
-        this.logger.log({ nameHeading, connectButtons: dump }, 'Connect-candidate buttons (diagnostic)');
+        // Scan the DOM directly, not via getByRole('button'). The top-card Connect
+        // is commonly an <a> (role=link), so a button-only scan is blind to the very
+        // element this diagnostic exists to find — it would log an empty list and be
+        // misread as "no Connect on the page". Report every connect-ish control with
+        // its exact accessible label, whether it is on screen, and whether the
+        // name-anchored matcher accepted it. That is what separates "Connect is not
+        // there" from "Connect is there under a name we failed to match".
+        const dump = await page
+          .evaluate(() => {
+            const out: { tag: string; role: string; text: string; label: string; href: string; shown: boolean }[] = [];
+            document
+              .querySelectorAll('button, a, [role="button"], [role="menuitem"], [aria-label*="to connect" i]')
+              .forEach((el) => {
+                const label = el.getAttribute('aria-label') || '';
+                const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/connect/i.test(label) && !/^connect$/i.test(text)) return;
+                const r = (el as HTMLElement).getBoundingClientRect();
+                out.push({
+                  tag: el.tagName.toLowerCase(),
+                  role: el.getAttribute('role') || '',
+                  text: text.slice(0, 30),
+                  label,
+                  href: (el.getAttribute('href') || '').slice(0, 60),
+                  shown: r.width > 0 && r.height > 0,
+                });
+              });
+            return out.slice(0, 12);
+          })
+          .catch(() => [] as { tag: string; role: string; text: string; label: string; href: string; shown: boolean }[]);
+        this.logger.log(
+          {
+            nameHeading,
+            targetConnectRe: String(targetConnectRe),
+            candidates: dump.map((d) => ({ ...d, matches: targetConnectRe.test(d.label) })),
+          },
+          'Connect-candidate controls (diagnostic)',
+        );
       }
       // Track whether Connect lives inside the "More" dropdown: a dropdown item
       // is position-anchored, so a PAGE scroll or a force-click-by-coordinate
@@ -1012,8 +1339,16 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         }
       }
 
+      // The fast confirm path (toast / Pending flip) never navigates back to an
+      // /in/<slug> URL — the page is still on the custom-invite deep-link, so
+      // fall back to its vanityName param rather than losing the slug.
+      const landedSlug = resolvedSlugFrom(page.url());
       const externalId = 'li_inv_' + Date.now().toString(36);
-      return { status: 'sent', externalId };
+      return {
+        status: 'sent',
+        externalId,
+        ...(landedSlug ? { resolvedSlug: landedSlug } : {}),
+      };
     } catch (err: any) {
       return { status: 'failed', error: String(err?.message || err) };
     } finally {
@@ -1036,10 +1371,17 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
-      const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const nav = await gotoProfile(page, targetUrl, (reason) =>
+        this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+      );
+      // Failing HERE is before anything is typed or clicked, so the message
+      // provably did not go out and re-driving it cannot double-send.
+      if (nav.error) return { status: 'network_error', error: `nav_failed: ${nav.error}` };
+      const resp = nav.resp;
       await think();
       if (resp && resp.status() === 404) return { status: 'profile_gone' };
       if (await this.isCheckpoint(page)) return { status: 'checkpoint' };
@@ -1084,9 +1426,16 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       proxy: ctx.proxy,
       fingerprint: ctx.fingerprint,
       li_at: ctx.li_at,
+      cookies: ctx.cookies,
     });
     const page = context.pages()[0] || (await context.newPage());
-    const resp = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const nav = await gotoProfile(page, targetUrl, (reason) =>
+      this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
+    );
+    if (nav.error) {
+      return { ok: false, context, result: { status: 'network_error', error: `nav_failed: ${nav.error}` } };
+    }
+    const resp = nav.resp;
     await think();
     if (resp && resp.status() === 404) return { ok: false, context, result: { status: 'profile_gone' } };
     if (await this.isCheckpoint(page)) return { ok: false, context, result: { status: 'checkpoint' } };
@@ -1273,6 +1622,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
 
@@ -1348,6 +1698,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         proxy: ctx.proxy,
         fingerprint: ctx.fingerprint,
         li_at: ctx.li_at,
+        cookies: ctx.cookies,
       });
       const page = context.pages()[0] || (await context.newPage());
       await page.goto('https://www.linkedin.com/mynetwork/invitation-manager/sent/', {
@@ -1409,11 +1760,15 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
       // If the persistent profile is already signed in, reuse it — no
       // re-login (repeated logins are the #1 bot-detection trigger).
-      const existing = (await context.cookies('https://www.linkedin.com')).find(
-        (c) => c.name === 'li_at',
-      );
+      const jar = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+      const existing = jar.find((c) => c.name === 'li_at');
       if (existing?.value) {
-        return { status: 'connected', li_at: existing.value, fingerprint: ctx.fingerprint };
+        return {
+          status: 'connected',
+          li_at: existing.value,
+          cookies: jar,
+          fingerprint: ctx.fingerprint,
+        };
       }
 
       await page.goto('https://www.linkedin.com/login', {
@@ -1424,22 +1779,69 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
 
       // Already authenticated (redirected to feed)? Capture and stop.
       if (/\/feed|\/checkpoint\/lg\/login-submit/.test(page.url())) {
-        const c = (await context.cookies('https://www.linkedin.com')).find((x) => x.name === 'li_at');
-        if (c?.value) return { status: 'connected', li_at: c.value, fingerprint: ctx.fingerprint };
+        const j2 = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
+        const c = j2.find((x) => x.name === 'li_at');
+        if (c?.value) {
+          return { status: 'connected', li_at: c.value, cookies: j2, fingerprint: ctx.fingerprint };
+        }
       }
 
       // LinkedIn serves several login layouts — try robust selectors.
-      await typeLikeHuman(
-        page,
-        '#username, input[autocomplete="username"], input[name="session_key"], input[type="email"]',
-        ctx.email,
-      );
-      await sleep(rnd(400, 900));
-      await typeLikeHuman(
-        page,
-        '#password, input[autocomplete="current-password"], input[name="session_password"], input[type="password"]',
-        ctx.password,
-      );
+      const USERNAME_SEL =
+        '#username, input[autocomplete="username"], input[name="session_key"], input[type="email"]';
+      const PASSWORD_SEL =
+        '#password, input[autocomplete="current-password"], input[name="session_password"], input[type="password"]';
+
+      // A profile LinkedIn RECOGNISES gets the "Welcome back" page: the account's
+      // name, a masked email, and a password field only — no username input. We
+      // use persistent profiles deliberately, so that page is the norm for a
+      // re-login, yet the old code always typed the email first and waited 15s on
+      // a selector that would never appear, threw, and closed the browser. Every
+      // re-login through an established profile died there.
+      const visible = (sel: string) =>
+        page.locator(sel).filter({ visible: true }).count().catch(() => 0);
+      let variant = classifyLoginForm({
+        hasUsernameField: (await visible(USERNAME_SEL)) > 0,
+        hasPasswordField: (await visible(PASSWORD_SEL)) > 0,
+      });
+
+      if (variant === 'remembered') {
+        // Whose account does this profile remember? A mismatch must NOT get this
+        // account's password: that is a failed login attempt against someone
+        // else's identity. Fall back to the full form via "another account".
+        const masked = (
+          (await page
+            .locator('text=/\\S+@\\S+/')
+            .first()
+            .innerText()
+            .catch(() => '')) || ''
+        ).trim();
+        if (!rememberedAccountMatches(masked, ctx.email)) {
+          this.logger.warn(
+            { accountId: ctx.accountId },
+            'Profile remembers a different account — switching to the full sign-in form',
+          );
+          await page
+            .getByRole('button', { name: /sign in using another account/i })
+            .or(page.getByRole('link', { name: /sign in using another account/i }))
+            .first()
+            .click({ timeout: 8000 })
+            .catch(() => undefined);
+          await sleep(rnd(1200, 2200));
+          variant = (await visible(USERNAME_SEL)) > 0 ? 'full' : 'unknown';
+        }
+      }
+
+      if (variant === 'unknown') {
+        return { status: 'checkpoint', error: 'unrecognised_login_page' };
+      }
+
+      if (variant === 'full') {
+        await typeLikeHuman(page, USERNAME_SEL, ctx.email);
+        await sleep(rnd(400, 900));
+      }
+      // Both layouts end the same way: password, then Sign in.
+      await typeLikeHuman(page, PASSWORD_SEL, ctx.password);
       await think();
       await page.getByRole('button', { name: /^Sign in$/ }).first().click();
       await page.waitForLoadState('domcontentloaded').catch(() => undefined);
@@ -1453,19 +1855,51 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         (await page.locator(pinSel).count()) > 0;
       if (needs2fa) {
         if (!ctx.totpSecret) return { status: 'checkpoint', error: '2FA required but no TOTP seed stored' };
-        const pin = authenticator.generate(ctx.totpSecret);
+
+        // WHICH code is LinkedIn asking for? A stored seed can only answer the
+        // authenticator challenge. Typing that code into an email/SMS challenge
+        // submits a WRONG pin — a failed login attempt, which is exactly the
+        // signal that gets an account challenged harder. Stop instead of
+        // guessing, and say which factor is needed so the UI can explain it.
+        const challengeText = (await page.locator('body').innerText().catch(() => '')) || '';
+        const challenge = classifyPinChallenge(challengeText);
+        if (challenge !== 'totp') {
+          this.logger.warn(
+            { accountId: ctx.accountId, challenge },
+            'LinkedIn asked for a code we cannot generate — not guessing with the TOTP seed',
+          );
+          return {
+            status: 'checkpoint',
+            error:
+              challenge === 'unknown'
+                ? 'unrecognised_pin_challenge'
+                : `${challenge}_pin_required`,
+          };
+        }
         // Pick the VISIBLE input/button (LinkedIn ships hidden duplicates).
         const pinInput = page.locator(pinSel).filter({ visible: true }).first();
-        await pinInput.waitFor({ state: 'visible', timeout: 15000 });
-        await pinInput.fill(pin);
-        await think();
-        const submit = page
-          .locator('#two-step-submit-button, button[type="submit"], button:has-text("Submit")')
-          .filter({ visible: true })
-          .first();
-        await submit.click();
-        await page.waitForLoadState('domcontentloaded').catch(() => undefined);
-        await sleep(rnd(2000, 4000));
+        // The PIN field may never actually appear: LinkedIn can auto-trust this
+        // persistent profile and redirect straight to the feed. Don't hard-fail
+        // on the wait — only enter the PIN if the field truly shows; otherwise
+        // fall through to the li_at capture below (a /feed/ redirect means we're
+        // already signed in). Previously this waitFor threw on timeout and a
+        // SUCCESSFUL login was misreported as "failed".
+        const pinVisible = await pinInput
+          .waitFor({ state: 'visible', timeout: 15000 })
+          .then(() => true)
+          .catch(() => false);
+        if (pinVisible) {
+          const pin = authenticator.generate(ctx.totpSecret);
+          await pinInput.fill(pin);
+          await think();
+          const submit = page
+            .locator('#two-step-submit-button, button[type="submit"], button:has-text("Submit")')
+            .filter({ visible: true })
+            .first();
+          await submit.click().catch(() => undefined);
+          await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+          await sleep(rnd(2000, 4000));
+        }
       }
 
       // Any residual security wall → surface as checkpoint (needs human).
@@ -1473,8 +1907,10 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         return { status: 'checkpoint', error: 'Security checkpoint during login' };
       }
 
-      // Capture the li_at cookie — this IS the logged-in session.
-      const cookies = await context.cookies('https://www.linkedin.com');
+      // Capture the WHOLE jar. `li_at` names the session, but it cannot hold one
+      // on its own: replayed alone into a fresh profile it redirect-loops, because
+      // LinkedIn also needs JSESSIONID / bcookie / bscookie / liap alongside it.
+      const cookies = (await context.cookies('https://www.linkedin.com')) as StoredCookie[];
       const liAt = cookies.find((c) => c.name === 'li_at');
       if (!liAt?.value) {
         return { status: 'failed', error: 'Login did not yield a session cookie (bad credentials?)' };
@@ -1483,6 +1919,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       return {
         status: 'connected',
         li_at: liAt.value,
+        cookies,
         fingerprint: ctx.fingerprint,
       };
     } catch (err: any) {

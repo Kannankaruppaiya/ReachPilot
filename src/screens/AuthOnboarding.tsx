@@ -72,6 +72,131 @@ function TrustPanel({ items, quote }: { items: { icon: React.ReactNode; title: s
   )
 }
 
+/**
+ * The LinkedIn email / password / country fields — the SINGLE source shared by
+ * the onboarding "Connect LinkedIn" step AND the Integrations "Update LinkedIn
+ * login" modal, so both stay in lockstep.
+ */
+export function LinkedinCredentialFields({
+  email,
+  setEmail,
+  password,
+  setPassword,
+  country,
+  setCountry,
+  showPw,
+  setShowPw,
+}: {
+  email: string
+  setEmail: (v: string) => void
+  password: string
+  setPassword: (v: string) => void
+  country: string
+  setCountry: (v: string) => void
+  showPw: boolean
+  setShowPw: (v: boolean) => void
+}) {
+  return (
+    <>
+      <Field label="LinkedIn email">
+        <input
+          className={inputCls}
+          type="email"
+          placeholder="you@company.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+      </Field>
+      <Field label="LinkedIn password">
+        <div className="relative">
+          <input
+            className={inputCls}
+            type={showPw ? "text" : "password"}
+            placeholder="Your LinkedIn password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button
+            type="button"
+            aria-label={showPw ? "Hide password" : "Show password"}
+            onClick={() => setShowPw(!showPw)}
+            className="absolute right-3 top-1/2 -translate-y-1/2 text-sub hover:text-fg"
+          >
+            {showPw ? <EyeOff size={17} /> : <Eye size={17} />}
+          </button>
+        </div>
+      </Field>
+      <Field
+        label="Country"
+        hint="We'll set up a dedicated IP here so LinkedIn sees consistent activity."
+      >
+        <select className={inputCls} value={country} onChange={(e) => setCountry(e.target.value)}>
+          <option value="">Select a country</option>
+          <option>India</option>
+          <option>United States</option>
+          <option>Germany</option>
+        </select>
+      </Field>
+    </>
+  )
+}
+
+/**
+ * The 2FA instructions + secret-key input — shared by the onboarding "2FA" step
+ * and the Integrations "Update LinkedIn login" modal.
+ */
+export function TwoFaInstructions({
+  secret,
+  setSecret,
+}: {
+  secret: string
+  setSecret: (v: string) => void
+}) {
+  return (
+    <ol className="flex flex-col gap-6 border-l border-line pl-6">
+      <li className="relative">
+        <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
+          1
+        </span>
+        <p className="font-semibold">Set up 2FA on LinkedIn</p>
+        <p className="text-sm text-sub">
+          Pick Authenticator app, scan the QR with your authenticator.
+        </p>
+        <div className="mt-2 flex items-start gap-2 rounded-md bg-mutedbg px-3 py-2 text-sm">
+          <Info size={15} className="mt-0.5 shrink-0 text-sub" />
+          Already have 2FA? Disable it first, then re-enable.
+        </div>
+        <Button variant="outline" className="mt-3">
+          Open LinkedIn 2FA settings <ExternalLink size={15} />
+        </Button>
+      </li>
+      <li className="relative">
+        <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
+          2
+        </span>
+        <p className="font-semibold">Paste &amp; verify the secret key</p>
+        <div className="mt-2 flex gap-2">
+          <input
+            className={inputCls}
+            placeholder="JBSWY3DPEHPK3PXP…"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+          />
+        </div>
+      </li>
+      <li className="relative">
+        <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
+          3
+        </span>
+        <p className="font-semibold">Confirm on LinkedIn</p>
+        <p className="text-sm text-sub">
+          Enter the code from your authenticator in LinkedIn to finish.
+        </p>
+      </li>
+    </ol>
+  )
+}
+
 export function Auth({ onDone }: { onDone: () => void }) {
   const [mode, setMode] = useState<"login" | "signup">("signup")
   const [fullName, setFullName] = useState("")
@@ -379,49 +504,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   in.
                 </p>
               </div>
-              <Field label="LinkedIn email">
-                <input
-                  className={inputCls}
-                  type="email"
-                  placeholder="you@company.com"
-                  value={liEmail}
-                  onChange={(e) => setLiEmail(e.target.value)}
-                />
-              </Field>
-              <Field label="LinkedIn password">
-                <div className="relative">
-                  <input
-                    className={inputCls}
-                    type={showPw ? "text" : "password"}
-                    placeholder="Your LinkedIn password"
-                    value={liPw}
-                    onChange={(e) => setLiPw(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    aria-label={showPw ? "Hide password" : "Show password"}
-                    onClick={() => setShowPw(!showPw)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-sub hover:text-fg"
-                  >
-                    {showPw ? <EyeOff size={17} /> : <Eye size={17} />}
-                  </button>
-                </div>
-              </Field>
-              <Field
-                label="Country"
-                hint="We'll set up a dedicated IP here so LinkedIn sees consistent activity."
-              >
-                <select
-                  className={inputCls}
-                  value={country}
-                  onChange={(e) => setCountry(e.target.value)}
-                >
-                  <option value="">Select a country</option>
-                  <option>India</option>
-                  <option>United States</option>
-                  <option>Germany</option>
-                </select>
-              </Field>
+              <LinkedinCredentialFields
+                email={liEmail}
+                setEmail={setLiEmail}
+                password={liPw}
+                setPassword={setLiPw}
+                country={country}
+                setCountry={setCountry}
+                showPw={showPw}
+                setShowPw={setShowPw}
+              />
               {error && <ErrorBanner message={error} />}
               <Button
                 disabled={busy || !liEmail || !liPw || !country}
@@ -446,47 +538,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <h1 className="text-3xl font-bold">Protect this LinkedIn account</h1>
                 <p className="mt-2 text-sub">Stops LinkedIn from flagging this account on new IPs.</p>
               </div>
-              <ol className="flex flex-col gap-6 border-l border-line pl-6">
-                <li className="relative">
-                  <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
-                    1
-                  </span>
-                  <p className="font-semibold">Set up 2FA on LinkedIn</p>
-                  <p className="text-sm text-sub">
-                    Pick Authenticator app, scan the QR with your authenticator.
-                  </p>
-                  <div className="mt-2 flex items-start gap-2 rounded-md bg-mutedbg px-3 py-2 text-sm">
-                    <Info size={15} className="mt-0.5 shrink-0 text-sub" />
-                    Already have 2FA? Disable it first, then re-enable.
-                  </div>
-                  <Button variant="outline" className="mt-3">
-                    Open LinkedIn 2FA settings <ExternalLink size={15} />
-                  </Button>
-                </li>
-                <li className="relative">
-                  <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
-                    2
-                  </span>
-                  <p className="font-semibold">Paste &amp; verify the secret key</p>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      className={inputCls}
-                      placeholder="JBSWY3DPEHPK3PXP…"
-                      value={secret}
-                      onChange={(e) => setSecret(e.target.value)}
-                    />
-                  </div>
-                </li>
-                <li className="relative">
-                  <span className="absolute -left-[34px] flex h-6 w-6 items-center justify-center rounded-full bg-mutedbg text-xs font-bold">
-                    3
-                  </span>
-                  <p className="font-semibold">Confirm on LinkedIn</p>
-                  <p className="text-sm text-sub">
-                    Enter the code from your authenticator in LinkedIn to finish.
-                  </p>
-                </li>
-              </ol>
+              <TwoFaInstructions secret={secret} setSecret={setSecret} />
               {error && <ErrorBanner message={error} />}
               <div className="flex items-center justify-between">
                 <button
@@ -749,5 +801,190 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         </Modal>
       )}
     </div>
+  )
+}
+
+/**
+ * "Update LinkedIn login" — reuses the SAME two onboarding pages (credentials +
+ * 2FA) as a standalone modal, for when a user changes their LinkedIn password
+ * and needs ReachPilot to sign in again. Hits the same endpoints
+ * (connectLinkedin → verify2fa / skip2fa), which upsert the account by email and
+ * re-enqueue the login to re-capture the session — no separate "update" backend.
+ */
+export function LinkedinUpdateModal({
+  currentEmail,
+  onClose,
+  onUpdated,
+}: {
+  currentEmail: string | null
+  onClose: () => void
+  onUpdated: () => void
+}) {
+  const [phase, setPhase] = useState<"creds" | "twofa" | "skip">("creds")
+  const [email, setEmail] = useState(currentEmail ?? "")
+  const [pw, setPw] = useState("")
+  const [country, setCountry] = useState("")
+  const [secret, setSecret] = useState("")
+  const [showPw, setShowPw] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+  const toast = useToast()
+
+  const finish = () => {
+    toast("LinkedIn login updated — reconnecting your account…")
+    onUpdated()
+  }
+
+  const submitCreds = async () => {
+    if (busy) return
+    setBusy(true)
+    setError("")
+    try {
+      await api.connectLinkedin(email.trim(), pw, country)
+      setPhase("twofa")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const verify = async () => {
+    setBusy(true)
+    setError("")
+    try {
+      await api.verify2fa(secret)
+      finish()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const skip = async () => {
+    setBusy(true)
+    setError("")
+    try {
+      await api.skip2fa()
+      finish()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const title =
+    phase === "creds"
+      ? "Update LinkedIn login"
+      : phase === "skip"
+        ? "Skip 2FA setup?"
+        : "Confirm 2FA"
+
+  return (
+    <Modal title={title} onClose={onClose}>
+      {phase === "creds" && (
+        <div className="flex flex-col gap-5">
+          <p className="text-sm text-sub">
+            Changed your LinkedIn password? Re-enter your login so ReachPilot can sign in again on
+            your dedicated IP. Same steps as setup — nothing else changes.
+          </p>
+          <LinkedinCredentialFields
+            email={email}
+            setEmail={setEmail}
+            password={pw}
+            setPassword={setPw}
+            country={country}
+            setCountry={setCountry}
+            showPw={showPw}
+            setShowPw={setShowPw}
+          />
+          {error && <ErrorBanner message={error} />}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" disabled={busy} onClick={onClose}>
+              Cancel
+            </Button>
+            <Button disabled={busy || !email || !pw || !country} onClick={submitCreds}>
+              {busy ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" /> Updating…
+                </>
+              ) : (
+                <>
+                  Continue <ArrowRight size={16} />
+                </>
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {phase === "twofa" && (
+        <div className="flex flex-col gap-5">
+          <p className="text-sm text-sub">
+            Confirm two-factor so ReachPilot can enter the PIN when LinkedIn asks. If your 2FA
+            hasn't changed, paste the same secret key again.
+          </p>
+          <TwoFaInstructions secret={secret} setSecret={setSecret} />
+          {error && <ErrorBanner message={error} />}
+          <div className="flex items-center justify-between">
+            <button
+              className="text-sm font-semibold text-sub hover:text-fg"
+              onClick={() => {
+                setError("")
+                setPhase("skip")
+              }}
+              disabled={busy}
+            >
+              Skip — risk disconnects
+            </button>
+            <Button disabled={busy} onClick={verify}>
+              {busy ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" /> Verifying…
+                </>
+              ) : (
+                <>
+                  I've finished on LinkedIn <ArrowRight size={16} />
+                </>
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {phase === "skip" && (
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-sub">Without 2FA on this LinkedIn account:</p>
+          <div className="rounded-lg border border-warn/40 bg-warn/10 p-4">
+            <p className="flex items-center gap-2 font-semibold text-warn">
+              <Unplug size={16} /> It'll disconnect more often.
+            </p>
+            <p className="mt-1 text-sm">
+              LinkedIn challenges new IPs more aggressively when 2FA isn't on. Expect more reconnects
+              mid-campaign.
+            </p>
+          </div>
+          <div className="rounded-lg border border-warn/40 bg-warn/10 p-4">
+            <p className="flex items-center gap-2 font-semibold text-warn">
+              <AlertTriangle size={16} /> Sales Navigator and Recruiter won't work.
+            </p>
+            <p className="mt-1 text-sm">
+              LinkedIn requires 2FA for its premium products. If you use either, set up 2FA now.
+            </p>
+          </div>
+          {error && <ErrorBanner message={error} />}
+          <div className="mt-1 flex justify-end gap-3">
+            <Button variant="ghost" disabled={busy} onClick={skip}>
+              {busy ? <Loader2 size={16} className="animate-spin" /> : "Skip anyway"}
+            </Button>
+            <Button disabled={busy} onClick={() => setPhase("twofa")}>
+              Set up 2FA
+            </Button>
+          </div>
+        </div>
+      )}
+    </Modal>
   )
 }

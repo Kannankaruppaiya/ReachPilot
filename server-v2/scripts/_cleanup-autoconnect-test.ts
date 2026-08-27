@@ -40,8 +40,8 @@ import Redis from 'ioredis';
       const localDateIso = new Date().toLocaleDateString('en-US', { timeZone: tz });
       await redis.decr(`pacing:linkedin:${a.id}:date:${localDateIso}:daily`).catch(() => {});
       await redis.decr(`pacing:linkedin:${a.id}:weekly`).catch(() => {});
-      await redis.del(`pacing:linkedin:${a.id}:lastaction`).catch(() => {});
-      console.log(`ws ${ws.id.slice(0,8)} acct ${a.id.slice(0,8)}: daily_stats -2, pacing daily/weekly -1, lastaction cleared`);
+      await redis.del(`pacing:linkedin:${a.id}:nextallowed`).catch(() => {});
+      console.log(`ws ${ws.id.slice(0,8)} acct ${a.id.slice(0,8)}: daily_stats -2, pacing daily/weekly -1, nextallowed cleared`);
     }
   }
   await redis.quit();

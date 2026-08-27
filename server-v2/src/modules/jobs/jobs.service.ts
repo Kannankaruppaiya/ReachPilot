@@ -3,7 +3,8 @@ import { withWorkspace } from '@/db/rls';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
-import { computeWarmup } from '@/modules/engine/warmup';
+import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
+import { profileKey, profileKeyFromSlug, selectNewRows } from './profile-key';
 import { spin } from '@/modules/engine/spintax';
 
 let redisClient: Redis | null = null;
@@ -211,13 +212,66 @@ export class JobsService {
     rows: any[],
     template: string,
     subject?: string,
-    personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string } = {},
-  ): Promise<{ batchId: string; total: number; today: number; queuedDays: number }> {
+    personalization: { useAi?: boolean; useApify?: boolean; aiGuidance?: string; noNote?: boolean } = {},
+  ): Promise<{ batchId: string; total: number; today: number; queuedDays: number; skipped: number }> {
     if (kind !== 'linkedin' && kind !== 'email') {
       throw new BadRequestException('Invalid channel.');
     }
     if (!Array.isArray(rows) || rows.length === 0) {
       throw new BadRequestException('No profiles to send to.');
+    }
+
+    // Drop profiles this workspace has already sent a connection request to.
+    // Re-inviting someone spends weekly invite allowance a new prospect needed,
+    // and repeat invites to the same member are what automation detection looks
+    // for. Only SENT jobs count: a queued one has not happened yet, and a failed
+    // one is usually a bad network window rather than a verdict about the person.
+    let skipped = 0;
+    if (kind === 'linkedin') {
+      const sentJobs = await withWorkspace(workspaceId, (db) =>
+        db
+          .selectFrom('jobs')
+          .select('payload')
+          .where('workspace_id', '=', workspaceId)
+          .where('action', '=', 'connect_request')
+          .where('status', '=', 'sent')
+          .execute(),
+      );
+
+      const sentKeys = new Set<string>();
+      for (const j of sentJobs) {
+        const p: any =
+          typeof j.payload === 'string'
+            ? (() => {
+                try {
+                  return JSON.parse(j.payload);
+                } catch {
+                  return {};
+                }
+              })()
+            : j.payload || {};
+        // Both the URL we were given and the vanity slug LinkedIn actually
+        // landed on, so a member invited under an obfuscated URN is recognised
+        // when a later list carries their readable URL (see Task 4).
+        // resolvedSlug is a BARE slug ('ramcacpa'), not a URL — profileKey
+        // requires a literal linkedin.com/in/ segment, so it goes through
+        // profileKeyFromSlug instead, which normalises it into the same shape
+        // before comparing.
+        const targetKey = profileKey(p.target);
+        if (targetKey) sentKeys.add(targetKey);
+        const resolvedKey = profileKeyFromSlug(p.resolvedSlug);
+        if (resolvedKey) sentKeys.add(resolvedKey);
+      }
+
+      const selection = selectNewRows(rows, sentKeys);
+      skipped = selection.skipped.length;
+      rows = selection.kept;
+
+      if (rows.length === 0) {
+        // Uploading a list of people you have already contacted is a normal
+        // outcome, not an error — do not fall through to the empty-input throw.
+        return { batchId: '', total: 0, today: 0, queuedDays: 0, skipped };
+      }
     }
 
     const batchId = crypto.randomUUID();
@@ -235,7 +289,7 @@ export class JobsService {
       // Find first active LinkedIn/email account for this workspace to link
       const linkedinAcct = await db
         .selectFrom('linkedin_accounts')
-        .select(['id', 'warmup_daily_limit', 'warmup_target', 'connected_at', 'created_at'])
+        .select(['id', 'warmup_daily_limit', 'warmup_target', 'connected_at', 'created_at', 'hours_start', 'hours_end', 'timezone'])
         .where('workspace_id', '=', workspaceId)
         .limit(1)
         .executeTakeFirst();
@@ -247,7 +301,7 @@ export class JobsService {
       const perDay =
         kind === 'linkedin' && linkedinAcct
           ? computeWarmup(
-              linkedinAcct.connected_at || linkedinAcct.created_at,
+              warmupOrigin(linkedinAcct.connected_at, linkedinAcct.created_at),
               linkedinAcct.warmup_daily_limit,
               linkedinAcct.warmup_target,
             ).todayLimit
@@ -261,15 +315,87 @@ export class JobsService {
         .executeTakeFirst();
 
       const createdJobs: any[] = [];
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+
+      // Schedule in the ACCOUNT's timezone + working hours (NOT the server clock).
+      // Old code hardcoded setHours(9) which, on a UTC server, meant 9am UTC =
+      // 2:30pm IST and ignored the account's hours_start entirely.
+      //
+      // Each day's quota is now released AT the window open, all of it, rather
+      // than pinned to a slot grid stepped across [hours_start, hours_end]. The
+      // grid assumed a cloud executor that is always up. Ours is the user's
+      // LAPTOP: a job pinned to 15:40 only sends if the laptop happens to be open
+      // at 15:40, so a grid across a 9-hour window demands a 9-hour session, and
+      // across a 23-hour window it demands sends at 3am. Releasing the quota at
+      // the open instead lets pacing drain it whenever the machine is actually on
+      // — open the laptop once, the queue empties, close it again.
+      //
+      // Nothing is uncapped by this: pacing still enforces the daily limit, the
+      // weekly invite cap, the working-hours window and the per-action gap at
+      // send time. This only decides when a job becomes ELIGIBLE.
+      const tz = (kind === 'linkedin' && linkedinAcct?.timezone) || 'UTC';
+      const parseMin = (hhmm: any, def: number) => {
+        const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || ''));
+        return m ? Number(m[1]) * 60 + Number(m[2]) : def;
+      };
+      // Only the OPEN matters here — the close is pacing's business. That also
+      // means a window that wraps past midnight (22:00 → 06:00) needs no special
+      // case at this layer, where the old slot-grid math had to clamp it.
+      const startMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_start, 9 * 60) : 9 * 60;
+
+      // Ensure every LinkedIn target URL carries a protocol. A bare
+      // "linkedin.com/in/x" is treated as a RELATIVE path — the UI "Open" link
+      // resolves it against the app domain (→ Vercel 404) and the driver's goto
+      // fails (→ profile_gone / no_connect_button). Normalize once at job-create.
+      const withProtocol = (u: any): string => {
+        const s = String(u || '').trim();
+        if (!s) return '';
+        return /^https?:\/\//i.test(s) ? s : `https://${s.replace(/^\/+/, '')}`;
+      };
+
+      // "Today" as a calendar date in the account timezone (YYYY-MM-DD).
+      const [ty, tm, td] = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      })
+        .format(new Date())
+        .split('-')
+        .map(Number);
+
+      // Wall-clock (account tz) → UTC instant. One-pass offset correction; at most
+      // ~1h off across a DST edge, which pacing re-checks and self-corrects.
+      const wallToUtc = (dayOffset: number, minsFromMidnight: number): Date => {
+        const guess = Date.UTC(ty, tm - 1, td + dayOffset, 0, minsFromMidnight, 0);
+        const p: any = new Intl.DateTimeFormat('en-US', {
+          timeZone: tz,
+          hour12: false,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
+          .formatToParts(new Date(guess))
+          .reduce((a: any, x) => ((a[x.type] = x.value), a), {});
+        const asUtc = Date.UTC(
+          Number(p.year),
+          Number(p.month) - 1,
+          Number(p.day),
+          Number(p.hour === '24' ? 0 : p.hour),
+          Number(p.minute),
+          Number(p.second),
+        );
+        return new Date(guess - (asUtc - guess));
+      };
 
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
         const dayOffset = Math.floor(i / perDay);
-        const scheduledFor = new Date(today);
-        scheduledFor.setDate(scheduledFor.getDate() + dayOffset);
-        scheduledFor.setHours(9, 0, 0, 0); // Outbound at 9am local timezone-ish
+        // The day's whole quota becomes DUE at the window open; pacing decides the
+        // actual send times from there. See the note above `tz` for why.
+        const scheduledFor = wallToUtc(dayOffset, startMin);
 
         const isToday = dayOffset === 0;
         const status = isToday ? 'queued' : 'scheduled';
@@ -277,7 +403,10 @@ export class JobsService {
 
         const payload = {
           name: row.name || '',
-          target: row.target || row.linkedinUrl || row.email || '',
+          target:
+            kind === 'linkedin'
+              ? withProtocol(row.target || row.linkedinUrl)
+              : row.target || row.linkedinUrl || row.email || '',
           company: row.company || '',
           role: row.role || row.title || '',
           // Template is always filled as the fallback; when AI is on the worker
@@ -291,6 +420,9 @@ export class JobsService {
                 aiGuidance: personalization.aiGuidance || '',
               }
             : {}),
+          // "Send without a note" — independent of AI; the worker drops the note
+          // entirely (direct note-less connect, skips the note-cap check).
+          ...(kind === 'linkedin' && personalization.noNote ? { noNote: true } : {}),
         };
 
         const jobData = {
@@ -328,12 +460,14 @@ export class JobsService {
         .insertInto('activity')
         .values({
           workspace_id: workspaceId,
-          text: `Queued ${totalCount} ${kind === 'linkedin' ? 'connection requests' : 'emails'} (${todayCount} today)`,
+          text:
+            `Queued ${totalCount} ${kind === 'linkedin' ? 'connection requests' : 'emails'} (${todayCount} today)` +
+            (skipped ? ` · skipped ${skipped} already contacted` : ''),
           tone: 'accent',
         })
         .execute();
 
-      return { batchId, total: totalCount, today: todayCount, queuedDays };
+      return { batchId, total: totalCount, today: todayCount, queuedDays, skipped };
     });
 
     // Transaction has committed — the rows are now visible to the worker's

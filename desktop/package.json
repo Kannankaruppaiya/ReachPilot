@@ -1,0 +1,40 @@
+{
+  "name": "reachpilot-desktop",
+  "version": "0.1.0",
+  "description": "ReachPilot Desktop — dashboard + local LinkedIn agent that runs on the user's own residential IP.",
+  "main": "main.js",
+  "author": "ReachPilot",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "build:agent": "node agent/build.js",
+    "dist": "npm run build:agent && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.2"
+  },
+  "dependencies": {
+    "playwright": "^1.48.2"
+  },
+  "build": {
+    "appId": "com.reachpilot.desktop",
+    "productName": "ReachPilot",
+    "asarUnpack": [
+      "node_modules/playwright/**",
+      "node_modules/playwright-core/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "ReachPilot"
+    }
+  }
+}

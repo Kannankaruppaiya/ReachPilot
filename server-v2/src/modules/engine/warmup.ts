@@ -26,6 +26,40 @@ const START = 5;
 const STEP = 3;
 const EVERY_DAYS = 2;
 
+/** A date we can actually measure from, or null. */
+function asTime(d: Date | string | null | undefined): number | null {
+  if (!d) return null;
+  const t = new Date(d).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * Which date the warm-up ramp should measure from: the EARLIER of when the
+ * account was connected and when its row was created.
+ *
+ * `connect()` rewrites `connected_at` every time credentials are saved — even
+ * for an account that already exists — so on its own it answers "when was the
+ * password last re-entered", not "how long has this account been running". A
+ * long-lived account was knocked back to 5/day by a password change while
+ * holding 159 sent invites. `created_at` never moves, so taking the earlier of
+ * the two makes the ramp immune to that AND repairs rows already damaged, with
+ * no migration.
+ *
+ * An unparseable date is ignored rather than trusted: `new Date('nonsense')` is
+ * NaN, and letting that through would make an account look infinitely old and
+ * skip warm-up altogether — failure in the dangerous direction.
+ */
+export function warmupOrigin<T extends Date | string | null | undefined>(
+  connectedAt: T,
+  createdAt: T,
+): T | null {
+  const a = asTime(connectedAt);
+  const b = asTime(createdAt);
+  if (a === null) return b === null ? null : createdAt;
+  if (b === null) return connectedAt;
+  return a <= b ? connectedAt : createdAt;
+}
+
 export function computeWarmup(
   connectedAt: Date | string | null | undefined,
   warmupDailyLimit?: number | null,

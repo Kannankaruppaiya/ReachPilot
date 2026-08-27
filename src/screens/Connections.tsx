@@ -389,7 +389,9 @@ function ConnectionRowView({ r, onDelete }: { r: ConnectionRow; onDelete: () => 
       <td className="px-4 py-3">
         {r.linkedinUrl ? (
           <a
-            href={r.linkedinUrl}
+            // A bare "linkedin.com/in/x" without a protocol resolves against the
+            // app domain (→ Vercel 404). Force an absolute URL.
+            href={/^https?:\/\//i.test(r.linkedinUrl) ? r.linkedinUrl : `https://${r.linkedinUrl.replace(/^\/+/, '')}`}
             target="_blank"
             rel="noreferrer noopener"
             className="inline-flex items-center gap-1 text-xs font-semibold text-accent hover:underline"

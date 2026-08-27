@@ -19,6 +19,7 @@ export class JobsController {
       useAi?: boolean;
       useApify?: boolean;
       aiGuidance?: string;
+      noNote?: boolean;
     },
     @Req() req: Request,
   ) {
@@ -36,6 +37,7 @@ export class JobsController {
         useAi: !!body.useAi,
         useApify: !!body.useApify,
         aiGuidance: body.aiGuidance || '',
+        noNote: !!body.noNote,
       },
     );
   }

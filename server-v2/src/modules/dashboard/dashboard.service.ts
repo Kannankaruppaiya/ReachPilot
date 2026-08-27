@@ -1,10 +1,49 @@
 import { Injectable } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
 import { LinkedinAccountsService } from '@/modules/accounts/linkedin-accounts.service';
+import { PacingService } from '@/modules/engine/pacing.service';
+
+/**
+ * The only job states that still represent OUTSTANDING work.
+ *
+ * 🔴 `failed`, `sent` and `canceled` must never be in here. A failed invite is
+ * finished — counting it as pending tells the operator work is coming that never
+ * will, and every terminal `no_connect_button` would inflate the queue forever.
+ *
+ * `queued` alone is not a queue either: it is the momentary BullMQ handoff, held
+ * for seconds, so a counter built on it reads 0 essentially always — which is
+ * exactly what "Sending today" showed while 71 jobs were due and overdue.
+ */
+export const PENDING_JOB_STATUSES = ['scheduled', 'queued', 'running'] as const;
+
+/**
+ * Split outstanding work into "going out today" and "later".
+ *
+ * 🔴 Being DUE today is not the same as GOING today. The warm-up cap bounds what
+ * can actually leave: 53 jobs were due against a 20/day cap with 19 already sent,
+ * so the honest answer was 1. Reporting 53 promises sends that pacing will refuse
+ * — the mirror image of the 0 this panel used to show unconditionally.
+ *
+ * Nothing is dropped: whatever is not going today is counted as later, so the two
+ * numbers always sum to the outstanding total.
+ */
+export function splitQueue(input: {
+  dueToday: number;
+  outstanding: number;
+  dailyLimit: number | null | undefined;
+  sentToday: number;
+}): { sendingToday: number; scheduledLater: number } {
+  const remaining = Math.max(0, (input.dailyLimit ?? 0) - input.sentToday);
+  const sendingToday = Math.max(0, Math.min(input.dueToday, remaining, input.outstanding));
+  return { sendingToday, scheduledLater: Math.max(0, input.outstanding - sendingToday) };
+}
 
 @Injectable()
 export class DashboardService {
-  constructor(private readonly linkedin: LinkedinAccountsService) {}
+  constructor(
+    private readonly linkedin: LinkedinAccountsService,
+    private readonly pacing: PacingService,
+  ) {}
 
   async getDashboardData(workspaceId: string): Promise<any> {
     const startOfToday = new Date();
@@ -22,8 +61,17 @@ export class DashboardService {
 
       const invitesSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent'));
       const emailsSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'email').where('status', '=', 'sent'));
-      const queuedToday = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('status', '=', 'queued'));
-      const scheduled = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('status', '=', 'scheduled'));
+      // Split OUTSTANDING work by when it is due, not by which internal state it
+      // happens to be parked in. Both sides share PENDING_JOB_STATUSES, so a
+      // failed / sent / canceled job can never appear in either number.
+      const endOfToday = new Date(startOfToday);
+      endOfToday.setDate(endOfToday.getDate() + 1);
+      const pending = (q: any) =>
+        q.where('workspace_id', '=', workspaceId).where('status', 'in', PENDING_JOB_STATUSES as any);
+      const dueToday = await jobCount((q) =>
+        pending(q).where('scheduled_for', '<', endOfToday.toISOString()),
+      );
+      const outstanding = await jobCount((q) => pending(q));
       const sentToday = await jobCount((q) =>
         q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent').where('sent_at', '>=', startOfToday.toISOString()),
       );
@@ -46,7 +94,7 @@ export class DashboardService {
         .limit(20)
         .execute();
 
-      return { invitesSent, emailsSent, queuedToday, scheduled, sentToday, totalLeads, accepted, replies, activity };
+      return { invitesSent, emailsSent, dueToday, outstanding, sentToday, totalLeads, accepted, replies, activity };
     });
 
     const acceptanceRate = counts.invitesSent > 0 ? Math.round((counts.accepted / counts.invitesSent) * 100) : 0;
@@ -55,6 +103,19 @@ export class DashboardService {
     const state = await this.linkedin.getAccountState(workspaceId);
     const detail = await this.linkedin.getForWorkspace(workspaceId);
 
+    // Use the ceiling PACING ENFORCES, not the ramp figure. The daily cap is
+    // jittered +/-15% per account/day (anti-fingerprinting), so a 20/day ramp can
+    // be 19 today — and reading the un-jittered 20 against 19 sent advertised one
+    // more send that pacing had already refused. Same class of error twice over:
+    // the panel must quote the number the sender obeys.
+    // (The cap is the LinkedIn warm-up; email jobs are paced separately.)
+    const { sendingToday: queuedToday, scheduledLater: scheduled } = splitQueue({
+      dueToday: counts.dueToday,
+      outstanding: counts.outstanding,
+      dailyLimit: this.effectiveDailyLimit(state.warmup?.todayLimit, detail),
+      sentToday: counts.sentToday,
+    });
+
     return {
       invitesSent: counts.invitesSent,
       emailsSent: counts.emailsSent,
@@ -62,8 +123,8 @@ export class DashboardService {
       replies: counts.replies,
       meetings: 0, // no meetings source yet — honest zero, not a fake number
       totalLeads: counts.totalLeads,
-      queuedToday: counts.queuedToday,
-      scheduled: counts.scheduled,
+      queuedToday,
+      scheduled,
       sentToday: counts.sentToday,
       account: state.connected
         ? {
@@ -81,6 +142,13 @@ export class DashboardService {
         time: this.formatTimeDiff(new Date(a.created_at)),
       })),
     };
+  }
+
+  /** The jittered ceiling pacing will actually enforce for this account today. */
+  private effectiveDailyLimit(base: number | null | undefined, account: any): number {
+    if (!base || !account?.id) return base ?? 0;
+    const dateIso = new Date().toLocaleDateString('en-US', { timeZone: account.timezone || 'UTC' });
+    return this.pacing.jitterDailyLimit(base, account.id, dateIso);
   }
 
   private formatTimeDiff(d: Date): string {

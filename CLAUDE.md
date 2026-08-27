@@ -49,6 +49,14 @@ GUC via `SET LOCAL`). This bit us repeatedly.
 ## Drivers (swappable via env)
 `src/modules/drivers/` — chosen by `LINKEDIN_DRIVER` / `EMAIL_DRIVER` env (tokens
 in `driver.tokens.ts`, wired in `drivers.module.ts`).
+- 🔴 **PRODUCTION RUNS `LINKEDIN_DRIVER=remote`** — the Oracle VMs never launch a
+  browser. `RemoteAgentDriver` hands each action over Redis to the user's DESKTOP
+  Electron app, which runs the real `PlaywrightLinkedInDriver` on their own IP.
+  `desktop/agent/build.js` esbuild-bundles **this same server source file** into
+  the packaged `app.asar`. So a driver change ships only by rebuilding and
+  reinstalling the desktop app — scp + `pm2 restart` alone changes nothing at
+  runtime, and the gitignored bundle can sit weeks behind the source. See
+  `DEPLOYMENT.md`.
 - **GmailDriver** (`gmail.driver.ts`) — real Gmail API send (OAuth). Rich MIME:
   From display name, Reply-To, Message-ID, List-Unsubscribe, multipart HTML,
   unsubscribe footer (deliverability). `EMAIL_DRIVER=gmail`.
@@ -122,10 +130,42 @@ Verified by `scripts/verify-safety.ts`.
 - **Daily-cap randomization**: the effective daily cap is jittered ±15%
   deterministically per account/day (`seed01`), so the count varies day-to-day
   instead of a robotic constant.
-- **Inter-action spacing**: a per-account Redis `lastaction` stamp enforces a
-  6–14 min randomized minimum gap between actions, spreading the day's quota
-  across working hours instead of bursting. Checked BEFORE the daily counter so
-  a spacing defer doesn't consume a slot.
+- 🔴 **Session model — the executor is the USER'S LAPTOP, not a server.**
+  In `LINKEDIN_DRIVER=remote` nothing sends while the desktop agent is offline, so
+  scheduling must not assume an always-up executor. Two rules follow, and both are
+  load-bearing:
+  - `createBatch` releases a day's WHOLE quota at the working-hours OPEN
+    (`jobs.service.ts`) — it does NOT pin jobs to a slot grid across the window.
+    A grid meant a 9-hour window demanded a 9-hour laptop session (and a 23-hour
+    window demanded 3am sends). Now the user opens the laptop once, the queue
+    drains in ~2h, they close it. Pacing still caps everything at send time.
+  - The SCHEDULER checks `agent:hb:<accountId>` before enqueuing and defers
+    (+5 min, `last_error='agent_unavailable'`) without touching BullMQ. Without
+    that gate an offline laptop drags every backlogged job through
+    BullMQ→worker→pacing→driver every few minutes all night to accomplish nothing.
+    **`last_error` must stay `agent_unavailable`** — `AgentController`'s
+    wake-on-reconnect matches on it to pull the backlog forward when the laptop
+    returns (recovery is ~1 tick, it does NOT wait out the backoff).
+- **Inter-action spacing**: Redis `pacing:linkedin:<acct>:nextallowed` holds the
+  ABSOLUTE instant the next action may run. The gap is re-rolled for EVERY action
+  (`seed01(acct, date, 'gaproll'|'gapmag', seq)`, seq = the day's action counter):
+  90s–7 min normally, ~15% of the time an 8–20 min pause. A gap held constant for
+  a day is its own fingerprint — every action on one metronome, which no human
+  produces. Storing the DEADLINE (not the last-action time) is what lets the roll
+  vary while a re-checked blocked job still gets the same answer. Checked BEFORE
+  the daily counter so a spacing defer doesn't consume a slot; `release()` deletes
+  the key so a send that never happened doesn't spend the cool-down.
+- 🔴 **Slow-network tolerance** (`gotoProfile` in the Playwright driver): profile
+  navigation commits (`waitUntil:'commit'`) then waits on a RENDERED BODY, not on
+  document-complete, with one retry. The old `domcontentloaded`/30s gate failed
+  pages that had already painted (a 1–2 MB profile can't stream in 30s on a slow
+  link) — the tab visibly showed Connect while `page.goto` threw, `finally` closed
+  the context ("tab closes by itself"), and a live lead was recorded failed.
+  A load failure returns the `network_error` outcome → `DEFER_OUTCOMES` → the
+  worker reschedules (+10 min) instead of failing. **`network_error` must never be
+  added to `TERMINAL_FAIL_OUTCOMES`,** and drivers must only emit it from an
+  action's FIRST navigation (proves nothing was clicked ⇒ safe to re-drive).
+  Covered by `test/slow-network-nav.spec.ts`.
 - **Duplicate-invite guard** (scheduler): a `connect_request` to a lead that
   already has a `sent` connect_request is cancelled (`last_error=duplicate_invite`).
 - **Login cooldown** (`linkedin-accounts.service.ts`): `enqueueLogin` skips if a
@@ -165,10 +205,42 @@ Verified by `scripts/verify-safety.ts`.
 `screens/`. A file exporting components exports only components (fast-refresh).
 Type-only imports use `import type` (`verbatimModuleSyntax` is on).
 
+## 🔴 Tests MUST run against local services (never the prod DB)
+`server-v2/.env` points `DATABASE_URL` at the **production** Supabase, and the
+live worker's scheduler tick enumerates **every workspace** in it every 30s.
+A test that inserts jobs there gets them claimed and enqueued by the production
+scheduler mid-test — this was observed for real (prod worker logged "Account not
+sendable" for a test account, and a drain test lost rows to the race).
+- `test/setup-test-env.ts` (wired as jest `setupFiles`) loads `server-v2/.env.test`
+  BEFORE `src/config/env.ts` reads `.env`; dotenv never overwrites an existing
+  `process.env` value, so the local URLs win.
+- `test/local-only.ts` → `assertLocalServices(getEnv())`. Any suite that writes
+  rows or enqueues jobs calls this in `beforeAll` and skips if it throws.
+- Local services:
+  ```
+  docker run -d --name rp-test-redis -p 6379:6379 redis:7-alpine
+  docker run -d --name rp-test-pg -p 55432:5432 -e POSTGRES_USER=reachpilot \
+    -e POSTGRES_PASSWORD=reachpilot -e POSTGRES_DB=reachpilot postgres:15-alpine
+  DATABASE_URL=postgresql://reachpilot:reachpilot@127.0.0.1:55432/reachpilot \
+    npx ts-node -r tsconfig-paths/register scripts/migrate.ts
+  ```
+  (`docker compose up -d redis` currently fails — a decorative `───` line in
+  `.env` breaks compose's env parser. Use `docker run`.)
+- Connect-flow suites: `connect-no-note` (pure), `-pacing` (D), `-scheduler` (E),
+  `connect-batch-drip` (100-profile 20/day drip). Never call `scheduler.tick()`
+  in a test — it drains every workspace; use the private `drainWorkspace(ws)`.
+
 ## Docs
+- 🔴 `DEPLOYMENT.md` — **read before deploying anything.** Real topology (2 Oracle
+  VMs, rsync'd not git, `/opt/ReachPilot/`), the decision table for what a given
+  change requires, and why a LinkedIn driver fix needs a desktop rebuild.
 - `docs/LINKEDIN_AUTOMATION_FLOW.md` — the working connect flow + 7 invariants that must
   not be broken (pacing defer returns not throws, sent-before-ancillary, etc.). Read before
   touching pacing/scheduler/driver.
+- `docs/PROXY_IP_RESEARCH.md` — why we buy no proxies, and what to check if we ever
+  do. Read before anyone proposes routing LinkedIn traffic through our own VMs:
+  both are AS31898 Oracle (indexed hosting), and one geolocates to Texas. Also
+  carries the India provider matrix and the NetNut/FBI seizure.
 - `AGENTS.md` — vendor-neutral agent guide (portable quick-start).
 - `docs/adr/` — architecture decision records (e.g. 0001 Supabase migration).
 - `server-v2/.env.example` — env template (copy to `.env`).

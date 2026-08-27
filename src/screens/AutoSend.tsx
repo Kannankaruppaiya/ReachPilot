@@ -10,6 +10,7 @@ import {
   Rocket,
   Send,
   Sparkles,
+  StickyNote,
   UploadCloud,
   UserPlus,
   X,
@@ -45,11 +46,15 @@ const detect = (headers: string[], patterns: RegExp[]): string => {
   return ""
 }
 
-function fillTemplate(tpl: string, r: Row) {
+function fillTemplate(tpl: string, r?: Row) {
+  // r can be undefined — the preview calls this with buildRows()[0], which is
+  // undefined right after an upload whose columns aren't mapped yet (all rows
+  // filtered out). Guard so the preview shows the fallback text instead of
+  // crashing the whole page (white screen).
   const filled = tpl
-    .replace(/\{\{firstName\}\}/g, r.firstName || "there")
-    .replace(/\{\{company\}\}/g, r.company || "your company")
-    .replace(/\{\{role\}\}/g, r.role || "your role")
+    .replace(/\{\{firstName\}\}/g, r?.firstName || "there")
+    .replace(/\{\{company\}\}/g, r?.company || "your company")
+    .replace(/\{\{role\}\}/g, r?.role || "your role")
   // Preview spintax like the backend does — but pick the FIRST option so the
   // preview is stable while typing (the real send randomizes per recipient).
   let out = filled
@@ -97,6 +102,10 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
   const [useAi, setUseAi] = useState(false)
   const [useApify, setUseApify] = useState(false)
   const [aiGuidance, setAiGuidance] = useState("")
+  // "Include a personalized note" (LinkedIn only). Off ⇒ requests go out with NO
+  // note — the worker sends straight through the note-less connect flow, which
+  // skips LinkedIn's monthly personalized-note limit entirely.
+  const [withNote, setWithNote] = useState(true)
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -177,6 +186,19 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       })
       .filter((r) => r.name && r.target)
 
+  // Key a row against its backend job. The server normalizes every LinkedIn
+  // target with its own `withProtocol` before storing it on the job payload
+  // (`jobs.service.ts` — keep the two in step), so a CSV carrying a bare
+  // "linkedin.com/in/x" comes back as "https://linkedin.com/in/x". Matching on
+  // the raw client value missed EVERY such row, and reconciliation drops rows
+  // with no matching job — the whole table would empty out. Idempotent, so
+  // applying it to both sides is safe.
+  const targetKey = (t: string): string => {
+    const s = String(t || "").trim()
+    if (!s || mode !== "linkedin") return s
+    return /^https?:\/\//i.test(s) ? s : `https://${s.replace(/^\/+/, "")}`
+  }
+
   // Map a backend job status → the row status shown in the queue.
   const jobToRowStatus = (s: string): Row["status"] => {
     if (s === "sent") return "sent"
@@ -218,36 +240,80 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
         rows: list.map((r) => ({ name: r.name, target: r.target, company: r.company, role: r.role })),
         template,
         subject: mode === "email" ? subject : undefined,
-        ...(mode === "linkedin" && useAi
-          ? { useAi: true, useApify, aiGuidance }
-          : {}),
+        ...(mode === "linkedin" && !withNote
+          ? { noNote: true }
+          : mode === "linkedin" && useAi
+            ? { useAi: true, useApify, aiGuidance }
+            : {}),
       })
       batchId = res.batchId
       toast(
-        `Queued ${res.total} ${mode === "linkedin" ? "connection requests" : "emails"} — ${res.today} today` +
-          (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
+        res.total === 0
+          ? `Everyone on that list has already been contacted — nothing queued (${res.skipped} skipped)`
+          : `Queued ${res.total} ${mode === "linkedin" ? "connection requests" : "emails"} — ${res.today} today` +
+              (res.skipped ? ` · ${res.skipped} already contacted, skipped` : "") +
+              (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
       )
+      if (res.total === 0) {
+        // Nothing was queued at all, so there is no batch to poll and nothing
+        // will ever reconcile the speculative rows. Clear them here; the
+        // partial case is reconciled against the first poll below.
+        setRows([])
+        setRunning(false)
+        return
+      }
     } catch (e) {
+      // The request failed, so NOTHING was queued and no polling starts — the
+      // speculative rows would sit on "pending" forever. Same reconciliation
+      // rule as everywhere else: a row with no job behind it is not in the
+      // queue and must not be shown as if it were.
+      setRows([])
       setRunning(false)
       toast(e instanceof Error ? e.message : "Couldn't start the send")
       return
     }
 
     // Poll the backend for real job statuses (worker paces sends with jitter).
+    //
+    // RECONCILIATION — why the first poll rewrites the table rather than just
+    // updating statuses. The backend now drops rows whose profile was already
+    // sent a connection request, so a 106-row upload can queue 18 jobs. The
+    // speculative setRows(list) at the top of start() listed all 106, and
+    // createSend answers with COUNTS only (total/today/skipped) — never which
+    // rows survived — so the counts alone cannot tell us what to remove. The
+    // batch listing is the first and only thing that names the surviving
+    // targets. Until we apply it, the table shows 88 rows that no job will ever
+    // resolve (stuck on "pending" forever) and the header's todayTotal is
+    // client-side `Math.floor(i / cap)` arithmetic over rows the server never
+    // accepted — it would claim ~20 today while 5 were really queued, and
+    // disagree with the toast. So: drop every row with no matching job, and take
+    // `day` from the server instead of recomputing it. The first poll runs
+    // immediately rather than after the 3s interval, to keep that window short.
     let ticks = 0
-    timerRef.current = setInterval(async () => {
+    let reconciled = false
+    const poll = async () => {
       ticks++
       try {
         const jobs = await api.listJobs(batchId)
-        const byTarget = new Map(jobs.map((j) => [j.target, j]))
-        setRows((rs) =>
-          rs.map((r) => {
-            // Keep a locally-canceled row canceled even if a stale poll returns.
-            if (r.status === "canceled") return r
-            const j = byTarget.get(r.target)
-            return j ? { ...r, jobId: j.id, status: jobToRowStatus(j.status) } : r
-          }),
-        )
+        const byTarget = new Map(jobs.map((j) => [targetKey(j.target), j]))
+        // An empty listing is a transient read, not proof the batch vanished —
+        // createSend already told us total > 0. Never reconcile against it.
+        if (jobs.length > 0) {
+          // Read the flag HERE, not inside the updater: React runs the updater
+          // on the next render, by which point `reconciled` is already true —
+          // the drop would never happen.
+          const firstPass = !reconciled
+          reconciled = true
+          setRows((rs) =>
+            rs.flatMap((r) => {
+              // Keep a locally-canceled row canceled even if a stale poll returns.
+              if (r.status === "canceled") return [r]
+              const j = byTarget.get(targetKey(r.target))
+              if (!j) return firstPass ? [] : [r]
+              return [{ ...r, jobId: j.id, day: j.day, status: jobToRowStatus(j.status) }]
+            }),
+          )
+        }
         const todayJobs = jobs.filter((j) => j.day === 0)
         const settled = todayJobs.every((j) => ["sent", "failed", "canceled"].includes(j.status))
         if ((todayJobs.length > 0 && settled) || ticks > 60) {
@@ -261,12 +327,15 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       } catch {
         /* transient — keep polling */
       }
-    }, 3000)
+    }
+    timerRef.current = setInterval(poll, 3000)
+    void poll()
   }
 
   const parsed = rawRows.length > 0
   const valid = parsed && mapping.name && mapping.target
-  const aiMode = mode === "linkedin" && useAi
+  const aiMode = mode === "linkedin" && useAi && withNote
+  const noNoteMode = mode === "linkedin" && !withNote
   const total = valid ? buildRows().length : 0
   const days = total ? Math.ceil(total / cap) : 0
   const sentCount = rows.filter((r) => r.status === "sent").length
@@ -411,6 +480,32 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       <Card className="p-5">
         <h2 className="mb-3 flex items-center gap-2 font-bold">{icon} 2. Message</h2>
 
+        {/* Include-a-note switch — LinkedIn Auto Connect only. Off = note-less send. */}
+        {mode === "linkedin" && (
+          <div className="mb-4 flex flex-col gap-2 rounded-lg border border-line bg-mutedbg/30 p-3">
+            <Toggle
+              on={withNote}
+              onChange={setWithNote}
+              icon={<StickyNote size={15} />}
+              title="Include a personalized note"
+              subtitle="Off → send the connection request with no note. Faster, and it never uses your monthly personalized-note limit."
+            />
+          </div>
+        )}
+
+        {noNoteMode ? (
+          <div className="rounded-md border border-line bg-mutedbg/40 p-3.5 text-sm">
+            <p className="flex items-center gap-1.5 font-semibold">
+              <Send size={14} className="text-accent" /> No note — connection request only
+            </p>
+            <p className="mt-1.5 text-sub">
+              Every request goes out straight through the “Send without a note” flow. This skips
+              LinkedIn's personalized-note check entirely, so free accounts keep sending all the way up
+              to the weekly invite cap. Turn the switch on above to write a note (template or AI).
+            </p>
+          </div>
+        ) : (
+          <>
         {/* Personalization toggles — LinkedIn Auto Connect only */}
         {mode === "linkedin" && (
           <div className="mb-4 flex flex-col gap-2 rounded-lg border border-line bg-mutedbg/30 p-3">
@@ -508,6 +603,8 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
                 <p className="whitespace-pre-line">{fillTemplate(template, buildRows()[0])}</p>
               </div>
             )}
+          </>
+        )}
           </>
         )}
       </Card>

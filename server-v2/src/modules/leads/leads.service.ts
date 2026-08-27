@@ -111,7 +111,13 @@ export class LeadsService {
       for (const row of rows) {
         const name = String(row.name || '').trim();
         if (!name) continue;
-        const target = String(row.target || row.linkedinUrl || '').trim();
+        const rawTarget = String(row.target || row.linkedinUrl || '').trim();
+        // Add a protocol if a bare linkedin.com URL slipped in, so a lead never
+        // stores/serves a relative URL (→ app-domain 404 on "Open").
+        const target =
+          rawTarget && !/^https?:\/\//i.test(rawTarget) && rawTarget.includes('linkedin.com')
+            ? `https://${rawTarget.replace(/^\/+/, '')}`
+            : rawTarget;
         const email = String(row.email || '').trim().toLowerCase();
         const isEmail = /@/.test(email);
         const slug = target.includes('linkedin.com') ? this.slugOf(target) : null;

@@ -1,0 +1,18 @@
+# Vercel builds the FRONTEND only (npm run build → vite → dist/, served per
+# vercel.json). Everything below is backend / desktop / docs — not needed for
+# the frontend build, and huge (the desktop .exe alone is ~100MB). Excluding it
+# keeps deploy uploads small and fast. Vercel already excludes node_modules and
+# .git by default; Vercel does NOT read .gitignore, so these must be listed here.
+server-v2
+desktop
+.specs
+docs
+scripts
+
+# Local build output — Vercel rebuilds this remotely.
+dist
+
+# Stray heavy / local-only artifacts.
+*.exe
+*.rdb
+*.log
