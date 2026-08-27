@@ -3,12 +3,15 @@
 function Injectable() {
   return function () {}; // no-op class decorator
 }
+// Nest's Logger takes (payload, message) — forward BOTH. Keeping only the first
+// arg dropped the message half of every `logger.log({ data }, 'what happened')`
+// in the driver, which is the half that says which branch ran.
 class Logger {
   constructor(context) { this.context = context || ''; }
-  log(m) { console.log(`[${this.context}]`, m); }
-  warn(m) { console.warn(`[${this.context}]`, m); }
-  error(m) { console.error(`[${this.context}]`, m); }
-  debug(m) { console.debug(`[${this.context}]`, m); }
-  verbose(m) { console.log(`[${this.context}]`, m); }
+  log(...a) { console.log(`[${this.context}]`, ...a); }
+  warn(...a) { console.warn(`[${this.context}]`, ...a); }
+  error(...a) { console.error(`[${this.context}]`, ...a); }
+  debug(...a) { console.debug(`[${this.context}]`, ...a); }
+  verbose(...a) { console.log(`[${this.context}]`, ...a); }
 }
 module.exports = { Injectable, Logger };

@@ -16,6 +16,30 @@
 
 const { app, BrowserWindow, Menu, shell } = require('electron');
 const path = require('path');
+const fs = require('fs');
+
+// Persist the agent console to a file. The driver already logs exactly what it
+// saw on a failing profile (which Connect controls, which branch it took) — in a
+// packaged app that went to a stdout nobody can read, so every field failure was
+// undiagnosable. Truncate at 5 MB rather than rotate; this is a debug tail, not
+// an audit trail.
+const AGENT_LOG = path.join(app.getPath('userData'), 'agent.log');
+try {
+  if (fs.statSync(AGENT_LOG).size > 5 * 1024 * 1024) fs.truncateSync(AGENT_LOG, 0);
+} catch {}
+for (const level of ['log', 'warn', 'error', 'debug']) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => {
+    orig(...a);
+    try {
+      const line = a
+        .map((x) => (typeof x === 'string' ? x : JSON.stringify(x, (_k, v) => (v instanceof Error ? String(v) : v))))
+        .join(' ');
+      fs.appendFileSync(AGENT_LOG, `${new Date().toISOString()} ${line}
+`);
+    } catch {}
+  };
+}
 
 const DASHBOARD_URL = 'https://reachpilot-eight.vercel.app';
 const API_BASE = 'https://api.reachpilot.dpdns.org';
