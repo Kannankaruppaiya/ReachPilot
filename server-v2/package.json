@@ -24,7 +24,8 @@
     "codegen": "kysely-codegen --out-file src/db/types.ts --dialect postgres",
     "test": "jest --runInBand --forceExit",
     "test:cov": "jest --runInBand --forceExit --coverage",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "export:finance": "ts-node -r tsconfig-paths/register scripts/export-finance-tn.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

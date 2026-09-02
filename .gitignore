@@ -33,3 +33,8 @@ dump.rdb
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Scrape/export OUTPUT — real people's names, employers and profile URLs.
+# The tooling that generates it is committed; the data it produces is not.
+# Git history is permanent, so PII that lands here cannot be taken back.
+server-v2/exports/
