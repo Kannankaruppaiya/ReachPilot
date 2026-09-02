@@ -23,7 +23,8 @@ export type LinkedInOutcome =
   | 'checkpoint' // CAPTCHA / security challenge — STOP, pause account
   | 'profile_gone' // 404 / deactivated — mark lead dead
   | 'blocked' // we've been blocked by the target — skip
-  | 'network_error'; // the page never loaded — nothing was clicked, defer and re-drive
+  | 'network_error' // the page never loaded — nothing was clicked, defer and re-drive
+  | 'session_expired'; // LinkedIn signed this account out — halt the account, keep the leads
 
 export interface ProxyConfig {
   /** host:port or http://host:port — the egress the browser routes through. */
@@ -130,7 +131,22 @@ export interface LinkedInSyncResult {
 /** Outcomes that mean "advance the sequence, don't count as a failure or a send". */
 export const SKIP_OUTCOMES: LinkedInOutcome[] = ['already_connected', 'pending'];
 /** Outcomes that must pause the whole account, not just fail the one job. */
-export const ACCOUNT_HALT_OUTCOMES: LinkedInOutcome[] = ['checkpoint', 'limit_reached'];
+/**
+ * Outcomes that must pause the whole account, not just fail the one job.
+ *
+ * 🔴 `session_expired` belongs here and NOT in TERMINAL_FAIL_OUTCOMES. A signed-out
+ * account fails EVERY job it is handed, so classifying it per-lead burns the whole
+ * queue over one dead cookie. Observed live on narmatha@rjpinfotek.ooo: the vault
+ * held a legacy bare `li_at` (no JSESSIONID/bcookie/liap), LinkedIn had already
+ * invalidated it, and 15 consecutive invites died as `ERR_TOO_MANY_REDIRECTS` —
+ * a raw Playwright string in `last_error`, no notification, and the account stuck
+ * at status='connecting' with nothing telling the user to reconnect.
+ */
+export const ACCOUNT_HALT_OUTCOMES: LinkedInOutcome[] = [
+  'checkpoint',
+  'limit_reached',
+  'session_expired',
+];
 /** Terminal per-lead failures — mark failed but do NOT retry.
  *  `network_error` is deliberately NOT here: it means we never got a usable page,
  *  so nothing was clicked and nothing was sent. Treating a bad connection as a
@@ -144,6 +160,102 @@ export const TERMINAL_FAIL_OUTCOMES: LinkedInOutcome[] = [
 /** Outcomes that mean "the executor couldn't run, not that the lead is bad" —
  *  reschedule with a backoff; never fail the job, never burn a BullMQ attempt. */
 export const DEFER_OUTCOMES: LinkedInOutcome[] = ['network_error'];
+
+/**
+ * Does this evidence say LinkedIn has signed the account out?
+ *
+ * Takes a landed URL and/or an error string, because the same fact arrives in
+ * two shapes and BOTH must be caught:
+ *
+ *   1. `ERR_TOO_MANY_REDIRECTS`. A stale `li_at` with no JSESSIONID/bcookie/liap
+ *      makes LinkedIn bounce /in/<slug> -> /authwall -> /login -> back, until
+ *      Chrome gives up at 20 hops. `page.goto` THROWS, so no landed URL exists.
+ *   2. A clean load that simply landed on /login or /authwall.
+ *
+ * Deliberately NOT matched: /checkpoint/, /challenge/, captcha. Those mean
+ * LinkedIn wants the human to verify a session it still considers real — a
+ * different remedy, so they stay with the `checkpoint` outcome.
+ *
+ * 🔴 This lives HERE, not in the Playwright driver, for a deployment reason that
+ * is the whole point of the fix. The driver is esbuild-bundled into each user's
+ * desktop app, so a change there reaches customers only when they download and
+ * reinstall a new build — which is not a thing we can ask users to do per bug.
+ * The desktop agent ALREADY reports the raw `page.goto: net::ERR_TOO_MANY_
+ * REDIRECTS ...` string back over the wire, so the SERVER can classify it from
+ * what every existing app version already sends. Keeping the predicate in this
+ * playwright-free module lets the worker import it (importing the driver would
+ * drag Playwright into the API/worker process and crash it on boot — observed).
+ * Result: the fix ships with an ordinary server restart, and the driver-side
+ * copy below is an optimisation for future builds, not a prerequisite.
+ */
+export function isSignedOutNav(landedUrl: string, thrownError: string): boolean {
+  if (/ERR_TOO_MANY_REDIRECTS/i.test(thrownError)) return true;
+  return /linkedin\.com\/(?:authwall|login|uas\/login|signup)/i.test(landedUrl);
+}
+
+/**
+ * Is this failure safe to put back in the queue?
+ *
+ * "Safe" has exactly one meaning here: the evidence PROVES no invite left the
+ * account. Re-driving a job that already sent one would fire a second invite at
+ * a real person and spend a second pacing slot, so the test is an ALLOWLIST of
+ * failures that happened at or before navigation — never a denylist, because a
+ * denylist silently admits every new driver error code someone adds later.
+ *
+ * Admitted:
+ *   - the signed-out redirect loop / sign-in wall (the account was logged out)
+ *   - any `page.goto` failure (the profile never loaded, so nothing was clicked)
+ *   - the outcome codes that mean the executor never ran
+ *
+ * Refused, and deliberately so:
+ *   - `no_connect_button`, `profile_gone`, `blocked`, `email_required` — these
+ *     are real readings OF THE LEAD. Re-driving them just fails again.
+ *   - `invite_dialog_never_opened`, `send_button_not_found`, `locator.click`
+ *     timeouts, `invite_not_confirmed` — the flow was already inside the invite
+ *     composer. Whether an invite went out is AMBIGUOUS, and the safe reading of
+ *     an ambiguous send is "it sent".
+ */
+export function isRequeueableFailure(lastError?: string | null): boolean {
+  const err = (lastError || '').trim();
+  if (!err) return false;
+  if (isSignedOutNav('', err)) return true;
+  // A navigation that never completed proves the page was never interacted with.
+  if (/(?:^|\s)page\.goto:/.test(err)) return true;
+  return ['session_expired', 'network_error', 'agent_unavailable'].includes(err);
+}
+
+/**
+ * Human text for the codes a driver returns in `error` (or the bare outcome when
+ * it has none). `last_error` keeps the machine code — the dashboard and the
+ * scheduler match on it — but the NOTIFICATION the user reads must be a sentence.
+ * A raw enum reaching the UI ("skipped: email required", "skipped: no connect
+ * button") tells the user nothing about what LinkedIn actually refused, or what
+ * to do about it. Unmapped codes fall back to the de-underscored code so a new
+ * driver signal degrades to today's behaviour instead of throwing.
+ */
+const FAILURE_TEXT: Record<string, string> = {
+  // Verified live: the invite composer replaces the note field with
+  // <input type="email" name="email"> when the member restricts invites to
+  // people who know their email address. Nothing was sent.
+  email_required:
+    "LinkedIn will only let you invite this person if you know their email address (their privacy setting), so the invite was not sent — connect manually or reach them another way",
+  follow_only_profile: 'this profile offers only Follow — LinkedIn gives no way to invite it',
+  connect_target_mismatch: "LinkedIn's Connect control pointed at a different person, so nothing was sent",
+  invite_dialog_never_opened: 'the LinkedIn invite window never opened',
+  send_button_not_found: 'the invite window opened but showed no Send button',
+  no_connect_button: 'LinkedIn shows no Connect option on this profile',
+  profile_gone: 'this LinkedIn profile no longer exists',
+  blocked: 'this member blocks contact from your account',
+  note_cap: "your LinkedIn account's personalized-note quota is used up for this month",
+  session_expired:
+    'LinkedIn signed this account out, so nothing could be sent — reconnect the account in Settings and the queued outreach will resume on its own',
+};
+
+/** Turn a driver error code / outcome into the sentence shown to the user. */
+export function failureText(code?: string | null): string {
+  if (!code) return 'unknown error';
+  return FAILURE_TEXT[code] ?? code.replace(/_/g, ' ');
+}
 
 export interface LinkedInDriver {
   /** Perform a connection request; optionally with a personalized note. */

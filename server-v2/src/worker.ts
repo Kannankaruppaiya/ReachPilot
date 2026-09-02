@@ -16,6 +16,8 @@ import {
   ACCOUNT_HALT_OUTCOMES,
   TERMINAL_FAIL_OUTCOMES,
   DEFER_OUTCOMES,
+  failureText,
+  isSignedOutNav,
 } from '@/modules/drivers/linkedin-driver.interface';
 import { serializeSession } from '@/modules/drivers/linkedin-session-store';
 import { EmailDriver } from '@/modules/drivers/email-driver.interface';
@@ -212,7 +214,14 @@ async function bootstrap() {
     if (accountId) {
       await db
         .updateTable('linkedin_accounts')
-        .set({ status: outcome === 'checkpoint' ? 'checkpoint' : 'paused' })
+        .set({
+          status:
+            outcome === 'checkpoint'
+              ? 'checkpoint'
+              : outcome === 'session_expired'
+                ? 'disconnected'
+                : 'paused',
+        })
         .where('id', '=', accountId)
         .execute();
     }
@@ -220,11 +229,18 @@ async function bootstrap() {
       .insertInto('notifications')
       .values({
         workspace_id: workspaceId,
-        kind: outcome === 'checkpoint' ? 'account_checkpoint' : 'account_paused',
+        kind:
+          outcome === 'checkpoint'
+            ? 'account_checkpoint'
+            : outcome === 'session_expired'
+              ? 'account_disconnected'
+              : 'account_paused',
         text:
           outcome === 'checkpoint'
             ? 'LinkedIn security checkpoint detected — automation paused. Please verify your account.'
-            : 'LinkedIn sending limit reached — account paused until it resets.',
+            : outcome === 'session_expired'
+              ? 'LinkedIn signed this account out, so nothing is being sent. Reconnect it and the queued outreach resumes on its own — no leads were lost.'
+              : 'LinkedIn sending limit reached — account paused until it resets.',
       })
       .execute();
   };
@@ -239,6 +255,11 @@ async function bootstrap() {
   // to stay bad for a while, and unlike an offline agent there is no heartbeat to
   // tell us it recovered — so back off further rather than re-driving into it.
   const NETWORK_BACKOFF_MS = 10 * 60 * 1000;
+  // A signed-out account recovers only when a HUMAN reconnects it, so re-driving
+  // sooner just re-reads a cookie we already know is dead. The account is halted
+  // ('disconnected') the moment this fires, and the scheduler's account-health
+  // gate holds the queue anyway — this backoff is only the belt to that braces.
+  const SESSION_EXPIRED_BACKOFF_MS = 60 * 60 * 1000;
 
   const linkedinWorker = new Worker(
     'linkedin-actions',
@@ -362,6 +383,28 @@ async function bootstrap() {
 
       /* ----- classify the outcome (each block commits before any throw) ----- */
 
+      // 🔴 Re-classify a signed-out account BEFORE anything else looks at the
+      // outcome. A desktop agent that predates the driver-side detection reports
+      // the redirect loop as a generic `failed` carrying the raw Playwright text
+      // ("page.goto: net::ERR_TOO_MANY_REDIRECTS at …"), which fell through to
+      // the generic-failure branch: the LEAD was marked failed and the account
+      // was left untouched, so the next job repeated it. Observed on
+      // narmatha@rjpinfotek.ooo — 17 live prospects burned in one afternoon over
+      // a single dead cookie, with 75 more queued behind them.
+      //
+      // Doing it HERE rather than only in the driver is the whole delivery
+      // story: the driver ships inside each user's desktop app and only reaches
+      // them via a reinstall, which is not something users can be asked to do
+      // per bug fix. Every existing app version already sends this string, so
+      // classifying it server-side makes the fix live on an ordinary restart.
+      if (res.status === 'failed' && isSignedOutNav('', res.error || '')) {
+        logger.warn(
+          { jobId, accountId, error: res.error },
+          'Agent reported a signed-out redirect loop — re-classifying as session_expired',
+        );
+        res = { ...res, status: 'session_expired' };
+      }
+
       // Success — commit "sent" first, then best-effort bookkeeping.
       if (res.status === 'sent') {
         // Record the slug LinkedIn served so a later upload recognises this
@@ -419,13 +462,27 @@ async function bootstrap() {
 
       // Account-level halt — checkpoint or limit. Pause the whole account.
       if (ACCOUNT_HALT_OUTCOMES.includes(res.status)) {
+        // A signed-out account clicked nothing, so the slot it registered was
+        // never spent — hand it back, or reconnecting mid-day would find the
+        // quota already eaten by sends that never happened. (`limit_reached`
+        // keeps its slot on purpose: LinkedIn itself said stop.)
+        if (res.status === 'session_expired') {
+          await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        }
         await withWorkspace(workspaceId, async (db) => {
           await haltAccount(db, workspaceId, accountId, res.status, payload.name);
-          if (res.status === 'limit_reached') {
-            const tomorrow = new Date(Date.now() + 86400000).toISOString();
-            await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: tomorrow, last_error: 'limit_reached' }).where('id', '=', jobId).execute();
+          // Neither of these sent anything, so the LEAD is untouched — hold the
+          // job and let the scheduler re-drive it once the account is healthy.
+          // (`session_expired` used to fall into the `else` below and be marked
+          // failed as a 'checkpoint', which burned a live prospect per tick for
+          // as long as the cookie stayed dead.)
+          if (res.status === 'limit_reached' || res.status === 'session_expired') {
+            const retryAt = new Date(
+              Date.now() + (res.status === 'limit_reached' ? 86400000 : SESSION_EXPIRED_BACKOFF_MS),
+            ).toISOString();
+            await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.status }).where('id', '=', jobId).execute();
             if (jobRow.enrollment_id) {
-              await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: tomorrow }).where('id', '=', jobRow.enrollment_id).execute();
+              await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
             }
           } else {
             await db.updateTable('jobs').set({ status: 'failed', last_error: 'checkpoint' }).where('id', '=', jobId).execute();
@@ -538,7 +595,7 @@ async function bootstrap() {
           if (jobRow.enrollment_id) {
             await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
           }
-          await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} skipped: ${reason.replace(/_/g, ' ')}` }).execute();
+          await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} skipped: ${failureText(reason)}` }).execute();
         });
         return;
       }
@@ -551,7 +608,7 @@ async function bootstrap() {
         if (jobRow.enrollment_id) {
           await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
         }
-        await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} failed: ${res.error || 'unknown error'}` }).execute();
+        await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} failed: ${failureText(res.error)}` }).execute();
       });
       throw new Error(res.error || 'LinkedIn driver failed');
     },

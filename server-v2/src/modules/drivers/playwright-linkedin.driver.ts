@@ -16,6 +16,7 @@ import {
   LinkedInSyncResult,
   ProxyConfig,
   LinkedInFingerprint,
+  isSignedOutNav,
 } from './linkedin-driver.interface';
 import { CONNECT_NAME, SELECTORS, resolveFirst, type SelectorScope } from './linkedin-selectors';
 import {
@@ -116,6 +117,7 @@ export interface NavResponse {
  */
 export interface NavigablePage {
   goto(url: string, opts: { waitUntil: 'commit'; timeout: number }): Promise<NavResponse | null>;
+  url(): string;
   waitForLoadState(state: 'domcontentloaded', opts: { timeout: number }): Promise<void>;
   locator(selector: string): {
     first(): { waitFor(opts: { state: 'attached'; timeout: number }): Promise<void> };
@@ -243,7 +245,7 @@ export async function gotoProfile(
   page: NavigablePage,
   url: string,
   onRetry?: (reason: string) => void,
-): Promise<{ resp: NavResponse | null; error?: string }> {
+): Promise<{ resp: NavResponse | null; error?: string; signedOut?: boolean }> {
   let lastErr = '';
   for (let attempt = 0; attempt < NAV_ATTEMPTS; attempt++) {
     if (attempt) {
@@ -255,6 +257,10 @@ export async function gotoProfile(
       resp = await page.goto(url, { waitUntil: 'commit', timeout: NAV_COMMIT_TIMEOUT_MS });
     } catch (err: any) {
       lastErr = String(err?.message || err).split('\n')[0].trim();
+      // A dead session fails identically on every retry, and each retry is more
+      // unauthenticated traffic at LinkedIn from an account already in trouble.
+      // Report it and stop.
+      if (isSignedOutNav('', lastErr)) return { resp: null, error: lastErr, signedOut: true };
       continue;
     }
     // A 404 is a real answer, not a slow page. Hand it straight back so the
@@ -269,7 +275,12 @@ export async function gotoProfile(
       .waitFor({ state: 'attached', timeout: NAV_READY_TIMEOUT_MS })
       .then(() => true)
       .catch(() => false);
-    if (rendered) return { resp };
+    if (rendered) {
+      if (isSignedOutNav(page.url(), '')) {
+        return { resp, error: `signed_out: landed on ${page.url()}`, signedOut: true };
+      }
+      return { resp };
+    }
     lastErr = 'body never rendered';
   }
   return { resp: null, error: lastErr || 'navigation_failed' };
@@ -631,12 +642,29 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
     return hit > 0;
   }
 
-  /** Lead imports often carry bare "linkedin.com/in/…" URLs (no scheme) —
-   *  page.goto rejects those as invalid, so normalize before navigating. */
+  /**
+   * Put an imported profile URL into the ONE form LinkedIn serves directly.
+   *
+   * Scraped lead lists carry every variant: bare "linkedin.com/in/…" (no scheme,
+   * which page.goto rejects outright), plain `http://`, and country hosts like
+   * `in.linkedin.com`. LinkedIn resolves all of them, but each costs a redirect
+   * hop before the profile is even reached — measured live in a signed-in
+   * browser: http:// → https:// is one hop, in.linkedin.com → www is another.
+   *
+   * Those hops are not why a dead session redirect-loops (a pristine
+   * `https://www.linkedin.com/in/<slug>/` loops just as hard — verified), so this
+   * is headroom, not the fix. It is still worth having: fewer hops means less
+   * distance to the 20-redirect cap and one less way for a marginal session to
+   * tip over.
+   */
   private normalizeProfileUrl(url: string): string {
-    const u = (url || '').trim();
-    if (!u || /^https?:\/\//i.test(u)) return u;
-    return 'https://' + u.replace(/^\/+/, '');
+    let u = (url || '').trim();
+    if (!u) return u;
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
+    u = u.replace(/^http:\/\//i, 'https://');
+    // Country/locale hosts (in., uk., www.linkedin.cn …) all redirect to www.
+    u = u.replace(/^https:\/\/(?:[a-z]{2,3}\.)?linkedin\.com/i, 'https://www.linkedin.com');
+    return u;
   }
 
   /* ---- actions ---- */
@@ -668,6 +696,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
           { targetUrl, error: nav.error },
           'Profile never loaded — deferring as a network failure (nothing was sent)',
         );
+        if (nav.signedOut) return { status: 'session_expired', error: nav.error };
         return { status: 'network_error', error: `nav_failed: ${nav.error}` };
       }
       const resp = nav.resp;
@@ -1380,6 +1409,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       );
       // Failing HERE is before anything is typed or clicked, so the message
       // provably did not go out and re-driving it cannot double-send.
+      if (nav.signedOut) return { status: 'session_expired', error: nav.error };
       if (nav.error) return { status: 'network_error', error: `nav_failed: ${nav.error}` };
       const resp = nav.resp;
       await think();
@@ -1433,6 +1463,9 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       this.logger.warn({ targetUrl, reason }, 'Profile navigation failed — retrying once'),
     );
     if (nav.error) {
+      if (nav.signedOut) {
+        return { ok: false, context, result: { status: 'session_expired', error: nav.error } };
+      }
       return { ok: false, context, result: { status: 'network_error', error: `nav_failed: ${nav.error}` } };
     }
     const resp = nav.resp;
