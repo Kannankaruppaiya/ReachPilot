@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
+import { whereRealSend } from '@/modules/jobs/real-sends';
 
 /** One node from the campaign builder (a linear sequence, waits + one branch). */
 type BuilderNode = {
@@ -232,8 +233,8 @@ export class CampaignsService {
         eb.fn('to_char', [eb.ref('sent_at'), eb.val('YYYY-MM-DD')]).as('day'),
       ])
       .where('workspace_id', '=', workspaceId)
-      .where('campaign_id', 'is not', null)
-      .where('status', '=', 'sent')
+      .where('campaign_id', 'is not', null);
+    q = whereRealSend(q)
       .where('sent_at', '>=', since.toISOString() as any)
       .groupBy(['campaign_id', 'day']);
     if (campaignId) q = q.where('campaign_id', '=', campaignId);

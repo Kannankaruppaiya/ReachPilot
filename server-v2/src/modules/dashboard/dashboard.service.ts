@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
 import { LinkedinAccountsService } from '@/modules/accounts/linkedin-accounts.service';
 import { PacingService } from '@/modules/engine/pacing.service';
+import { whereRealSend } from '@/modules/jobs/real-sends';
 
 /**
  * The only job states that still represent OUTSTANDING work.
@@ -59,7 +60,10 @@ export class DashboardService {
         return Number(r?.cnt || 0);
       };
 
-      const invitesSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent'));
+      // whereRealSend, not status='sent': a skipped lead (already connected /
+      // invite already pending) is parked in `sent` without an invite leaving the
+      // account, and counting it read 22 against a 20/day cap.
+      const invitesSent = await jobCount((q) => whereRealSend(q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin')));
       const emailsSent = await jobCount((q) => q.where('workspace_id', '=', workspaceId).where('kind', '=', 'email').where('status', '=', 'sent'));
       // Split OUTSTANDING work by when it is due, not by which internal state it
       // happens to be parked in. Both sides share PENDING_JOB_STATUSES, so a
@@ -73,7 +77,7 @@ export class DashboardService {
       );
       const outstanding = await jobCount((q) => pending(q));
       const sentToday = await jobCount((q) =>
-        q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin').where('status', '=', 'sent').where('sent_at', '>=', startOfToday.toISOString()),
+        whereRealSend(q.where('workspace_id', '=', workspaceId).where('kind', '=', 'linkedin')).where('sent_at', '>=', startOfToday.toISOString()),
       );
 
       const leadCount = async (build: (q: any) => any): Promise<number> => {
