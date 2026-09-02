@@ -195,6 +195,11 @@ export const api = {
   // Bulk-delete jobs — clear the queue (statuses) or wipe LinkedIn history for a fresh test.
   clearJobs: (statuses?: string[], kind?: string) =>
     req<{ deleted: number }>("/api/send/jobs/clear", { statuses, kind }),
+  // Put back leads burned by a failure that was never their fault (signed-out
+  // account, page never loaded). The server allowlists which failures qualify,
+  // so this can never re-send an invite that already went out.
+  requeueFailed: (kind = "linkedin") =>
+    req<{ requeued: number; skipped: number }>("/api/send/jobs/requeue-failed", { kind }),
   // Every LinkedIn connection request sent, with delivery + acceptance outcome.
   getConnections: () => req<ConnectionsData>("/api/send/connections"),
 

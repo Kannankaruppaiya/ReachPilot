@@ -8,6 +8,7 @@ import {
   Loader2,
   MessageSquare,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   Trash2,
@@ -143,6 +144,30 @@ export function Connections() {
     }
   }
 
+  // Put back leads a failure burned that was never their fault — an account that
+  // had been signed out, or a profile that never loaded. The SERVER decides which
+  // failures qualify (an allowlist of failures that provably sent nothing), so a
+  // lead whose invite may already have gone out is left alone and reported as
+  // skipped rather than being invited twice.
+  const [requeueing, setRequeueing] = useState(false)
+  const requeueFailed = async () => {
+    if (!window.confirm("Put the recoverable failed leads back in the queue?")) return
+    setRequeueing(true)
+    try {
+      const r = await api.requeueFailed()
+      toast(
+        r.requeued === 0
+          ? "Nothing to retry — those failures need a fresh upload."
+          : `Requeued ${r.requeued}${r.skipped ? ` · ${r.skipped} left alone` : ""}`,
+      )
+      load(true)
+    } catch {
+      toast("Couldn't requeue those leads.")
+    } finally {
+      setRequeueing(false)
+    }
+  }
+
   // Wipe ALL LinkedIn connection jobs — a clean slate to test the flow fresh.
   const clearAll = async () => {
     if (!window.confirm("Delete ALL connection history for a fresh test? This can't be undone.")) return
@@ -200,6 +225,11 @@ export function Connections() {
           <Button variant="outline" onClick={() => load(true)} disabled={refreshing}>
             <RefreshCw size={15} className={cx(refreshing && "animate-spin")} /> Refresh
           </Button>
+          {(s?.failed ?? 0) > 0 && (
+            <Button variant="outline" onClick={requeueFailed} disabled={requeueing}>
+              <RotateCcw size={15} className={cx(requeueing && "animate-spin")} /> Retry failed
+            </Button>
+          )}
           {(s?.inQueue ?? 0) > 0 && (
             <Button variant="outline" onClick={clearQueue}>
               <XCircle size={15} /> Clear queue

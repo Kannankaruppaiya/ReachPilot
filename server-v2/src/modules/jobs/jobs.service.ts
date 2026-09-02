@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
+import { sql } from 'kysely';
 import { withWorkspace } from '@/db/rls';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
@@ -6,6 +7,7 @@ import { getEnv } from '@/config/env';
 import { computeWarmup, warmupOrigin } from '@/modules/engine/warmup';
 import { profileKey, profileKeyFromSlug, selectNewRows } from './profile-key';
 import { spin } from '@/modules/engine/spintax';
+import { isRequeueableFailure } from '@/modules/drivers/linkedin-driver.interface';
 
 let redisClient: Redis | null = null;
 let linkedinQueue: Queue | null = null;
@@ -203,6 +205,61 @@ export class JobsService {
       await getQueue('email-send').remove(id).catch(() => undefined);
     }
     return { deleted: ids.length };
+  }
+
+  /**
+   * Put back the leads a failure BURNED that was never their fault.
+   *
+   * A terminal `failed` row is normally the right answer — the profile has no
+   * Connect button, the member is gone, LinkedIn blocked us. But some failures
+   * say nothing about the lead at all: when the account was signed out, every
+   * job it touched died with a redirect loop while the prospect stayed perfectly
+   * contactable. Measured live on one account: 17 live prospects marked failed in
+   * a single afternoon over one dead cookie.
+   *
+   * Those rows are recoverable, and without this the only way back was a DB
+   * script. `isRequeueableFailure` decides — an allowlist of failures that
+   * provably happened at or before navigation, so this can never re-send an
+   * invite that already went out.
+   *
+   * Spread over the next hour rather than dumped at once: pacing still caps them
+   * at send time, this only avoids handing the scheduler a thundering herd.
+   */
+  async requeueFailed(
+    workspaceId: string,
+    kind = 'linkedin',
+  ): Promise<{ requeued: number; skipped: number }> {
+    const failed = await withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('jobs')
+        .select(['id', 'last_error'])
+        .where('workspace_id', '=', workspaceId)
+        .where('kind', '=', kind as any)
+        .where('status', '=', 'failed' as any)
+        .execute(),
+    );
+
+    const ids = failed
+      .filter((j) => isRequeueableFailure(j.last_error as string | null))
+      .map((j) => j.id);
+    if (ids.length === 0) return { requeued: 0, skipped: failed.length };
+
+    await withWorkspace(workspaceId, (db) =>
+      db
+        .updateTable('jobs')
+        .set({
+          status: 'scheduled' as any,
+          attempts: 0,
+          last_error: 'requeued_by_user',
+          // Random spread across the next hour — the scheduler drains it from there.
+          scheduled_for: sql<string>`now() + (random() * interval '60 minutes')` as any,
+        })
+        .where('workspace_id', '=', workspaceId)
+        .where('id', 'in', ids)
+        .execute(),
+    );
+
+    return { requeued: ids.length, skipped: failed.length - ids.length };
   }
 
   async createBatch(

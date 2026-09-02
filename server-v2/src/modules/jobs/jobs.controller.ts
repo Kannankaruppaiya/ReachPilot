@@ -84,6 +84,18 @@ export class JobsController {
     return this.jobs.deleteJobs(workspaceId, { statuses: body?.statuses, kind: body?.kind });
   }
 
+  /**
+   * Put back the leads a not-their-fault failure burned (the "Retry failed"
+   * button). Only failures that provably never sent an invite are moved —
+   * `isRequeueableFailure` is the allowlist — so this can never double-send.
+   */
+  @Post('jobs/requeue-failed')
+  async requeueFailed(@Body() body: { kind?: string }, @Req() req: Request) {
+    const user = (req as any).user as JwtPayload;
+    const workspaceId = (req as any).workspaceId || user.workspaceId;
+    return this.jobs.requeueFailed(workspaceId, body?.kind || 'linkedin');
+  }
+
   /** Delete one job (the queue "delete" button). */
   @Delete('jobs/:id')
   async deleteJob(@Param('id') id: string, @Req() req: Request) {
