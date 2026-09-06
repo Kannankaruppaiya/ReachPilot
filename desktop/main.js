@@ -308,7 +308,16 @@ async function getPublicIp() {
 }
 
 async function pollOnce(token) {
-  const h = { Authorization: `Bearer ${token}` };
+  // Tell the server which build is polling.
+  //
+  // 🔴 The point is what it says when it is ABSENT. Builds before 0.1.1 have no
+  // auto-updater and can never be changed, so they will never send this header —
+  // which makes its absence the one reliable signal that an install is stuck on a
+  // pre-update build and needs a one-time manual reinstall. Without it every
+  // agent looks identical and "which of my users still has the bug?" is
+  // unanswerable. Do not make this conditional or optional on newer builds; the
+  // whole mechanism rests on new = present, old = missing.
+  const h = { Authorization: `Bearer ${token}`, 'X-Agent-Version': app.getVersion() };
   let res;
   try {
     res = await fetch(`${API_BASE}/api/agent/next-job`, { headers: h });

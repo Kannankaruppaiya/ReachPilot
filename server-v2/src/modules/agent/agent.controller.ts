@@ -67,8 +67,15 @@ export class AgentController {
     const accounts = await withWorkspace(ws, (db) =>
       db.selectFrom('linkedin_accounts').select('id').where('workspace_id', '=', ws).execute(),
     );
+    // Which desktop build is this? Sent only by 0.1.1+ (the first build that can
+    // update itself); anything older cannot be changed to send it, so an absent
+    // header identifies an install that needs one manual reinstall.
+    const agentVersion = String((req.headers as any)['x-agent-version'] || '').slice(0, 32);
+
     // TEMP DIAG: which workspace/accounts is a desktop agent polling for?
-    this.logger.log(`agent poll ws=${ws.slice(0, 8)} accounts=[${accounts.map((a) => a.id.slice(0, 8)).join(',')}]`);
+    this.logger.log(
+      `agent poll ws=${ws.slice(0, 8)} v=${agentVersion || 'legacy(pre-0.1.1, needs manual update)'} accounts=[${accounts.map((a) => a.id.slice(0, 8)).join(',')}]`,
+    );
 
     // Heartbeat + wake-on-reconnect. This poll proves a live desktop agent is
     // online for every account in the workspace right now (the worker's
@@ -80,7 +87,17 @@ export class AgentController {
     // backoff. Pacing still caps them at the daily warm-up limit.
     for (const a of accounts) {
       const wasOnline = await this.redis.get(`agent:hb:${a.id}`);
-      await this.redis.set(`agent:hb:${a.id}`, '1', 'EX', 30);
+      // Carry the agent's build version AS the heartbeat value rather than in a
+      // second key: both readers of this key (RemoteAgentDriver, SchedulerService)
+      // only test truthiness, so a version string works exactly as '1' did, and
+      // "is it online" and "which build" stay one write and one read.
+      //
+      // 🔴 A MISSING header is the signal that matters. Builds before 0.1.1 have
+      // no auto-updater and cannot be changed, so they never send one — meaning
+      // this is how a stuck install is identified and told to reinstall once.
+      // 'legacy' is deliberately not a version number so it can never be mistaken
+      // for one, or compared as one.
+      await this.redis.set(`agent:hb:${a.id}`, agentVersion || 'legacy', 'EX', 30);
       if (!wasOnline) {
         const nowIso = new Date().toISOString();
         const res = await withWorkspace(ws, (db) =>
