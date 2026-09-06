@@ -162,6 +162,33 @@ export const TERMINAL_FAIL_OUTCOMES: LinkedInOutcome[] = [
 export const DEFER_OUTCOMES: LinkedInOutcome[] = ['network_error'];
 
 /**
+ * How many times one job may be deferred as `network_error` before we stop.
+ *
+ * 🔴 A defer means "try again later" — it must never mean "try again forever".
+ * Observed live: a lead URL that LinkedIn no longer serves a profile for (its
+ * page renders as plain "LinkedIn", no name, no action bar — a 404 in every way
+ * that matters) is INDISTINGUISHABLE, from the driver's side, from a page that
+ * was merely too slow. The driver rightly refuses to call that a verdict about
+ * the lead and returns `network_error`; the worker rightly defers it. With no
+ * bound, the pair loops: the same dead link is re-queued and re-opened every
+ * ~10 minutes, day and night, holding a queue slot and a real browser tab.
+ *
+ * So the retry is generous but FINITE. Five attempts across roughly an hour is
+ * far past any transient-network window, and what remains is a URL that will
+ * never load — which the user must be told about, not silently retried at.
+ *
+ * ⚠️ This bounds ONLY `network_error`. `agent_unavailable` / `agent_result_pending`
+ * mean the user's laptop was closed, and deferring those for days IS correct —
+ * capping them would fail a whole legitimate backlog over a weekend.
+ */
+export const MAX_NETWORK_DEFERS = 5;
+
+/** Has this job used up its network-retry budget? (`attempts` counts defers.) */
+export function networkDeferExhausted(attempts?: number | null): boolean {
+  return (attempts ?? 0) + 1 >= MAX_NETWORK_DEFERS;
+}
+
+/**
  * Does this evidence say LinkedIn has signed the account out?
  *
  * Takes a landed URL and/or an error string, because the same fact arrives in
@@ -188,6 +215,28 @@ export const DEFER_OUTCOMES: LinkedInOutcome[] = ['network_error'];
  * Result: the fix ships with an ordinary server restart, and the driver-side
  * copy below is an optimisation for future builds, not a prerequisite.
  */
+/**
+ * Did LinkedIn answer this navigation by saying the profile does not exist?
+ *
+ * 🔴 OBSERVED LIVE on `/in/darwin-ponraj-77939020`: LinkedIn does NOT serve a
+ * dead profile in place. It REDIRECTS to `linkedin.com/404/`, and that page is a
+ * bare illustration + "This page doesn't exist" — with no `<main>` and no `<h1>`.
+ * So the navigation's rendered-body probe finds nothing, reports `body never
+ * rendered`, and hands back a NULL response — which means every downstream check
+ * that would have recognised the dead link (the `resp.status() === 404` test, the
+ * "this page doesn't exist" text scan) is skipped, and a permanently dead URL is
+ * classified as a slow network and re-driven forever.
+ *
+ * The landed URL is the reliable signal, exactly as it is for {@link isSignedOutNav}:
+ * `/404/` is LinkedIn's own verdict, delivered before any rendering matters.
+ *
+ * Anchored to the PATH so a member whose vanity slug merely contains "404"
+ * (`/in/john-404`) can never be mistaken for a dead profile.
+ */
+export function isProfileGoneNav(landedUrl: string): boolean {
+  return /^https?:\/\/[^/]*linkedin\.com\/404(?:[/?#]|$)/i.test(landedUrl);
+}
+
 export function isSignedOutNav(landedUrl: string, thrownError: string): boolean {
   if (/ERR_TOO_MANY_REDIRECTS/i.test(thrownError)) return true;
   return /linkedin\.com\/(?:authwall|login|uas\/login|signup)/i.test(landedUrl);
@@ -245,6 +294,11 @@ const FAILURE_TEXT: Record<string, string> = {
   send_button_not_found: 'the invite window opened but showed no Send button',
   no_connect_button: 'LinkedIn shows no Connect option on this profile',
   profile_gone: 'this LinkedIn profile no longer exists',
+  profile_not_found: "LinkedIn returned a 'page not found' for this link — the profile was deleted or the URL is wrong",
+  // Retried MAX_NETWORK_DEFERS times over ~an hour and never got a page. Almost
+  // always a dead/wrong URL rather than a network problem, so say both.
+  profile_unreachable:
+    'this LinkedIn link never opened after several tries — check that the profile URL is still valid',
   blocked: 'this member blocks contact from your account',
   note_cap: "your LinkedIn account's personalized-note quota is used up for this month",
   session_expired:

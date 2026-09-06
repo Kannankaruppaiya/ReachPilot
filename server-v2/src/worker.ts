@@ -16,6 +16,7 @@ import {
   ACCOUNT_HALT_OUTCOMES,
   TERMINAL_FAIL_OUTCOMES,
   DEFER_OUTCOMES,
+  networkDeferExhausted,
   failureText,
   isSignedOutNav,
 } from '@/modules/drivers/linkedin-driver.interface';
@@ -569,14 +570,46 @@ async function bootstrap() {
       // window and lose the job for good).
       if (DEFER_OUTCOMES.includes(res.status)) {
         await pacing.release(accountId, 'linkedin', workspaceId, isInvite, jobRow.campaign_id).catch(() => undefined);
+        const tries = (jobRow.attempts ?? 0) + 1;
+
+        // …but "later" must never mean "forever". A link LinkedIn no longer
+        // serves a profile for looks exactly like a slow page from here, so
+        // unbounded deferral re-opens the same dead URL every 10 minutes for
+        // days. Spend a generous budget, then tell the user the link is bad.
+        if (networkDeferExhausted(jobRow.attempts)) {
+          await withWorkspace(workspaceId, async (db) => {
+            await db
+              .updateTable('jobs')
+              .set({ status: 'failed', attempts: tries, last_error: 'profile_unreachable' })
+              .where('id', '=', jobId)
+              .execute();
+            if (jobRow.enrollment_id) {
+              await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
+            }
+            await db
+              .insertInto('notifications')
+              .values({
+                workspace_id: workspaceId,
+                kind: 'job_failed',
+                text: `Outreach to ${payload.name} stopped: ${failureText('profile_unreachable')}`,
+              })
+              .execute();
+          });
+          logger.warn(
+            { jobId, accountId, attempts: tries, reason: res.error },
+            'Page never loaded after the full retry budget — treating the link as dead instead of retrying it forever',
+          );
+          return;
+        }
+
         const retryAt = new Date(Date.now() + NETWORK_BACKOFF_MS).toISOString();
         await withWorkspace(workspaceId, async (db) => {
-          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.error || res.status }).where('id', '=', jobId).execute();
+          await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, attempts: tries, last_error: res.error || res.status }).where('id', '=', jobId).execute();
           if (jobRow.enrollment_id) {
             await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
           }
         });
-        logger.warn({ jobId, accountId, retryAt, reason: res.error }, 'Page never loaded (network) — deferred to scheduler, lead NOT failed');
+        logger.warn({ jobId, accountId, retryAt, attempts: tries, reason: res.error }, 'Page never loaded (network) — deferred to scheduler, lead NOT failed');
         return;
       }
 

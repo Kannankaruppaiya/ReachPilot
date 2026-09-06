@@ -17,6 +17,7 @@ import {
   ProxyConfig,
   LinkedInFingerprint,
   isSignedOutNav,
+  isProfileGoneNav,
 } from './linkedin-driver.interface';
 import { CONNECT_NAME, SELECTORS, resolveFirst, type SelectorScope } from './linkedin-selectors';
 import {
@@ -241,6 +242,30 @@ export function connectedControl(page: Page): Locator {
     .filter({ visible: true });
 }
 
+/**
+ * Does this page say, in words, that there is no profile here?
+ *
+ * LinkedIn answers a dead /in/<slug> two different ways and BOTH must be read:
+ * sometimes an HTTP 404, but very often a 200 whose "This page doesn't exist"
+ * body is CLIENT-rendered a beat after the navigation commits. That timing is
+ * why this is a function and not one inline check — it has to be re-asked later,
+ * once the page has had time to settle, or a dead link reads as a slow one.
+ *
+ * Kept deliberately narrow: only phrasings that mean "no profile at this URL",
+ * never a checkpoint or a sign-in wall, which have their own outcomes.
+ */
+export async function profileUnavailable(page: {
+  locator(sel: string): { count(): Promise<number> };
+}): Promise<boolean> {
+  const n = await page
+    .locator(
+      'text=/this profile is not available|profile.{0,20}not available|page doesn.?t exist|isn.?t available right now|no longer active|this page doesn.?t exist|page not found/i',
+    )
+    .count()
+    .catch(() => 0);
+  return n > 0;
+}
+
 export async function gotoProfile(
   page: NavigablePage,
   url: string,
@@ -266,6 +291,13 @@ export async function gotoProfile(
     // A 404 is a real answer, not a slow page. Hand it straight back so the
     // caller can classify the profile as gone instead of retrying a dead URL.
     if (resp && resp.status() === 404) return { resp };
+    // …and LinkedIn usually delivers that answer as a REDIRECT to linkedin.com/404/
+    // with a 200, whose page carries neither <main> nor <h1>. Left alone it fails
+    // the rendered-body probe below, returns a null response, and every dead-link
+    // check downstream is skipped — which is how one dead profile was re-driven
+    // every ten minutes forever. Normalise it to the 404 each caller already
+    // understands, so the answer survives the probe instead of racing it.
+    if (isProfileGoneNav(page.url())) return { resp: { status: () => 404 } };
     await page
       .waitForLoadState('domcontentloaded', { timeout: NAV_READY_TIMEOUT_MS })
       .catch(() => undefined);
@@ -275,6 +307,9 @@ export async function gotoProfile(
       .waitFor({ state: 'attached', timeout: NAV_READY_TIMEOUT_MS })
       .then(() => true)
       .catch(() => false);
+    // Re-read the landed URL: a redirect to /404/ can also arrive client-side,
+    // i.e. after the commit checked above. Same verdict either way.
+    if (isProfileGoneNav(page.url())) return { resp: { status: () => 404 } };
     if (rendered) {
       if (isSignedOutNav(page.url(), '')) {
         return { resp, error: `signed_out: landed on ${page.url()}`, signedOut: true };
@@ -726,13 +761,7 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
       // Soft-unavailable: LinkedIn often serves a 200 page for deleted /
       // deactivated / restricted / blocked-by-member profiles rather than a 404.
       // Classify it explicitly instead of falling through to "no_connect_button".
-      const unavailable = await page
-        .locator(
-          'text=/this profile is not available|profile.{0,20}not available|page doesn.?t exist|isn.?t available right now|no longer active|this page doesn.?t exist/i',
-        )
-        .count()
-        .catch(() => 0);
-      if (unavailable) return { status: 'profile_gone' };
+      if (await profileUnavailable(page)) return { status: 'profile_gone', error: 'profile_not_found' };
 
       await humanScroll(page);
 
@@ -814,9 +843,15 @@ export class PlaywrightLinkedInDriver implements LinkedInDriver {
         // it means we never got a usable page. Classifying that as
         // `no_connect_button` (TERMINAL, never retried) is how a slow link turned
         // live prospects into permanent failures; defer it instead.
-        return redirected
-          ? { status: 'no_connect_button', error: 'redirected_off_profile' }
-          : { status: 'network_error', error: 'profile_not_loaded' };
+        if (redirected) return { status: 'no_connect_button', error: 'redirected_off_profile' };
+        // …but ASK ONE MORE TIME whether the page says there is no profile here.
+        // A dead /in/<slug> stays on its own URL and titles itself plain
+        // "LinkedIn", so it reaches this branch looking identical to a slow page
+        // — and the "doesn't exist" copy it renders lands only AFTER the check up
+        // at nav time. Re-reading it here is what stops a permanently dead link
+        // from being deferred and re-opened every 10 minutes forever.
+        if (await profileUnavailable(page)) return { status: 'profile_gone', error: 'profile_not_found' };
+        return { status: 'network_error', error: 'profile_not_loaded' };
       }
 
       // Precise, name-constrained matchers. LinkedIn labels each Connect control
