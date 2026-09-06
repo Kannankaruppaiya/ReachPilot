@@ -146,12 +146,86 @@ async function boot() {
   }
 }
 
+/* ---------------- auto-update ---------------- */
+
+// 🔴 WHY THIS EXISTS. The LinkedIn driver does not run on our servers — it is
+// esbuild-bundled into THIS app and runs on each user's machine. So a driver
+// fix used to reach a customer only if that customer downloaded and reinstalled
+// the app, which is not a thing anyone can be asked to do per bug. Observed:
+// an Aug-7 bundle still running against an Aug-24 driver, with no signal to
+// anyone that the two had diverged. This closes that gap — a driver fix now
+// ships on an app restart, the same way a server fix ships on a deploy.
+//
+// Feed: GitHub Releases on the PUBLIC repo (see "publish" in package.json), so
+// there is no server to run and NO TOKEN inside the app. electron-updater
+// verifies each download against the sha512 in latest.yml, which is what makes
+// an unsigned build safe to auto-update: a tampered file fails the hash and is
+// discarded rather than installed.
+//
+// ⚠️ Every release MUST bump "version" in package.json. electron-updater
+// compares versions, so shipping two builds under one version silently
+// delivers nothing — exactly the failure this code exists to prevent.
+function initAutoUpdate() {
+  // Only a packaged, installed app can update itself; in dev this would just
+  // throw ("dev-app-update.yml not found") on every launch.
+  if (!app.isPackaged) return;
+  let updater;
+  try {
+    updater = require('electron-updater').autoUpdater;
+  } catch (e) {
+    alog('auto-update unavailable:', (e && e.message) || e);
+    return;
+  }
+  updater.logger = { info: alog, warn: alog, error: alog, debug: () => {} };
+  // Download in the background; ask before RESTARTING, never before downloading.
+  // An unattended download costs the user nothing, but an unannounced restart
+  // would kill a LinkedIn action mid-flight — and this app's whole job is to be
+  // the executor, so it must never disappear underneath a running invite.
+  updater.autoDownload = true;
+  updater.autoInstallOnAppQuit = true;
+
+  updater.on('error', (e) => alog('auto-update error:', (e && e.message) || e));
+  updater.on('update-available', (i) => alog('update available:', i && i.version));
+  updater.on('update-not-available', () => alog('already on the latest version'));
+
+  updater.on('update-downloaded', async (info) => {
+    const version = (info && info.version) || '';
+    alog('update downloaded:', version, '— offering restart');
+    // The dashboard is REMOTE web content with no preload and no IPC (see the
+    // file header), so this prompt cannot be an in-page banner without handing
+    // remote content a channel into this process. A native dialog gives the same
+    // one-click "relaunch to update" without touching that boundary.
+    const { dialog } = require('electron');
+    const { response } = await dialog.showMessageBox(mainWin && !mainWin.isDestroyed() ? mainWin : null, {
+      type: 'info',
+      buttons: ['Relaunch now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Update ready',
+      message: `ReachPilot ${version} is ready to install.`,
+      detail:
+        'Relaunching takes a few seconds. If you choose Later, the update installs by itself the next time you close ReachPilot.',
+    });
+    if (response === 0) {
+      // isSilent=true, isForceRunAfter=true — reinstall without the NSIS wizard
+      // and come straight back up, so the agent resumes polling on its own.
+      updater.quitAndInstall(true, true);
+    }
+  });
+
+  const check = () => updater.checkForUpdates().catch((e) => alog('update check failed:', (e && e.message) || e));
+  check();
+  // A laptop that stays open for days would otherwise never see a new build.
+  setInterval(check, 6 * 60 * 60 * 1000).unref();
+}
+
 app.whenReady().then(() => {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: 'ReachPilot', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'quit' }] },
     { role: 'editMenu' },
   ]));
   boot();
+  initAutoUpdate();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) boot(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

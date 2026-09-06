@@ -136,6 +136,25 @@ ssh -i ~/.ssh/oci_reachpilot.key ubuntu@129.225.68.89 "pm2 logs rp-worker --line
 
 ## Runbook B — desktop deploy (required for driver changes)
 
+> **Users no longer reinstall.** Since 0.1.1 the app carries `electron-updater`
+> pointed at GitHub Releases on this (public) repo, so a driver fix reaches
+> customers on an app restart. Publish a release with:
+>
+> ```bash
+> cd desktop && GH_TOKEN=$(gh auth token) npm run release
+> ```
+>
+> 🔴 **Bump `desktop/package.json` "version" first.** electron-updater compares
+> versions — two builds published under one version deliver nothing, silently.
+>
+> Installed apps check on launch and every 6 h, download in the background, and
+> prompt "Relaunch now / Later"; choosing Later installs on next quit. The build
+> is unsigned, which is fine: the download is verified against the sha512 in
+> `latest.yml`, so a tampered file is discarded, not installed.
+>
+> The manual build below is still how you test a change on YOUR machine before
+> publishing it to everyone.
+
 Close the ReachPilot app first. Then, from the repo root:
 
 ```bash
