@@ -43,7 +43,8 @@ for (const level of ['log', 'warn', 'error', 'debug']) {
 
 const DASHBOARD_URL = 'https://reachpilot-eight.vercel.app';
 const API_BASE = 'https://api.reachpilot.dpdns.org';
-const ACCESS_TOKEN_KEY = 'rp_access'; // dashboard's localStorage key (src/constants)
+const ACCESS_TOKEN_KEY = 'rp_access'; // dashboard's localStorage keys (src/constants)
+const HEADLESS_KEY = 'rp_headless';
 
 let mainWin = null;
 let realDriver = null; // the bundled REAL PlaywrightLinkedInDriver (built by build:agent)
@@ -273,18 +274,21 @@ async function runJob(job) {
 
 /* ---------------- silent background agent poll loop ---------------- */
 
-// The logged-in user's access token lives in the dashboard's localStorage. Read
-// it fresh each cycle so login/logout and token refresh are handled for free.
-async function readToken() {
-  if (!mainWin || mainWin.isDestroyed()) return null;
+// The logged-in user's access token lives in the dashboard's localStorage, and
+// so does the Settings toggle for showing the browser window. Read both fresh
+// each cycle so login/logout, token refresh, and flipping the toggle mid-run are
+// all handled for free (each action opens its own context, so the next job picks
+// up the new value). Unset headless key = headed, the previous behaviour.
+async function readDashboardState() {
+  if (!mainWin || mainWin.isDestroyed()) return {};
   try {
-    const t = await mainWin.webContents.executeJavaScript(
-      `localStorage.getItem(${JSON.stringify(ACCESS_TOKEN_KEY)})`,
+    return await mainWin.webContents.executeJavaScript(
+      `({ token: localStorage.getItem(${JSON.stringify(ACCESS_TOKEN_KEY)}),
+          headless: localStorage.getItem(${JSON.stringify(HEADLESS_KEY)}) === '1' })`,
       true,
     );
-    return t || null;
   } catch {
-    return null;
+    return {};
   }
 }
 
@@ -351,7 +355,9 @@ async function agentLoop() {
   for (;;) {
     let busy = false;
     try {
-      const token = await readToken(); // null until the user is logged into the dashboard
+      const { token, headless } = await readDashboardState(); // token null until logged in
+      // The bundled driver reads this via agent/shims/env.js at context launch.
+      process.env.PLAYWRIGHT_HEADLESS = headless ? '1' : '0';
       const state = token ? 'token PRESENT' : 'no token yet (log in to the dashboard)';
       if (state !== lastTokenState) { alog(state); lastTokenState = state; }
       if (token) busy = await pollOnce(token);

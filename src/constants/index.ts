@@ -4,6 +4,8 @@
 // ── Auth token storage keys (localStorage) ───────────────────────────
 export const ACCESS_TOKEN_KEY = "rp_access"
 export const REFRESH_TOKEN_KEY = "rp_refresh"
+/** "1" = run the desktop agent's LinkedIn browser hidden. Read by desktop/main.js. */
+export const HEADLESS_KEY = "rp_headless"
 
 // ── Polling / timing ──────────────────────────────────────────────────
 /** App shell re-fetches live account + notifications on this cadence. */
