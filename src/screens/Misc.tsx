@@ -22,7 +22,7 @@ import { Badge, Button, Card, Field, LinkedinIcon } from "@/components/ui"
 import { LinkedinUpdateModal } from "./AuthOnboarding"
 import { useToast } from "@/components/Toast"
 import { cx } from "@/lib/utils/cx"
-import { HEADLESS_KEY, inputCls } from "@/constants"
+import { inputCls } from "@/constants"
 import { api } from "@/lib/api"
 import type {
   IntegrationsState,
@@ -556,9 +556,6 @@ export function Settings() {
   const [hoursEnd, setHoursEnd] = useState("18:00")
   const [timezone, setTimezone] = useState("UTC")
   const [sendWeekends, setSendWeekends] = useState(false)
-  // Desktop-only, and deliberately NOT server state: which machine shows a
-  // browser window is a property of that machine, not of the workspace.
-  const [showBrowser, setShowBrowser] = useState(() => localStorage.getItem(HEADLESS_KEY) !== "1")
   const [saving, setSaving] = useState(false)
 
   // Real profile + account limits — nothing hardcoded.
@@ -727,26 +724,6 @@ export function Settings() {
             />
             Send on weekends (Sat &amp; Sun)
           </label>
-          <div>
-            <label className="flex w-fit items-center gap-2 text-sm font-medium">
-              <input
-                type="checkbox"
-                checked={showBrowser}
-                onChange={(e) => {
-                  setShowBrowser(e.target.checked)
-                  localStorage.setItem(HEADLESS_KEY, e.target.checked ? "0" : "1")
-                }}
-                className="accent-[#0369a1]"
-              />
-              Show the browser window while sending
-            </label>
-            <span className="mt-1 block text-xs text-sub">
-              Desktop app only, and applies from the next action. On, you can watch every click the
-              agent makes on your account. Off runs it headless in the background — quieter, but
-              headless browsers are easier for LinkedIn to flag, so leave it on unless the window is
-              in your way. Saved on this machine only.
-            </span>
-          </div>
           <p className="rounded-md bg-mutedbg p-3 text-xs text-sub">
             This is the only place limits are set — Auto Connect and campaigns always send within
             what you save here. Automation may conflict with LinkedIn's User Agreement. Conservative

@@ -4,6 +4,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Eye,
+  EyeOff,
   ExternalLink,
   Loader2,
   MessageSquare,
@@ -21,7 +23,7 @@ import type { ConnectionRow, ConnectionsData, ConnectionOutcome, ConnectionDeliv
 import { Badge, Button, Card, StatCard } from "@/components/ui"
 import { useToast } from "@/components/Toast"
 import { cx } from "@/lib/utils/cx"
-import { inputCls } from "@/constants"
+import { HEADLESS_KEY, inputCls } from "@/constants"
 
 const REFRESH_MS = 20_000
 const PAGE_SIZES = [10, 25, 50, 100]
@@ -77,6 +79,51 @@ const FILTERS: { key: Filter; label: string }[] = [
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/)
   return ((parts[0]?.[0] || "") + (parts[1]?.[0] || "")).toUpperCase() || "?"
+}
+
+/**
+ * Whether the desktop agent shows its browser window. Per-machine, not workspace
+ * state (localStorage, read by desktop/main.js each poll) — which machine puts a
+ * window on screen is a property of that machine, so it lives here beside the
+ * live queue rather than in the server-saved Settings form.
+ */
+function ShowBrowserSwitch() {
+  const [on, setOn] = useState(() => localStorage.getItem(HEADLESS_KEY) !== "1")
+  const toggle = () => {
+    const next = !on
+    setOn(next)
+    localStorage.setItem(HEADLESS_KEY, next ? "0" : "1")
+  }
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={toggle}
+      title={
+        on
+          ? "The desktop agent's browser window is visible — you can watch every click it makes on your account. Applies from the next action; saved on this machine only."
+          : "The desktop agent runs hidden. Quieter, but headless browsers are easier for LinkedIn to flag. Applies from the next action; saved on this machine only."
+      }
+      className="inline-flex items-center gap-2 rounded-md border border-line bg-card px-3 py-2 text-sm font-semibold text-fg transition-colors duration-150 hover:bg-mutedbg"
+    >
+      {on ? <Eye size={15} /> : <EyeOff size={15} className="text-sub" />}
+      <span className="hidden sm:inline">Show browser</span>
+      <span
+        className={cx(
+          "relative h-4 w-7 rounded-full transition-colors duration-150",
+          on ? "bg-accent" : "bg-line",
+        )}
+      >
+        <span
+          className={cx(
+            "absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all duration-150",
+            on ? "left-3.5" : "left-0.5",
+          )}
+        />
+      </span>
+    </button>
+  )
 }
 
 export function Connections() {
@@ -222,6 +269,7 @@ export function Connections() {
           {updatedAt && (
             <span className="hidden text-xs text-sub sm:inline">Updated {timeAgo(updatedAt.toISOString())}</span>
           )}
+          <ShowBrowserSwitch />
           <Button variant="outline" onClick={() => load(true)} disabled={refreshing}>
             <RefreshCw size={15} className={cx(refreshing && "animate-spin")} /> Refresh
           </Button>
