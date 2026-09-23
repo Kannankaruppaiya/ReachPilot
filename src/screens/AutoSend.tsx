@@ -20,7 +20,9 @@ import { useToast } from "@/components/Toast"
 import { cx } from "@/lib/utils/cx"
 import { inputCls } from "@/constants"
 import { api } from "@/lib/api"
+import { useTemplateDraft } from "@/hooks/useTemplateDraft"
 import type { LinkedInAccountState } from "@/types"
+import { TemplateEditor } from "./TemplateEditor"
 
 type Mode = "linkedin" | "email"
 
@@ -91,12 +93,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
   useEffect(() => {
     if (mode === "linkedin" && account?.warmup) setCap(account.warmup.todayLimit)
   }, [account?.warmup?.todayLimit, mode])
-  const [subject, setSubject] = useState("Quick intro — {{firstName}}")
-  const [template, setTemplate] = useState(
-    mode === "linkedin"
-      ? "Hi {{firstName}}, impressed by your work at {{company}}. I'd love to connect and share how we help {{role}}s grow."
-      : "Hi {{firstName}},\n\nI came across your profile at {{company}} and wanted to reach out about an opportunity that fits your experience as {{role}}.\n\nOpen to a quick chat this week?",
-  )
+  const { template, setTemplate, subject, setSubject } = useTemplateDraft(mode)
   // Personalization (LinkedIn Auto Connect only). AI writes a unique note per
   // person; Apify (only when AI is on) scrapes each profile first for grounding.
   const [useAi, setUseAi] = useState(false)
@@ -565,33 +562,13 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
           </>
         ) : (
           <>
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              {["{{firstName}}", "{{company}}", "{{role}}"].map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setTemplate(template + " " + v)}
-                  className="rounded-full bg-accent/10 px-2.5 py-1 text-xs font-semibold text-accent hover:bg-accent/20"
-                >
-                  {v}
-                </button>
-              ))}
-            </div>
-            {mode === "email" && (
-              <Field label="Subject">
-                <input className={inputCls} value={subject} onChange={(e) => setSubject(e.target.value)} />
-              </Field>
-            )}
-            <textarea
-              rows={mode === "email" ? 5 : 3}
-              className={cx(inputCls, "mt-3 resize-none font-[inherit]")}
-              value={template}
-              onChange={(e) => setTemplate(e.target.value)}
-              aria-label="Message template"
+            <TemplateEditor
+              mode={mode}
+              template={template}
+              setTemplate={setTemplate}
+              subject={subject}
+              setSubject={setSubject}
             />
-            <p className="mt-1 text-xs text-sub">
-              Variation: <code className="rounded bg-mutedbg px-1">{"{Hi|Hey|Hello}"}</code> picks one option
-              per recipient — varied wording keeps your emails out of the bulk-mail spam fingerprint.
-            </p>
             {valid && (
               <div className="mt-3 rounded-md bg-mutedbg p-3 text-sm">
                 <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-sub">

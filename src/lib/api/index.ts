@@ -80,7 +80,7 @@ function refreshOnce(): Promise<RefreshResult> {
   return refreshInFlight
 }
 
-async function req<T>(url: string, body?: unknown, retried = false, method?: string): Promise<T> {
+export async function req<T>(url: string, body?: unknown, retried = false, method?: string): Promise<T> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers["Content-Type"] = "application/json"
   const token = localStorage.getItem(ACCESS_TOKEN_KEY)
@@ -118,7 +118,7 @@ async function req<T>(url: string, body?: unknown, retried = false, method?: str
 const patch = <T>(url: string, body: unknown) => req<T>(url, body, false, "PATCH")
 
 /** DELETE helper. */
-const del = <T>(url: string) => req<T>(url, undefined, false, "DELETE")
+export const del = <T>(url: string) => req<T>(url, undefined, false, "DELETE")
 
 export const api = {
   // Auth
