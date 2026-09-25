@@ -2,13 +2,18 @@ import { Injectable, Inject, NotFoundException, BadRequestException } from '@nes
 import { withWorkspace } from '@/db/rls';
 import { EMAIL_DRIVER, LINKEDIN_DRIVER } from '@/modules/drivers/driver.tokens';
 import { EmailDriver } from '@/modules/drivers/email-driver.interface';
-import { LinkedInDriver } from '@/modules/drivers/linkedin-driver.interface';
+import { LinkedInDriver, LinkedInActionResult, failureText } from '@/modules/drivers/linkedin-driver.interface';
+import { LinkedInSessionService } from '@/modules/drivers/linkedin-session.service';
+
+/** Account statuses that may act on LinkedIn (mirrors the scheduler's health gate). */
+const SENDABLE_ACCOUNT = ['active', 'warming_up'];
 
 @Injectable()
 export class InboxService {
   constructor(
     @Inject(EMAIL_DRIVER) private readonly emailDriver: EmailDriver,
     @Inject(LINKEDIN_DRIVER) private readonly linkedinDriver: LinkedInDriver,
+    private readonly sessions: LinkedInSessionService,
   ) {}
 
   /** All threads (LinkedIn + email) with their messages and lead context. */
@@ -148,11 +153,7 @@ export class InboxService {
       }
       externalId = res.externalId;
     } else {
-      // LinkedIn — best-effort through the driver (paused → simulator).
-      const res = await this.linkedinDriver
-        .sendMessage(thread.linkedin_url || '', body, { workspaceId })
-        .catch(() => ({ status: 'failed' as const, externalId: undefined }));
-      externalId = (res as any).externalId;
+      externalId = await this.sendLinkedInReply(workspaceId, thread.lead_id, thread.linkedin_url, body);
     }
 
     // Record the outgoing message + mark the thread read.
@@ -199,6 +200,86 @@ export class InboxService {
         time: this.formatTime(new Date(m.sent_at)),
       })),
     };
+  }
+
+  /**
+   * Send a LinkedIn reply AS one of the workspace's accounts, or throw.
+   *
+   * 🔴 This used to call the driver with no account at all and ignore the
+   * result, then record the message as sent. In production (remote driver) a
+   * call without an account returns `failed: no_account_id` at once — so every
+   * LinkedIn reply from the inbox showed as sent while nothing reached the
+   * prospect. Now the reply goes out through a real account session, and only a
+   * confirmed `sent` is recorded; anything else is reported to the user.
+   */
+  private async sendLinkedInReply(
+    workspaceId: string,
+    leadId: string,
+    linkedinUrl: string | null,
+    body: string,
+  ): Promise<string | undefined> {
+    if (!linkedinUrl) throw new BadRequestException('This lead has no LinkedIn profile URL.');
+
+    const accountId = await this.replyAccountFor(workspaceId, leadId);
+    if (!accountId) {
+      throw new BadRequestException('Connect a LinkedIn account to reply on LinkedIn.');
+    }
+    const ctx = await this.sessions.buildActionContext(accountId, workspaceId);
+    if (!ctx) {
+      throw new BadRequestException(
+        'Your LinkedIn account is paused or needs reconnecting, so the reply was not sent.',
+      );
+    }
+
+    let res: LinkedInActionResult;
+    try {
+      res = await this.linkedinDriver.sendMessage(linkedinUrl, body, ctx);
+    } catch (err: any) {
+      res = { status: 'failed', error: String(err?.message || err) };
+    }
+    if (res.status === 'sent') return res.externalId;
+
+    if (res.error === 'agent_unavailable') {
+      throw new BadRequestException('The ReachPilot desktop app is offline. Open it and try again. Nothing was sent.');
+    }
+    if (res.error === 'agent_result_pending') {
+      // The agent took the job but never confirmed it — it may have gone out.
+      throw new BadRequestException(
+        'The desktop app did not confirm this message. Check LinkedIn before sending it again, so it is not sent twice.',
+      );
+    }
+    throw new BadRequestException(`LinkedIn reply not sent: ${failureText(res.error || res.status)}`);
+  }
+
+  /**
+   * The account to reply from: the one that last reached this lead (the
+   * conversation lives in that account's inbox), else the workspace's most
+   * recently connected account that may send.
+   */
+  private async replyAccountFor(workspaceId: string, leadId: string): Promise<string | null> {
+    return withWorkspace(workspaceId, async (db) => {
+      const lastUsed = await db
+        .selectFrom('jobs')
+        .innerJoin('linkedin_accounts', 'linkedin_accounts.id', 'jobs.linkedin_account_id')
+        .select('jobs.linkedin_account_id as id')
+        .where('jobs.workspace_id', '=', workspaceId)
+        .where('jobs.lead_id', '=', leadId)
+        .where('jobs.kind', '=', 'linkedin')
+        .where('jobs.status', '=', 'sent')
+        .where('linkedin_accounts.status', 'in', SENDABLE_ACCOUNT)
+        .orderBy('jobs.sent_at', 'desc')
+        .executeTakeFirst();
+      if (lastUsed?.id) return lastUsed.id as string;
+
+      const fallback = await db
+        .selectFrom('linkedin_accounts')
+        .select('id')
+        .where('workspace_id', '=', workspaceId)
+        .where('status', 'in', SENDABLE_ACCOUNT)
+        .orderBy('connected_at', 'desc')
+        .executeTakeFirst();
+      return (fallback?.id as string) ?? null;
+    });
   }
 
   private formatTime(d: Date): string {
