@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
 
 @Injectable()
@@ -34,12 +33,14 @@ export class TemplatesService {
   }
 
   async getTemplate(workspaceId: string, id: string): Promise<any> {
-    const db = getDb();
-    return db
-      .selectFrom('templates')
-      .selectAll()
-      .where('workspace_id', '=', workspaceId)
-      .where('id', '=', id)
-      .executeTakeFirst();
+    // templates is RLS-scoped — read under the workspace context.
+    return withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('templates')
+        .selectAll()
+        .where('workspace_id', '=', workspaceId)
+        .where('id', '=', id)
+        .executeTakeFirst(),
+    );
   }
 }

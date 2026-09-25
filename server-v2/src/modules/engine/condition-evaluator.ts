@@ -1,24 +1,32 @@
 import { Injectable } from '@nestjs/common';
-import { getDb } from '@/db';
+import type { Kysely } from 'kysely';
+import type { DatabaseSchema } from '@/db';
+import { withWorkspace } from '@/db/rls';
 
 @Injectable()
 export class ConditionEvaluator {
   /**
    * Evaluates if a specific step condition is true or false for a lead.
+   *
+   * `db` is the caller's workspace-scoped transaction when it has one (the graph
+   * executor does); otherwise the read opens its own. `leads` is RLS-scoped, so
+   * a bare getDb() read sees nothing under a role that is subject to RLS.
    */
   async evaluate(
     workspaceId: string,
     leadId: string,
     conditionType: string,
     _params: any,
+    db?: Kysely<DatabaseSchema>,
   ): Promise<boolean> {
-    const db = getDb();
-    const lead = await db
-      .selectFrom('leads')
-      .selectAll()
-      .where('workspace_id', '=', workspaceId)
-      .where('id', '=', leadId)
-      .executeTakeFirst();
+    const read = (d: Kysely<DatabaseSchema>) =>
+      d
+        .selectFrom('leads')
+        .selectAll()
+        .where('workspace_id', '=', workspaceId)
+        .where('id', '=', leadId)
+        .executeTakeFirst();
+    const lead = db ? await read(db) : await withWorkspace(workspaceId, read);
 
     if (!lead) return false;
 

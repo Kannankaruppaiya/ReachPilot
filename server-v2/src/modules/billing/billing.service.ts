@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { getDb } from '@/db';
+import { withWorkspace } from '@/db/rls';
 
 @Injectable()
 export class BillingService {
@@ -9,12 +10,14 @@ export class BillingService {
   }
 
   async getSubscription(workspaceId: string): Promise<any> {
-    const db = getDb();
-    const sub = await db
-      .selectFrom('subscriptions')
-      .selectAll()
-      .where('workspace_id', '=', workspaceId)
-      .executeTakeFirst();
+    // subscriptions is RLS-scoped (plans is not).
+    const sub = await withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('subscriptions')
+        .selectAll()
+        .where('workspace_id', '=', workspaceId)
+        .executeTakeFirst(),
+    );
 
     if (!sub) {
       // Auto-provision free trial if none exists
@@ -41,25 +44,27 @@ export class BillingService {
     const end = new Date();
     end.setMonth(end.getMonth() + 1);
 
-    const sub = await db
-      .insertInto('subscriptions')
-      .values({
-        workspace_id: workspaceId,
-        plan_id: planId,
-        status: 'active',
-        current_period_start: now.toISOString(),
-        current_period_end: end.toISOString(),
-      })
-      .onConflict((oc) =>
-        oc.column('workspace_id').doUpdateSet({
+    const sub = await withWorkspace(workspaceId, (wdb) =>
+      wdb
+        .insertInto('subscriptions')
+        .values({
+          workspace_id: workspaceId,
           plan_id: planId,
           status: 'active',
           current_period_start: now.toISOString(),
           current_period_end: end.toISOString(),
-        }),
-      )
-      .returningAll()
-      .executeTakeFirstOrThrow();
+        })
+        .onConflict((oc) =>
+          oc.column('workspace_id').doUpdateSet({
+            plan_id: planId,
+            status: 'active',
+            current_period_start: now.toISOString(),
+            current_period_end: end.toISOString(),
+          }),
+        )
+        .returningAll()
+        .executeTakeFirstOrThrow(),
+    );
 
     return sub;
   }

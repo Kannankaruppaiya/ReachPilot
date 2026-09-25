@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { Subject, Observable } from 'rxjs';
 import { filter, map } from 'rxjs/operators';
-import { getDb } from '@/db';
+import { withWorkspace } from '@/db/rls';
 
 export interface SseEvent {
   workspaceId: string;
@@ -38,18 +38,19 @@ export class NotificationsService {
     storeInDb = false,
     text?: string,
   ): Promise<void> {
-    const db = getDb();
-
+    // notifications is RLS-scoped — every access runs under the workspace context.
     if (storeInDb && text) {
-      await db
-        .insertInto('notifications')
-        .values({
-          workspace_id: workspaceId,
-          kind: type,
-          text,
-          refs: JSON.stringify(data),
-        })
-        .execute();
+      await withWorkspace(workspaceId, (db) =>
+        db
+          .insertInto('notifications')
+          .values({
+            workspace_id: workspaceId,
+            kind: type,
+            text,
+            refs: JSON.stringify(data),
+          })
+          .execute(),
+      );
     }
 
     // Push to active SSE clients
@@ -61,22 +62,24 @@ export class NotificationsService {
   }
 
   async list(workspaceId: string): Promise<any[]> {
-    const db = getDb();
-    return db
-      .selectFrom('notifications')
-      .selectAll()
-      .where('workspace_id', '=', workspaceId)
-      .orderBy('created_at', 'desc')
-      .execute();
+    return withWorkspace(workspaceId, (db) =>
+      db
+        .selectFrom('notifications')
+        .selectAll()
+        .where('workspace_id', '=', workspaceId)
+        .orderBy('created_at', 'desc')
+        .execute(),
+    );
   }
 
   async markAsRead(workspaceId: string, notificationId: string): Promise<void> {
-    const db = getDb();
-    await db
-      .updateTable('notifications')
-      .set({ read_at: new Date().toISOString() })
-      .where('workspace_id', '=', workspaceId)
-      .where('id', '=', notificationId)
-      .execute();
+    await withWorkspace(workspaceId, (db) =>
+      db
+        .updateTable('notifications')
+        .set({ read_at: new Date().toISOString() })
+        .where('workspace_id', '=', workspaceId)
+        .where('id', '=', notificationId)
+        .execute(),
+    );
   }
 }

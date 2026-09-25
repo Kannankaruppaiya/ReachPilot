@@ -382,14 +382,17 @@ export class AuthService {
       .onConflict((oc) => oc.column('id').doNothing())
       .execute();
 
-    await db
-      .insertInto('memberships')
-      .values({
-        workspace_id: workspaceId,
-        user_id: userId,
-        role: 'owner',
-      })
-      .onConflict((oc) => oc.columns(['workspace_id', 'user_id']).doNothing())
-      .execute();
+    // memberships is RLS-scoped — insert under the workspace's context.
+    await withWorkspace(workspaceId, (wdb) =>
+      wdb
+        .insertInto('memberships')
+        .values({
+          workspace_id: workspaceId,
+          user_id: userId,
+          role: 'owner',
+        })
+        .onConflict((oc) => oc.columns(['workspace_id', 'user_id']).doNothing())
+        .execute(),
+    );
   }
 }

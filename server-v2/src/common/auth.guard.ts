@@ -7,9 +7,10 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import * as jwt from 'jsonwebtoken';
-import * as crypto from 'crypto';
 import { getEnv } from '@/config/env';
 import { getDb } from '@/db';
+import { withWorkspace } from '@/db/rls';
+import { hashApiKey, workspaceIdFromToken } from '@/modules/apikeys/api-key-token';
 
 export const IS_PUBLIC_KEY = 'isPublic';
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
@@ -75,24 +76,47 @@ export class AuthGuard implements CanActivate {
   }
 
   private async validateApiKey(key: string, request: any): Promise<boolean> {
-    const hash = crypto.createHash('sha256').update(key).digest('hex');
-    const db = getDb();
-    const row = await db
-      .selectFrom('api_keys')
-      .selectAll()
-      .where('key_hash', '=', hash)
-      .where('revoked_at', 'is', null)
-      .executeTakeFirst();
+    const hash = hashApiKey(key);
+
+    // api_keys is RLS-scoped, and a key-authenticated request has no workspace
+    // context yet. A raw getDb() lookup only worked while production connected
+    // as a BYPASSRLS role. Current keys name their workspace (api-key-token.ts);
+    // keys minted before that are found by probing each workspace — the same
+    // approach login uses for memberships.
+    const findIn = (workspaceId: string) =>
+      withWorkspace(workspaceId, async (db) => {
+        const found = await db
+          .selectFrom('api_keys')
+          .selectAll()
+          .where('workspace_id', '=', workspaceId)
+          .where('key_hash', '=', hash)
+          .where('revoked_at', 'is', null)
+          .executeTakeFirst();
+        if (found) {
+          await db
+            .updateTable('api_keys')
+            .set({ last_used_at: new Date().toISOString() })
+            .where('id', '=', found.id)
+            .execute();
+        }
+        return found;
+      });
+
+    let row: Awaited<ReturnType<typeof findIn>> = undefined;
+    const embedded = workspaceIdFromToken(key);
+    if (embedded) {
+      row = await findIn(embedded);
+    } else {
+      const workspaces = await getDb().selectFrom('workspaces').select('id').execute();
+      for (const ws of workspaces) {
+        row = await findIn(ws.id);
+        if (row) break;
+      }
+    }
 
     if (!row) {
       throw new UnauthorizedException('Invalid API key.');
     }
-
-    await db
-      .updateTable('api_keys')
-      .set({ last_used_at: new Date().toISOString() })
-      .where('id', '=', row.id)
-      .execute();
 
     request.user = {
       sub: row.created_by || '00000000-0000-0000-0000-000000000000',

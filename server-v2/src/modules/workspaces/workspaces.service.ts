@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { getDb } from '@/db';
+import { withWorkspace } from '@/db/rls';
 
 @Injectable()
 export class WorkspacesService {
@@ -18,14 +19,17 @@ export class WorkspacesService {
       .returning(['id', 'name', 'goal', 'created_at'])
       .executeTakeFirstOrThrow();
 
-    await db
-      .insertInto('memberships')
-      .values({
-        workspace_id: workspace.id,
-        user_id: userId,
-        role: 'owner',
-      })
-      .execute();
+    // memberships is RLS-scoped — insert under the new workspace's context.
+    await withWorkspace(workspace.id, (wdb) =>
+      wdb
+        .insertInto('memberships')
+        .values({
+          workspace_id: workspace.id,
+          user_id: userId,
+          role: 'owner',
+        })
+        .execute(),
+    );
 
     return workspace;
   }
@@ -58,15 +62,12 @@ export class WorkspacesService {
       .where('id', '=', workspaceId)
       .execute();
 
-    await db
-      .deleteFrom('linkedin_accounts')
-      .where('workspace_id', '=', workspaceId)
-      .execute();
-
-    await db
-      .deleteFrom('email_accounts')
-      .where('workspace_id', '=', workspaceId)
-      .execute();
+    // Both account tables are RLS-scoped: under a role subject to RLS a raw
+    // delete matches nothing and the "reset" silently keeps the accounts.
+    await withWorkspace(workspaceId, async (wdb) => {
+      await wdb.deleteFrom('linkedin_accounts').where('workspace_id', '=', workspaceId).execute();
+      await wdb.deleteFrom('email_accounts').where('workspace_id', '=', workspaceId).execute();
+    });
   }
 
   async getWorkspace(workspaceId: string): Promise<any> {
