@@ -1,12 +1,36 @@
-import { withWorkspace } from '@/db/rls';
-import { getDb } from '@/db';
 import * as crypto from 'crypto';
+import type { Kysely } from 'kysely';
+import { assertLocalServices } from './local-only';
+import { rlsRoleUrl } from './rls-role';
+
+/**
+ * RLS policies hide one workspace's rows from another.
+ *
+ * Runs as `rp_rls_probe` (see rls-role.ts): the local test user is a superuser,
+ * and a superuser bypasses RLS entirely — this test then failed on every correct
+ * schema, because it was measuring the connecting role rather than the policies.
+ */
+let getDb: () => Kysely<any>;
+let withWorkspace: <T>(ws: string, fn: (db: Kysely<any>) => Promise<T>) => Promise<T>;
+let reachable = false;
+let skipReason = '';
 
 describe('Row Level Security (RLS) Tenant Isolation', () => {
   const wsA = '00000000-0000-0000-0000-00000000001a';
   const wsB = '00000000-0000-0000-0000-00000000001b';
 
   beforeAll(async () => {
+    try {
+      assertLocalServices(process.env);
+      process.env.DATABASE_URL = await rlsRoleUrl(process.env.DATABASE_URL!);
+    } catch (e: any) {
+      skipReason = e.message;
+      return;
+    }
+    // Loaded after the URL swap: getEnv()/getDb() cache the first URL they see.
+    ({ getDb } = require('@/db'));
+    ({ withWorkspace } = require('@/db/rls'));
+
     // Workspaces table has no RLS — insert directly
     const db = getDb();
     await db
@@ -28,9 +52,18 @@ describe('Row Level Security (RLS) Tenant Isolation', () => {
       })
       .onConflict((oc) => oc.column('id').doNothing())
       .execute();
+    reachable = true;
+  }, 60_000);
+
+  afterAll(async () => {
+    if (reachable) await getDb().destroy();
   });
 
   it('should prevent Workspace B from reading Workspace A leads', async () => {
+    if (!reachable) {
+      console.warn(`  ↳ skipped (${skipReason})`);
+      return;
+    }
     const leadId = crypto.randomUUID();
 
     // Insert lead under Workspace A (must set RLS context)

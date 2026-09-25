@@ -74,7 +74,14 @@ async function seedConnectJob(leadId: string, status = 'scheduled'): Promise<str
         lead_id: leadId,
         linkedin_account_id: ACCT,
         // noNote: the flow under test — a connection request with no note.
-        payload: JSON.stringify({ name: 'Test Prospect', noNote: true }),
+        // target matches seedLead's profile URL: the duplicate-invite guard keys
+        // on the profile in the payload (connect jobs from Auto Connect carry no
+        // lead_id), so a job without one could never be recognised as a repeat.
+        payload: JSON.stringify({
+          name: 'Test Prospect',
+          noNote: true,
+          target: `https://www.linkedin.com/in/test-${leadId.slice(0, 8)}/`,
+        }),
       } as any)
       .execute(),
   );
