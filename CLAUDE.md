@@ -241,6 +241,10 @@ sendable" for a test account, and a drain test lost rows to the race).
   do. Read before anyone proposes routing LinkedIn traffic through our own VMs:
   both are AS31898 Oracle (indexed hosting), and one geolocates to Texas. Also
   carries the India provider matrix and the NetNut/FBI seizure.
+- `docs/market-analysis/` — competitor analysis + gap plan (Sept 2026): one doc per
+  area (safety/detection, LinkedIn sync & inbox, builder, leads, email, teams,
+  integrations, analytics, billing, security/compliance) and a phased roadmap.
+  Start at `00-README.md`.
 - `AGENTS.md` — vendor-neutral agent guide (portable quick-start).
 - `docs/adr/` — architecture decision records (e.g. 0001 Supabase migration).
 - `server-v2/.env.example` — env template (copy to `.env`).
