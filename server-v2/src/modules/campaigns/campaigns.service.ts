@@ -607,12 +607,27 @@ export class CampaignsService {
         await db.updateTable('campaigns').set(updates).where('id', '=', id).execute();
 
         // Pausing a campaign parks its live enrollments; resuming wakes them.
-        if (updates.status === 'paused') {
+        if (updates.status !== undefined && updates.status !== 'active') {
           await db
             .updateTable('enrollments')
             .set({ status: 'paused' })
+            .where('workspace_id', '=', workspaceId)
             .where('campaign_id', '=', id)
             .where('status', 'in', ['active', 'waiting'] as any)
+            .execute();
+          // 🔴 …and stop what is already materialised. Pausing used to touch
+          // only the enrollments, so every job the executor had already created
+          // (a follow-up due in two days, a message queued for this morning) was
+          // still sent by the scheduler after the user pressed Pause. Resuming
+          // re-creates them: the executor treats a 'campaign_paused' cancel as
+          // "make this step's job again" (graph-executor.ts, onCanceledJob).
+          // A 'running' job is mid-action on the agent and cannot be recalled.
+          await db
+            .updateTable('jobs')
+            .set({ status: 'canceled', last_error: 'campaign_paused' })
+            .where('workspace_id', '=', workspaceId)
+            .where('campaign_id', '=', id)
+            .where('status', 'in', ['scheduled', 'queued'] as any)
             .execute();
         } else if (updates.status === 'active') {
           await db

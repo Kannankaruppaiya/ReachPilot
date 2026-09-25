@@ -27,6 +27,23 @@ import { profileKey, invitedProfileKeys } from '@/modules/jobs/profile-key';
 const NON_SENDABLE_STATUSES = new Set(['checkpoint', 'paused', 'disconnected']);
 /** Lead statuses that suppress all outreach (opt-out / do-not-contact). */
 const SUPPRESSED_LEAD_STATUSES = new Set(['blacklisted', 'unqualified']);
+/**
+ * Why a CAMPAIGN job must not go out now, or null.
+ *
+ * The returned string becomes the job's `last_error`, and the campaign executor
+ * reads it back to decide what the cancel means (graph-executor.ts,
+ * onCanceledJob): a paused campaign or lead gets the job re-created on resume, a
+ * replied lead ends its sequence. Auto Connect / Auto Mail jobs carry no
+ * campaign or enrollment and are never held here.
+ */
+export function sequenceHold(campaignStatus?: string, enrollmentStatus?: string): string | null {
+  if (campaignStatus && campaignStatus !== 'active') return 'campaign_paused';
+  if (enrollmentStatus === 'replied') return 'lead_replied';
+  if (enrollmentStatus === 'paused') return 'enrollment_paused';
+  if (enrollmentStatus === 'stopped' || enrollmentStatus === 'finished') return 'enrollment_inactive';
+  return null;
+}
+
 /** How long to hold a job whose desktop agent is offline. Recovery does NOT wait
  *  this out: AgentController pulls these forward the moment the agent reappears,
  *  so the value only decides how often we re-check a laptop that stays shut. */
@@ -147,8 +164,55 @@ export class SchedulerService {
       return invited;
     };
 
+    // Campaign + enrollment state for every campaign job in this batch, read once
+    // per drain rather than once per job.
+    const campaignIds = [...new Set(due.map((j) => j.campaign_id).filter(Boolean))] as string[];
+    const enrollmentIds = [...new Set(due.map((j) => j.enrollment_id).filter(Boolean))] as string[];
+    const { campaignStatus, enrollmentStatus } = await withWorkspace(workspaceId, async (db) => {
+      const camps = campaignIds.length
+        ? await db
+            .selectFrom('campaigns')
+            .select(['id', 'status'])
+            .where('workspace_id', '=', workspaceId)
+            .where('id', 'in', campaignIds)
+            .execute()
+        : [];
+      const enrs = enrollmentIds.length
+        ? await db
+            .selectFrom('enrollments')
+            .select(['id', 'status'])
+            .where('workspace_id', '=', workspaceId)
+            .where('id', 'in', enrollmentIds)
+            .execute()
+        : [];
+      return {
+        campaignStatus: new Map(camps.map((c) => [c.id as string, c.status as string])),
+        enrollmentStatus: new Map(enrs.map((e) => [e.id as string, e.status as string])),
+      };
+    });
+
     for (const job of due) {
       const kind = (job.kind === 'email' ? 'email' : 'linkedin') as 'linkedin' | 'email';
+
+      // --- Sequence gate: a paused campaign / paused or replied lead sends
+      //     nothing. Pausing a campaign used to update only its enrollments, so
+      //     the jobs already materialised for it kept draining through here. ---
+      const hold = sequenceHold(
+        job.campaign_id ? campaignStatus.get(job.campaign_id) : undefined,
+        job.enrollment_id ? enrollmentStatus.get(job.enrollment_id) : undefined,
+      );
+      if (hold) {
+        await withWorkspace(workspaceId, (db) =>
+          db
+            .updateTable('jobs')
+            .set({ status: 'canceled', last_error: hold })
+            .where('workspace_id', '=', workspaceId)
+            .where('id', '=', job.id)
+            .execute(),
+        );
+        suppressed++;
+        continue;
+      }
 
       // --- Suppression gate: never contact opted-out / disqualified leads. ---
       if (job.lead_id) {
