@@ -107,7 +107,7 @@ export class LeadsService {
     return withWorkspace(workspaceId, async (db) => {
       // Normalize + in-batch dedup (a batch can contain the same profile twice).
       const bySlug = new Map<string, any>();
-      const emailOnly: any[] = [];
+      const emailOnly = new Map<string, any>();
       for (const row of rows) {
         const name = String(row.name || '').trim();
         if (!name) continue;
@@ -142,7 +142,39 @@ export class LeadsService {
           last_activity: 'Imported',
         };
         if (slug) bySlug.set(slug, data);
-        else emailOnly.push(data);
+        // Keyed by email for the same reason bySlug is keyed by slug: one upsert
+        // statement may not touch a row twice ("ON CONFLICT DO UPDATE command
+        // cannot affect row a second time"), so a list naming the same address
+        // twice aborted the WHOLE import.
+        else emailOnly.set(email, data);
+      }
+
+      // `leads_dedup_email` makes an email unique per workspace, but a LinkedIn
+      // row upserts on its SLUG — so a LinkedIn row carrying an email that
+      // another lead already owns (a different profile, or an email-only lead)
+      // violated the email index and rolled back the entire import. The same
+      // happened for two profiles in one file sharing an address. The profile is
+      // still imported; it just does not claim an email that is already taken.
+      const slugEmails = [...new Set([...bySlug.values()].map((r) => r.email).filter(Boolean))] as string[];
+      const emailOwner = new Map<string, string | null>(); // email → slug of the lead holding it
+      for (let i = 0; i < slugEmails.length; i += IMPORT_CHUNK) {
+        const owners = await db
+          .selectFrom('leads')
+          .select(['email', 'linkedin_slug'])
+          .where('workspace_id', '=', workspaceId)
+          .where('email', 'in', slugEmails.slice(i, i + IMPORT_CHUNK))
+          .execute();
+        for (const o of owners) emailOwner.set(String(o.email).toLowerCase(), (o.linkedin_slug as string | null) ?? null);
+      }
+      for (const [slug, row] of bySlug) {
+        if (!row.email) continue;
+        const owner = emailOwner.get(row.email);
+        if (owner === undefined) {
+          emailOwner.set(row.email, slug); // first row in this file to use it keeps it
+        } else if (owner !== slug) {
+          row.email = null;
+          row.email_verified = false;
+        }
       }
 
       let affected = 0;
@@ -175,10 +207,11 @@ export class LeadsService {
       }
 
       // Email-only rows (e.g. CSV) upsert on the email index.
-      for (let i = 0; i < emailOnly.length; i += IMPORT_CHUNK) {
+      const emailRows = [...emailOnly.values()];
+      for (let i = 0; i < emailRows.length; i += IMPORT_CHUNK) {
         const res = await db
           .insertInto('leads')
-          .values(emailOnly.slice(i, i + IMPORT_CHUNK))
+          .values(emailRows.slice(i, i + IMPORT_CHUNK))
           .onConflict((oc) =>
             oc
               .columns(['workspace_id', 'email'])
