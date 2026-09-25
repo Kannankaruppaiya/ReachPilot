@@ -354,8 +354,19 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [skipModal, setSkipModal] = useState(false)
   const [limit, setLimit] = useState(10)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState("")
+  // Back from Google OAuth (/?gmail=connected|error) — Google lands the user
+  // here, on the Gmail step, when onboarding is not finished yet.
+  const [oauthReturn] = useState(() => new URLSearchParams(window.location.search))
+  const [error, setError] = useState(() =>
+    oauthReturn.get("gmail") === "error" ? oauthReturn.get("reason") || "Gmail connection failed" : "",
+  )
   const toast = useToast()
+
+  useEffect(() => {
+    if (!oauthReturn.get("gmail")) return
+    if (oauthReturn.get("gmail") === "connected") toast("Gmail connected ✓")
+    window.history.replaceState({}, "", window.location.pathname)
+  }, [oauthReturn, toast])
 
   // Resume from saved backend progress on mount.
   useEffect(() => {
@@ -581,9 +592,13 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                     variant="outline"
                     disabled={busy}
                     onClick={() =>
+                      // Real Google OAuth. Google redirects back to /?gmail=…,
+                      // onboarding reloads on this step and sees the mailbox.
+                      // (This used to call /api/gmail/connect directly, which
+                      // "connected" a placeholder mailbox nothing could send from.)
                       run(async () => {
-                        await api.connectGmail(emailLimit)
-                        setGmailConnected(true)
+                        const { url } = await api.googleConnectUrl()
+                        window.location.href = url
                       }, false)
                     }
                   >
@@ -608,6 +623,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               >
                 Continue <ArrowRight size={16} />
               </Button>
+              {!gmailConnected && (
+                <Button
+                  variant="ghost"
+                  className="w-fit self-center text-sm"
+                  disabled={busy}
+                  onClick={() => run(() => api.connectGmail(emailLimit, { skip: true }))}
+                >
+                  Skip for now — connect Gmail later in Integrations
+                </Button>
+              )}
             </div>
           )}
 

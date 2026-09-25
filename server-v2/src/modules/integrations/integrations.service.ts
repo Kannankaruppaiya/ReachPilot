@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import * as jwt from 'jsonwebtoken';
 import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
+import { sendableMailboxes } from '@/modules/accounts/mailbox';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { ApifyMcpService } from '@/modules/ai/apify-mcp.service';
 import { GoogleOAuthService } from './google-oauth.service';
@@ -121,14 +122,27 @@ export class IntegrationsService {
       // must show and allow connecting more than one. Active rows first.
       const accounts = await db
         .selectFrom('email_accounts')
-        .select(['email', 'provider', 'daily_limit', 'status', 'connected_at', 'spf_status', 'dkim_status', 'dmarc_status'])
+        .select(['email', 'provider', 'daily_limit', 'status', 'connected_at', 'spf_status', 'dkim_status', 'dmarc_status', 'credentials_secret_id'])
         // Explicit workspace scope — the DB role bypasses RLS, so filtering by
         // provider alone leaks other tenants' mailboxes onto this page.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'gmail')
-        .orderBy((eb) => eb.case().when('status', '=', 'active').then(0).else(1).end())
+        // Mailboxes that can send first (see isConnected below).
+        .orderBy((eb) =>
+          eb
+            .case()
+            .when(eb.and([eb('status', '=', 'active'), eb('credentials_secret_id', 'is not', null)]))
+            .then(0)
+            .else(1)
+            .end(),
+        )
         .orderBy('connected_at', 'desc')
         .execute();
+      // "Connected" means it can send: active AND holding OAuth credentials. The
+      // old onboarding "Connect Gmail" inserted an active row with no
+      // credentials, which this page then showed as connected in every workspace.
+      const isConnected = (a: { status: string; credentials_secret_id: string | null }) =>
+        a.status === 'active' && !!a.credentials_secret_id;
       const gmail = accounts[0];
 
       const others = await db
@@ -149,7 +163,7 @@ export class IntegrationsService {
       return {
         gmail: gmail
           ? {
-              connected: gmail.status === 'active',
+              connected: isConnected(gmail as any),
               email: gmail.email,
               dailyLimit: gmail.daily_limit,
               status: gmail.status,
@@ -158,7 +172,7 @@ export class IntegrationsService {
           : { connected: false },
         gmailAccounts: accounts.map((a) => ({
           email: a.email,
-          connected: a.status === 'active',
+          connected: isConnected(a as any),
           status: a.status,
           connectedAt: a.connected_at,
         })),
@@ -269,13 +283,17 @@ export class IntegrationsService {
   /** Disconnect Gmail: revoke the token and drop the stored credential. */
   async disconnectGoogle(workspaceId: string): Promise<{ ok: true }> {
     await withWorkspace(workspaceId, async (db) => {
-      const acct = await db
-        .selectFrom('email_accounts')
-        .select(['id', 'credentials_secret_id'])
-        // Explicit workspace scope — the DB role bypasses RLS.
-        .where('workspace_id', '=', workspaceId)
-        .where('provider', '=', 'gmail')
-        .executeTakeFirst();
+      // The mailbox that is actually sending — an unordered pick could land on a
+      // credential-less placeholder row and leave the real inbox connected.
+      const acct =
+        (await sendableMailboxes(db, workspaceId).select(['id', 'credentials_secret_id']).executeTakeFirst()) ??
+        (await db
+          .selectFrom('email_accounts')
+          .select(['id', 'credentials_secret_id'])
+          // Explicit workspace scope — the DB role bypasses RLS.
+          .where('workspace_id', '=', workspaceId)
+          .where('provider', '=', 'gmail')
+          .executeTakeFirst());
       if (!acct) return;
 
       if (acct.credentials_secret_id) {

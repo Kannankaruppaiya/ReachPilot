@@ -5,6 +5,7 @@ import { withWorkspace } from '@/db/rls';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { GoogleOAuthService } from '@/modules/integrations/google-oauth.service';
 import { EmailDriver, EmailSendContext } from './email-driver.interface';
+import { sendableMailboxes } from '@/modules/accounts/mailbox';
 
 const GMAIL_SEND = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 
@@ -89,24 +90,20 @@ export class GmailDriver implements EmailDriver {
 
     let acct: any;
     if (ctx?.emailAccountId) {
-      acct = await read((db) =>
-        db.selectFrom('email_accounts').selectAll().where('id', '=', ctx.emailAccountId).executeTakeFirst(),
-      );
-    } else if (ctx?.workspaceId) {
-      // No explicit mailbox on the job → the workspace's DEFAULT sender is the
-      // most recently connected active mailbox (deterministic; without the
-      // orderBy, Postgres returns an arbitrary row once there are several).
-      acct = await read((db) =>
-        db
-          .selectFrom('email_accounts')
-          .selectAll()
-          .where('workspace_id', '=', ctx.workspaceId)
-          .where('provider', '=', 'gmail')
-          .where('status', '=', 'active')
-          .orderBy('connected_at', 'desc')
-          .limit(1)
-          .executeTakeFirst(),
-      );
+      acct = await read((db) => {
+        let q = db.selectFrom('email_accounts').selectAll().where('id', '=', ctx.emailAccountId);
+        if (ctx.workspaceId) q = q.where('workspace_id', '=', ctx.workspaceId);
+        return q.executeTakeFirst();
+      });
+    }
+    // No explicit mailbox on the job — or the one it names can no longer send
+    // (disconnected, or the credential-less placeholder the old onboarding
+    // "Connect Gmail" created, which jobs queued before that fix still point
+    // at) → the workspace's DEFAULT sender: its most recently connected
+    // mailbox that holds credentials. No screen lets a user pick a sender, so
+    // the job's mailbox was always this same implicit default.
+    if (!(acct?.status === 'active' && acct?.credentials_secret_id) && ctx?.workspaceId) {
+      acct = await read((db) => sendableMailboxes(db, ctx.workspaceId!).selectAll().executeTakeFirst());
     }
 
     if (!acct?.credentials_secret_id) {

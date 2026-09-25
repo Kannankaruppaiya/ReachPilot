@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { withWorkspace } from '@/db/rls';
+import { sendableMailboxes } from '@/modules/accounts/mailbox';
 import { whereRealSend } from '@/modules/jobs/real-sends';
 
 /** One node from the campaign builder (a linear sequence, waits + one branch). */
@@ -271,12 +272,9 @@ export class CampaignsService {
         .where('workspace_id', '=', workspaceId)
         .limit(1)
         .executeTakeFirst();
-      const emailAcct = await db
-        .selectFrom('email_accounts')
-        .select('id')
-        .where('workspace_id', '=', workspaceId)
-        .limit(1)
-        .executeTakeFirst();
+      // A mailbox that can actually send — never an unordered pick over every
+      // row, which could land on a credential-less placeholder (see mailbox.ts).
+      const emailAcct = await sendableMailboxes(db, workspaceId).select('id').executeTakeFirst();
 
       const created = await db
         .insertInto('campaigns')

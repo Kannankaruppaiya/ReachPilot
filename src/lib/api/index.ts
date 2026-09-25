@@ -162,8 +162,13 @@ export const api = {
   verify2fa: (secret: string) =>
     req<{ status: string }>("/api/linkedin/2fa/verify", { secret }),
   skip2fa: () => req<{ status: string }>("/api/linkedin/2fa/skip", {}),
-  connectGmail: (dailyLimit: number) =>
-    req<{ gmail: { dailyLimit: number } }>("/api/gmail/connect", { dailyLimit }),
+  // Saves the onboarding daily limit for the mailbox connected via Google OAuth
+  // (googleConnectUrl); `skip` finishes the step without one.
+  connectGmail: (dailyLimit: number, opts: { skip?: boolean } = {}) =>
+    req<{ gmail: { email: string; dailyLimit: number } | null }>("/api/gmail/connect", {
+      dailyLimit,
+      skip: !!opts.skip,
+    }),
   saveWarmup: (payload: {
     dailyLimit: number
     hoursStart: string

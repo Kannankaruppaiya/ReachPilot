@@ -7,13 +7,18 @@ import { JwtPayload } from '@/common/auth.guard';
 export class EmailAccountsController {
   constructor(private readonly email: EmailAccountsService) {}
 
+  /**
+   * Onboarding Gmail step. The mailbox itself is connected through Google OAuth
+   * (/api/integrations/google/connect); this saves its daily limit and marks the
+   * step done. `skip: true` finishes the step with no mailbox connected.
+   */
   @Post('connect')
-  async connect(@Body() body: { dailyLimit?: number }, @Req() req: Request) {
+  async connect(@Body() body: { dailyLimit?: number; skip?: boolean }, @Req() req: Request) {
     const user = (req as any).user as JwtPayload;
     const workspaceId = (req as any).workspaceId || user.workspaceId;
     const dailyLimit = Number(body.dailyLimit) || 50;
 
-    const result = await this.email.connectGmail(workspaceId, user.sub, dailyLimit);
+    const result = await this.email.saveOnboardingLimit(workspaceId, dailyLimit, { skip: !!body.skip });
     return {
       ok: true,
       gmail: result.gmail,

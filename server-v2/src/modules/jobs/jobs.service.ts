@@ -1,6 +1,7 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { sql } from 'kysely';
 import { withWorkspace } from '@/db/rls';
+import { sendableMailboxes } from '@/modules/accounts/mailbox';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getEnv } from '@/config/env';
@@ -364,12 +365,9 @@ export class JobsService {
             ).todayLimit
           : Math.max(1, Number(cap) || 15);
 
-      const emailAcct = await db
-        .selectFrom('email_accounts')
-        .select('id')
-        .where('workspace_id', '=', workspaceId)
-        .limit(1)
-        .executeTakeFirst();
+      // A mailbox that can actually send — never an unordered pick over every
+      // row, which could land on a credential-less placeholder (see mailbox.ts).
+      const emailAcct = await sendableMailboxes(db, workspaceId).select('id').executeTakeFirst();
 
       const createdJobs: any[] = [];
 
