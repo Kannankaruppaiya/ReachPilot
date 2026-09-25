@@ -767,6 +767,7 @@ export class CampaignsService {
       await db
         .updateTable('jobs')
         .set({ status: 'canceled', last_error: 'enrollment_removed' })
+        .where('workspace_id', '=', workspaceId)
         .where('enrollment_id', '=', enrollmentId)
         .where('status', 'in', ['scheduled', 'queued', 'running'] as any)
         .execute();

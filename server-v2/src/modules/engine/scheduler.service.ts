@@ -127,6 +127,10 @@ export class SchedulerService {
       db
         .selectFrom('jobs')
         .selectAll()
+        // Explicit workspace scope: under the BYPASSRLS production role each
+        // workspace's drain otherwise picked up EVERY tenant's due jobs and
+        // enqueued them under the wrong workspace id.
+        .where('workspace_id', '=', workspaceId)
         .where('status', '=', 'scheduled')
         .where('scheduled_for', '<=', nowIso as any)
         .orderBy('scheduled_for', 'asc')
@@ -155,6 +159,9 @@ export class SchedulerService {
           db
             .selectFrom('jobs')
             .select('payload')
+            // This workspace's invites only — another tenant having invited the
+            // same person is no reason to cancel ours.
+            .where('workspace_id', '=', workspaceId)
             .where('action', '=', 'connect_request')
             .where('status', '=', 'sent')
             .execute(),

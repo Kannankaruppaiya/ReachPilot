@@ -82,14 +82,14 @@ export class SimulatorDriver implements LinkedInDriver, EmailDriver {
     const replies: LinkedInSyncResult['replies'] = [];
 
     const invited = await withWorkspace(wsId, (db) =>
-      db.selectFrom('leads').select(['linkedin_url']).where('status', '=', 'invited').where('linkedin_url', 'is not', null).limit(50).execute(),
+      db.selectFrom('leads').select(['linkedin_url']).where('workspace_id', '=', wsId).where('status', '=', 'invited').where('linkedin_url', 'is not', null).limit(50).execute(),
     ).catch(() => [] as any[]);
     for (const l of invited) {
       if (l.linkedin_url && Math.random() < 0.35) accepted.push({ profileUrl: l.linkedin_url });
     }
 
     const acceptedLeads = await withWorkspace(wsId, (db) =>
-      db.selectFrom('leads').select(['linkedin_url', 'full_name']).where('status', '=', 'accepted').where('linkedin_url', 'is not', null).limit(50).execute(),
+      db.selectFrom('leads').select(['linkedin_url', 'full_name']).where('workspace_id', '=', wsId).where('status', '=', 'accepted').where('linkedin_url', 'is not', null).limit(50).execute(),
     ).catch(() => [] as any[]);
     for (const l of acceptedLeads) {
       if (l.linkedin_url && Math.random() < 0.15) {

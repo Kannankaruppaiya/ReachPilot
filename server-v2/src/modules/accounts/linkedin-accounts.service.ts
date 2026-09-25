@@ -130,6 +130,10 @@ export class LinkedinAccountsService {
       const existing = await db
         .selectFrom('linkedin_accounts')
         .select('id')
+        // Explicit workspace scope — the DB role bypasses RLS, so matching on
+        // email alone found (and then overwrote) ANOTHER tenant's account that
+        // uses the same LinkedIn login.
+        .where('workspace_id', '=', workspaceId)
         .where('email', '=', email.toLowerCase())
         .executeTakeFirst();
 
@@ -147,6 +151,7 @@ export class LinkedinAccountsService {
             // re-entered. (warmupOrigin() now also guards against this, but the
             // field should mean what its name says.)
           })
+          .where('workspace_id', '=', workspaceId)
           .where('id', '=', existing.id)
           .execute();
       } else {
@@ -384,6 +389,9 @@ export class LinkedinAccountsService {
       db
         .updateTable('linkedin_accounts')
         .set(fields)
+        // 🔴 This UPDATE had no WHERE at all: under the BYPASSRLS production role,
+        // saving limits in one workspace rewrote every tenant's accounts.
+        .where('workspace_id', '=', workspaceId)
         .returning('id')
         .execute(),
     );

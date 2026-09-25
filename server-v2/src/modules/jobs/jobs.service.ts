@@ -82,6 +82,7 @@ export class JobsService {
       const leads = await db
         .selectFrom('leads')
         .select(['linkedin_url', 'status', 'last_activity'])
+        .where('workspace_id', '=', workspaceId)
         .where('linkedin_url', 'is not', null)
         .execute();
       const bySlug = new Map<string, { status: string; lastActivity: string | null }>();

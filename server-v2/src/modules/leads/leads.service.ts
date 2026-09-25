@@ -25,7 +25,9 @@ export class LeadsService {
     } = {},
   ): Promise<any[]> {
     const rows = await withWorkspace(workspaceId, async (db) => {
-      let query = db.selectFrom('leads').selectAll();
+      // Explicit workspace scope: production connects as a role that bypasses
+      // RLS, so without it this listed EVERY tenant's leads on the Leads screen.
+      let query = db.selectFrom('leads').selectAll().where('workspace_id', '=', workspaceId);
 
       if (opts.scrapeJobId) query = query.where('scrape_job_id', '=', opts.scrapeJobId);
       if (opts.status) query = query.where('status', '=', opts.status.toLowerCase());
@@ -60,6 +62,7 @@ export class LeadsService {
       const existing = await db
         .selectFrom('leads')
         .select('id')
+        .where('workspace_id', '=', workspaceId)
         .where('id', '=', id)
         .executeTakeFirst();
 
@@ -73,12 +76,13 @@ export class LeadsService {
       if (data.lastActivity !== undefined) updates.last_activity = data.lastActivity;
 
       if (Object.keys(updates).length > 0) {
-        await db.updateTable('leads').set(updates).where('id', '=', id).execute();
+        await db.updateTable('leads').set(updates).where('workspace_id', '=', workspaceId).where('id', '=', id).execute();
       }
 
       const updated = await db
         .selectFrom('leads')
         .selectAll()
+        .where('workspace_id', '=', workspaceId)
         .where('id', '=', id)
         .executeTakeFirstOrThrow();
 

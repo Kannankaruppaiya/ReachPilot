@@ -55,6 +55,7 @@ export class ScrapeJobsService {
             ...(patch.reason !== undefined ? { reason: patch.reason } : {}),
             updated_at: sql`now()`,
           })
+          .where('workspace_id', '=', workspaceId)
           .where('id', '=', id)
           .execute(),
       );
@@ -68,6 +69,9 @@ export class ScrapeJobsService {
       db
         .selectFrom('scrape_jobs')
         .selectAll()
+        // Explicit workspace scope — the DB role bypasses RLS, so without it the
+        // scrape history listed every tenant's searches.
+        .where('workspace_id', '=', workspaceId)
         .orderBy('created_at', 'desc')
         .limit(Math.min(Math.max(limit, 1), 50))
         .execute(),
@@ -77,7 +81,7 @@ export class ScrapeJobsService {
 
   async get(workspaceId: string, id: string): Promise<any | null> {
     const row = await withWorkspace(workspaceId, (db) =>
-      db.selectFrom('scrape_jobs').selectAll().where('id', '=', id).executeTakeFirst(),
+      db.selectFrom('scrape_jobs').selectAll().where('workspace_id', '=', workspaceId).where('id', '=', id).executeTakeFirst(),
     );
     return row ? this.map(row) : null;
   }

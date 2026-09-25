@@ -52,7 +52,14 @@ export class LinkedInSyncService {
       let accounts: { id: string }[] = [];
       try {
         accounts = await withWorkspace(ws.id, (db) =>
-          db.selectFrom('linkedin_accounts').select('id').where('status', 'in', SENDABLE_ACCT as any).execute(),
+          db
+            .selectFrom('linkedin_accounts')
+            .select('id')
+            // Explicit workspace scope — the DB role bypasses RLS, so without it
+            // every workspace's pass re-synced every tenant's accounts.
+            .where('workspace_id', '=', ws.id)
+            .where('status', 'in', SENDABLE_ACCT as any)
+            .execute(),
         );
       } catch {
         continue;
@@ -121,6 +128,7 @@ export class LinkedInSyncService {
           const lead = await db
             .selectFrom('leads')
             .select(['id', 'full_name'])
+            .where('workspace_id', '=', workspaceId)
             .where('linkedin_url', 'ilike', `%/in/${slug}%`)
             .where('status', '=', 'invited')
             .executeTakeFirst();
@@ -141,10 +149,10 @@ export class LinkedInSyncService {
       try {
         const did = await withWorkspace(workspaceId, async (db) => {
           let lead = slug
-            ? await db.selectFrom('leads').select(['id', 'full_name']).where('linkedin_url', 'ilike', `%/in/${slug}%`).executeTakeFirst()
+            ? await db.selectFrom('leads').select(['id', 'full_name']).where('workspace_id', '=', workspaceId).where('linkedin_url', 'ilike', `%/in/${slug}%`).executeTakeFirst()
             : undefined;
           if (!lead && r.fromName) {
-            lead = await db.selectFrom('leads').select(['id', 'full_name']).where('full_name', 'ilike', r.fromName).executeTakeFirst();
+            lead = await db.selectFrom('leads').select(['id', 'full_name']).where('workspace_id', '=', workspaceId).where('full_name', 'ilike', r.fromName).executeTakeFirst();
           }
           if (!lead) return false;
 

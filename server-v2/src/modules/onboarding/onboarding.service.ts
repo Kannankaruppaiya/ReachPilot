@@ -21,11 +21,13 @@ export class OnboardingService {
       const countRes = await db
         .selectFrom('leads')
         .select((eb: any) => eb.fn.count('id').as('cnt'))
+        .where('workspace_id', '=', workspaceId)
         .executeTakeFirst() as any;
 
       const lead = await db
         .selectFrom('leads')
         .select('source')
+        .where('workspace_id', '=', workspaceId)
         .limit(1)
         .executeTakeFirst();
 
@@ -65,6 +67,9 @@ export class OnboardingService {
       db
         .updateTable('linkedin_accounts')
         .set({ warmup_daily_limit: dailyLimit, hours_start: hoursStart, hours_end: hoursEnd, send_weekends: weekends })
+        // 🔴 No WHERE here either — under the BYPASSRLS role this set every
+        // tenant's LinkedIn limits and working hours.
+        .where('workspace_id', '=', workspaceId)
         .execute(),
     );
 

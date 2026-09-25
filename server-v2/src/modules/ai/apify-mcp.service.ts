@@ -128,6 +128,9 @@ export class ApifyMcpService {
       db
         .selectFrom('integrations')
         .select(['credentials_secret_id', 'config', 'active'])
+        // Explicit workspace scope: under the BYPASSRLS role a lookup by
+        // provider alone could decrypt and spend ANOTHER tenant's Apify token.
+        .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .where('active', '=', true)
         .executeTakeFirst(),

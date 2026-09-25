@@ -66,6 +66,7 @@ export class InboxService {
         .selectFrom('enrollments')
         .innerJoin('campaigns', 'campaigns.id', 'enrollments.campaign_id')
         .select(['enrollments.lead_id as lead_id', 'campaigns.name as campaign'])
+        .where('enrollments.workspace_id', '=', workspaceId)
         .where('enrollments.lead_id', 'in', leadIds)
         .execute();
       const campaignByLead = new Map(enr.map((e) => [e.lead_id, e.campaign]));
