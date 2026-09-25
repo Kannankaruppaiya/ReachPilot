@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
+import { stopSequencesOnReply } from '@/modules/engine/enrollment-state';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { GoogleOAuthService } from './google-oauth.service';
 
@@ -150,13 +151,9 @@ export class GmailInboxService {
         .where('id', '=', lead.id)
         .execute();
 
-      // Auto-pause the lead's sequence (Expandi behaviour).
-      await db
-        .updateTable('enrollments')
-        .set({ status: 'replied' })
-        .where('workspace_id', '=', workspaceId)
-        .where('lead_id', '=', lead.id)
-        .execute();
+      // End the lead's sequences AND withdraw the follow-up already scheduled
+      // for them (Expandi behaviour) — see stopSequencesOnReply.
+      await stopSequencesOnReply(db, workspaceId, lead.id);
 
       // Bump reply rollups.
       const liAcct = await db

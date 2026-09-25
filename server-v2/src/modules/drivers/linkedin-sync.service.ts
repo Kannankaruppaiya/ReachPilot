@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
+import { stopSequencesOnReply } from '@/modules/engine/enrollment-state';
 import { getEnv } from '@/config/env';
 import { LINKEDIN_DRIVER } from './driver.tokens';
 import { LinkedInDriver, LinkedInSyncResult } from './linkedin-driver.interface';
@@ -161,7 +162,8 @@ export class LinkedInSyncService {
             .executeTakeFirstOrThrow();
           await db.insertInto('messages').values({ thread_id: thread.id, direction: 'them', channel: 'linkedin', body: r.text, external_id: r.externalId || 'li_reply_' + Date.now().toString(36) }).execute();
           await db.insertInto('activity').values({ workspace_id: workspaceId, text: `${lead.full_name} replied on LinkedIn`, tone: 'success' }).execute();
-          await db.updateTable('enrollments').set({ status: 'replied' }).where('workspace_id', '=', workspaceId).where('lead_id', '=', lead.id).execute();
+          // End the lead's sequences and withdraw the follow-up already queued.
+          await stopSequencesOnReply(db, workspaceId, lead.id);
           await this.bumpStat(db, workspaceId, accountId, 'replies');
           return true;
         });

@@ -24,6 +24,11 @@ import { serializeSession } from '@/modules/drivers/linkedin-session-store';
 import { EmailDriver } from '@/modules/drivers/email-driver.interface';
 import { SecretsService } from '@/modules/vault/secrets.service';
 import { PacingService } from '@/modules/engine/pacing.service';
+import {
+  advanceEnrollment,
+  deferEnrollment,
+  setLiveEnrollmentStatus,
+} from '@/modules/engine/enrollment-state';
 import { GmailInboxService } from '@/modules/integrations/gmail-inbox.service';
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { CampaignRunnerService } from '@/modules/engine/campaign-runner.service';
@@ -127,34 +132,6 @@ async function bootstrap() {
   const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
 
   /* ---------- shared helpers ---------- */
-
-  const advanceEnrollment = async (
-    db: any,
-    enrollmentId: string | null,
-    stepId: string | null,
-  ) => {
-    if (!enrollmentId || !stepId) return;
-    const step = await db
-      .selectFrom('campaign_steps')
-      .select('next_step_id')
-      .where('id', '=', stepId)
-      .executeTakeFirst();
-    const nextStepId = step?.next_step_id || null;
-    await db
-      .updateTable('enrollments')
-      .set({
-        current_step_id: nextStepId,
-        status: nextStepId ? 'active' : 'finished',
-        // Reset the step-entry clock so the next step's delay window / condition
-        // timeout is measured from now, and clear the wait marker so the campaign
-        // runner picks it up on the next tick.
-        step_entered_at: nowIso(),
-        next_run_at: nextStepId ? nowIso() : null,
-        finished_at: nextStepId ? null : nowIso(),
-      })
-      .where('id', '=', enrollmentId)
-      .execute();
-  };
 
   const bumpSendStats = async (
     db: any,
@@ -287,9 +264,7 @@ async function bootstrap() {
         const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: nextRun }).where('id', '=', jobId).execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ next_run_at: nextRun, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await deferEnrollment(db, workspaceId, jobRow.enrollment_id, nextRun);
         });
         logger.info({ jobId, nextRun }, 'Pacing limit hit — deferred to scheduler');
         return;
@@ -315,9 +290,7 @@ async function bootstrap() {
         const retryAt = new Date(Date.now() + 3600000).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: 'account_unavailable' }).where('id', '=', jobId).execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ next_run_at: retryAt, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await deferEnrollment(db, workspaceId, jobRow.enrollment_id, retryAt);
         });
         logger.info({ jobId, accountId }, 'Account not sendable — deferred to scheduler');
         return;
@@ -427,7 +400,7 @@ async function bootstrap() {
             } else if (leadId) {
               await db.updateTable('leads').set({ last_activity: label }).where('id', '=', leadId).execute();
             }
-            await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+            await advanceEnrollment(db, workspaceId, jobRow.enrollment_id, jobRow.step_id);
             await db.insertInto('activity').values({ workspace_id: workspaceId, text: `${label} — ${payload.name}`, tone: 'success' }).execute();
             // Only connection requests consume an "invite" against the caps/stats.
             if (isConnect) await bumpSendStats(db, workspaceId, accountId, 'invite');
@@ -455,7 +428,7 @@ async function bootstrap() {
           if (leadId && res.status === 'already_connected') {
             await db.updateTable('leads').set({ status: 'accepted', last_activity: 'Already connected' }).where('id', '=', leadId).execute();
           }
-          await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+          await advanceEnrollment(db, workspaceId, jobRow.enrollment_id, jobRow.step_id);
           await db.insertInto('activity').values({ workspace_id: workspaceId, text: `${payload.name}: ${res.status.replace('_', ' ')} — skipped`, tone: 'muted' }).execute();
         });
         return;
@@ -482,14 +455,10 @@ async function bootstrap() {
               Date.now() + (res.status === 'limit_reached' ? 86400000 : SESSION_EXPIRED_BACKOFF_MS),
             ).toISOString();
             await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.status }).where('id', '=', jobId).execute();
-            if (jobRow.enrollment_id) {
-              await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
-            }
+            await deferEnrollment(db, workspaceId, jobRow.enrollment_id, retryAt);
           } else {
             await db.updateTable('jobs').set({ status: 'failed', last_error: 'checkpoint' }).where('id', '=', jobId).execute();
-            if (jobRow.enrollment_id) {
-              await db.updateTable('enrollments').set({ status: 'paused' }).where('id', '=', jobRow.enrollment_id).execute();
-            }
+            await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'paused');
           }
         });
         // Do NOT throw — avoid a retry storm against a paused account.
@@ -529,9 +498,7 @@ async function bootstrap() {
             .set({ status: 'failed', last_error: 'agent_result_pending_review' })
             .where('id', '=', jobId)
             .execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'failed');
           await db
             .insertInto('notifications')
             .values({
@@ -553,9 +520,7 @@ async function bootstrap() {
         const retryAt = new Date(Date.now() + AGENT_OFFLINE_BACKOFF_MS).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, last_error: res.error }).where('id', '=', jobId).execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await deferEnrollment(db, workspaceId, jobRow.enrollment_id, retryAt);
         });
         logger.info({ jobId, accountId, retryAt, reason: res.error }, 'Desktop agent did not return a result — deferred to scheduler');
         return;
@@ -583,9 +548,7 @@ async function bootstrap() {
               .set({ status: 'failed', attempts: tries, last_error: 'profile_unreachable' })
               .where('id', '=', jobId)
               .execute();
-            if (jobRow.enrollment_id) {
-              await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
-            }
+            await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'failed');
             await db
               .insertInto('notifications')
               .values({
@@ -605,9 +568,7 @@ async function bootstrap() {
         const retryAt = new Date(Date.now() + NETWORK_BACKOFF_MS).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: retryAt, attempts: tries, last_error: res.error || res.status }).where('id', '=', jobId).execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ status: 'waiting', next_run_at: retryAt }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await deferEnrollment(db, workspaceId, jobRow.enrollment_id, retryAt);
         });
         logger.warn({ jobId, accountId, retryAt, attempts: tries, reason: res.error }, 'Page never loaded (network) — deferred to scheduler, lead NOT failed');
         return;
@@ -625,9 +586,7 @@ async function bootstrap() {
           if (leadId && res.status === 'profile_gone') {
             await db.updateTable('leads').set({ status: 'unqualified', last_activity: 'Profile unavailable' }).where('id', '=', leadId).execute();
           }
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'failed');
           await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} skipped: ${failureText(reason)}` }).execute();
         });
         return;
@@ -638,9 +597,7 @@ async function bootstrap() {
       await pacing.release(accountId, 'linkedin', workspaceId, isInvite).catch(() => undefined);
       await withWorkspace(workspaceId, async (db) => {
         await db.updateTable('jobs').set({ status: 'failed', last_error: res.error || 'failed' }).where('id', '=', jobId).execute();
-        if (jobRow.enrollment_id) {
-          await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
-        }
+        await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'failed');
         await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Outreach to ${payload.name} failed: ${failureText(res.error)}` }).execute();
       });
       throw new Error(res.error || 'LinkedIn driver failed');
@@ -780,9 +737,7 @@ async function bootstrap() {
         const nextRun = paceResult.nextScheduledAt || new Date(Date.now() + 3600000).toISOString();
         await withWorkspace(workspaceId, async (db) => {
           await db.updateTable('jobs').set({ status: 'scheduled', scheduled_for: nextRun }).where('id', '=', jobId).execute();
-          if (jobRow.enrollment_id) {
-            await db.updateTable('enrollments').set({ next_run_at: nextRun, status: 'waiting' }).where('id', '=', jobRow.enrollment_id).execute();
-          }
+          await deferEnrollment(db, workspaceId, jobRow.enrollment_id, nextRun);
         });
         logger.info({ jobId, nextRun }, 'Email pacing limit hit — deferred to scheduler');
         return;
@@ -815,7 +770,7 @@ async function bootstrap() {
             if (leadId) {
               await db.updateTable('leads').set({ status: 'invited', last_activity: 'Email sent' }).where('id', '=', leadId).execute();
             }
-            await advanceEnrollment(db, jobRow.enrollment_id, jobRow.step_id);
+            await advanceEnrollment(db, workspaceId, jobRow.enrollment_id, jobRow.step_id);
             await db.insertInto('activity').values({ workspace_id: workspaceId, text: `Email sent to ${payload.name}`, tone: 'success' }).execute();
             await bumpSendStats(db, workspaceId, jobRow.linkedin_account_id || '', 'email');
           });
@@ -829,9 +784,7 @@ async function bootstrap() {
       logger.error({ jobId, err: res.error }, 'Email job failed');
       await withWorkspace(workspaceId, async (db) => {
         await db.updateTable('jobs').set({ status: 'failed', last_error: res.error || 'failed' }).where('id', '=', jobId).execute();
-        if (jobRow.enrollment_id) {
-          await db.updateTable('enrollments').set({ status: 'failed' }).where('id', '=', jobRow.enrollment_id).execute();
-        }
+        await setLiveEnrollmentStatus(db, workspaceId, jobRow.enrollment_id, 'failed');
         await db.insertInto('notifications').values({ workspace_id: workspaceId, kind: 'job_failed', text: `Email to ${payload.name} failed: ${res.error || 'unknown error'}` }).execute();
       });
       throw new Error(res.error || 'Email driver failed');
