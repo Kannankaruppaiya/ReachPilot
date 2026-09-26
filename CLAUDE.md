@@ -205,6 +205,15 @@ Verified by `scripts/verify-safety.ts`.
 `screens/`. A file exporting components exports only components (fast-refresh).
 Type-only imports use `import type` (`verbatimModuleSyntax` is on).
 
+## Code comments: why, not what
+Comment only what the code can't say (a non-obvious reason, an invariant, a
+cross-file rule, a safety warning), in 1–2 lines. Never restate the code or tell
+bug history (incident dates, people, account/job IDs); that goes in the commit
+message, the test, or `docs/`. Keep lint/TS directives and the one-line invariant
+comments this file points at (e.g. `network_error` is never terminal, `last_error`
+stays `agent_unavailable`). A script's usage/flags header and a test file's short
+scope + safety note may run longer. Same rule as `AGENTS.md` → Conventions.
+
 ## 🔴 Tests MUST run against local services (never the prod DB)
 `server-v2/.env` points `DATABASE_URL` at the **production** Supabase, and the
 live worker's scheduler tick enumerates **every workspace** in it every 30s.
