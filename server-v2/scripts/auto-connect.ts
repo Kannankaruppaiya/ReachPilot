@@ -1,60 +1,28 @@
 /**
- * auto-connect.ts — operator-facing LinkedIn connection-automation runner.
+ * auto-connect.ts: run a batch of connection requests on demand, using the same
+ * driver, session, pacing and outcome handling as the worker.
  *
- * The worker + scheduler already drive `connect_request` jobs for live
- * campaigns, but there was no way to run a safe, self-pacing batch of real
- * connection requests on demand (e.g. "send today's invites for account X now",
- * or smoke-test the connect flow end-to-end against the simulator). This script
- * is that runner. It reuses the SAME production building blocks the worker does
- * — the DI container, the selected LinkedIn driver, LinkedInSessionService
- * (cookie + proxy + fingerprint), PacingService (warm-up ramp, daily/weekly
- * caps, working hours, inter-action spacing), and the shared outcome
- * classification — so its behaviour is identical to a real campaign send, just
- * triggered by hand.
+ * Safety: dry run by default; real LinkedIn actions need LINKEDIN_DRIVER=playwright
+ * AND --live. Pacing is honoured (waits up to --max-wait, releases the slot on any
+ * non-send). checkpoint / limit_reached pause the account and stop the run.
  *
- * ── Safety model ────────────────────────────────────────────────────────────
- *  - DRY RUN by default. It only performs REAL LinkedIn actions when the driver
- *    is `playwright` AND you pass --live. Without --live a playwright driver is
- *    refused, so you can never contact LinkedIn by accident.
- *  - Pacing is honoured exactly as in production. If an account has hit its cap
- *    or the inter-action gap hasn't elapsed, the runner waits (up to --max-wait)
- *    or stops cleanly, mirroring the worker's defer-to-scheduler behaviour. The
- *    pacing slot is released on any non-send outcome so quota isn't burned.
- *  - checkpoint / limit_reached pause the whole account and stop the run,
- *    exactly like the worker's haltAccount path — never push through a challenge.
- *  - RLS: linkedin_accounts / leads / daily_stats / activity are FORCE-RLS, so
- *    every tenant read/write is wrapped in withWorkspace(). Plain getDb() reads
- *    of those tables silently return 0 rows.
- *
- * ── Usage ───────────────────────────────────────────────────────────────────
- *   # Dry run (simulator) — pick a sendable account, send up to 10 invites to
- *   # this workspace's `new` leads, mirror all pacing/state writes:
- *   npm run connect
- *
- *   # Target a specific account by email, cap the batch, custom note:
+ * Usage:
+ *   npm run connect                                     # dry run, up to 10 invites
  *   npx ts-node -r tsconfig-paths/register scripts/auto-connect.ts \
- *     --email you@gmail.com --limit 25 --note "Hi {{firstName}}, loved your work at {{company}}."
- *
- *   # Fast dispatch smoke-test (skip pacing waits) — DRY RUN only:
- *   npx ts-node -r tsconfig-paths/register scripts/auto-connect.ts --no-pace --limit 5
- *
- *   # One-off connect to a single profile, no DB lead needed (dry run):
- *   npx ts-node -r tsconfig-paths/register scripts/auto-connect.ts --url https://www.linkedin.com/in/someone
- *
- *   # REAL sends (requires LINKEDIN_DRIVER=playwright + a logged-in account):
- *   LINKEDIN_DRIVER=playwright npx ts-node -r tsconfig-paths/register scripts/auto-connect.ts --live --limit 15
+ *     --email you@gmail.com --limit 25 --note "Hi {{firstName}}"
+ *   LINKEDIN_DRIVER=playwright npx ts-node -r tsconfig-paths/register \
+ *     scripts/auto-connect.ts --live --limit 15         # REAL sends
  *
  * Flags:
  *   --account <uuid>   Act as this linkedin_accounts.id.
- *   --email <addr>     Act as the account with this email (alternative to --account).
+ *   --email <addr>     Act as the account with this email.
  *   --workspace <uuid> Restrict lead selection to this workspace (default: the account's).
  *   --limit <n>        Max connection requests this run (default 10).
- *   --url <profileUrl> One-off connect to a profile; skips DB lead selection. Repeatable,
- *                      or comma-separated (e.g. --url a,b), so you can test a handful of URLs.
- *   --note "<tpl>"     Personalized note template ({{firstName}}, {{company}}, …). Empty = no note.
- *   --no-note          Send connection requests without a note.
- *   --live             Allow REAL sends when the driver is `playwright`. Required for real contact.
- *   --no-pace          Bypass pacing (DRY RUN only) for a quick dispatch/classification check.
+ *   --url <profileUrl> One-off connect, no DB lead. Repeatable or comma-separated.
+ *   --note "<tpl>"     Note template ({{firstName}}, {{company}}, …). Empty = no note.
+ *   --no-note          Send without a note.
+ *   --live             Allow real sends with the playwright driver.
+ *   --no-pace          Skip pacing (dry run only).
  *   --max-wait <min>   How long to wait on a pacing defer before stopping (default 20).
  */
 import { NestFactory } from '@nestjs/core';
@@ -135,9 +103,7 @@ const DEFAULT_NOTE = 'Hi {{firstName|there}}, I came across your profile and wou
 
 /* ---------------- lead selection ---------------- */
 
-/** Statuses that make a lead a valid connect target — mirrors the scheduler's
- *  suppression gate (blacklisted/unqualified are never contacted) and avoids
- *  re-inviting anyone already in-flight (invited/accepted/replied). */
+/** Only `new` leads: never blacklisted/unqualified, never re-invite in-flight leads. */
 const CONNECTABLE_STATUS = 'new';
 
 /* ---------------- main ---------------- */
@@ -250,8 +216,7 @@ async function main() {
   let targets: Target[] = [];
 
   if (args.urls.length) {
-    // One-off: ad-hoc profiles, no lead rows (no lead-state writes). Derive a
-    // readable name from the /in/<slug> segment when possible.
+    // One-off profiles have no lead rows; derive a name from the /in/<slug>.
     const nameFromUrl = (u: string) => {
       const m = u.match(/\/in\/([^/?#]+)/i);
       if (!m) return u;
@@ -306,9 +271,8 @@ async function main() {
     const t = targets[i];
     const label = `[${i + 1}/${targets.length}] ${t.name}`;
 
-    /* Pacing gate — the real safety envelope. On defer, wait until the slot is
-       ready (bounded by --max-wait) then retry the SAME target; a far-future cap
-       (daily/weekly/working-hours) stops the run cleanly. Mirrors the worker. */
+    /* Pacing gate: on defer, wait (bounded by --max-wait) and retry the same target;
+       a far-future cap stops the run. */
     if (!args.noPace) {
       let waited = 0;
       for (;;) {
@@ -333,10 +297,7 @@ async function main() {
       if (stopped) break;
     }
 
-    /* Build the per-account session (cookie + proxy + fingerprint). Null means
-       the account is not sendable (checkpoint/paused/disconnected) — release the
-       pacing slot we just took and stop, rather than driving a browser at
-       LinkedIn with a flagged account. */
+    /* Null = account not sendable: release the slot and stop. */
     const ctx = await sessions.buildActionContext(account.id, workspaceId);
     if (!ctx) {
       if (!args.noPace) await pacing.release(account.id, 'linkedin', workspaceId, true).catch(() => undefined);
@@ -405,9 +366,7 @@ async function main() {
       continue;
     }
 
-    // Generic transient failure — release the slot; leave the lead as-is so a
-    // later run retries it. (A standalone runner has no BullMQ backoff, so we
-    // simply move on rather than block the batch on one flaky profile.)
+    // Transient failure: release the slot and move on; a later run retries the lead.
     if (!args.noPace) await pacing.release(account.id, 'linkedin', workspaceId, true).catch(() => undefined);
   }
 

@@ -1,14 +1,7 @@
 /**
- * What the campaign executor does when the current step ALREADY has a job.
- *
- * It used to return as soon as any job existed for the enrollment+step. Pausing
- * a lead cancels its pending job, so after resume the enrollment sat `active` on
- * a step whose only job was canceled — re-visited on every runner tick, never
- * moving again. Measured before the fix: pause → resume → 3 runner visits left
- * one canceled job and no new one.
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise. Calls executeStep for the test
- * workspace only; every job is scheduled in the future, so nothing is enqueued.
+ * What the executor does when the current step already has a job: a canceled job
+ * (from a pause) is re-created on resume instead of stalling the enrollment.
+ * Skips without local Postgres; every job is in the future, so nothing is enqueued.
  */
 import { randomUUID } from 'crypto';
 import { getDb } from '@/db';
@@ -121,7 +114,7 @@ describe('executeStep with an existing job on the current step', () => {
     const jobs = await jobsOf(e.enrollmentId);
     expect(jobs.map((j) => j.status)).toEqual(['canceled', 'scheduled']);
     expect(jobs[1].step_id).toBe(e.inviteStep);
-    // idempotency_key is UNIQUE — the re-created job must not collide with the first.
+    // idempotency_key is UNIQUE: the re-created job needs its own.
     expect(jobs[1].idempotency_key).not.toBe(jobs[0].idempotency_key);
     expect((await enrollment(e.enrollmentId)).status).toBe('waiting');
 

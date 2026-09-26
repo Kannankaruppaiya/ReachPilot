@@ -1,32 +1,11 @@
 /**
- * Regression: on the NORMAL fast path for a real top-card Connect, LinkedIn's
- * Connect control resolves as the custom-invite anchor
- * ("/preload/custom-invite/?vanityName=<slug>"). When the invite confirms
- * quickly — an "Invitation sent" toast, or the control flipping to Pending —
- * `sendConnectRequest` returns WITHOUT ever navigating back to an
- * `/in/<slug>` URL (that only happens on the slower "reload and check"
- * confirmation path). `slugOf(page.url())` requires a literal `/in/`
- * segment, so on the fast path it returns '', `resolvedSlug` is silently
- * omitted, and the feature no-ops on exactly the path it was built for.
- *
- * Fix: when the current URL carries no `/in/` segment, fall back to the
- * `vanityName` query parameter of the custom-invite URL — the vanity slug
- * LinkedIn already handed us, read from the URL the page is already on (no
- * extra navigation).
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: on the fast confirm path (toast / Pending flip) the page stays on the
+ * custom-invite URL, so `slugOf` returned '' and `resolvedSlug` was lost. The
+ * driver now falls back to the URL's `vanityName`. Pure logic.
  */
 import { resolvedSlugFrom, slugOf, vanityNameOf } from '../src/modules/drivers/playwright-linkedin.driver';
 
-/**
- * THE PRODUCTION FUNCTION — not a local reimplementation.
- *
- * An earlier version of this spec defined its own `slugOf(url) || vanityNameOf(url)`
- * helper and asserted on that, which meant deleting the fallback from the driver
- * left the whole suite green: the one line that produces a cross-form key on the
- * fast path had no test at all. `sendConnectRequest` now calls
- * `resolvedSlugFrom` at its return site, so these assertions run the real code.
- */
+/** The production function, not a local copy, so removing the fallback fails these tests. */
 const resolvedSlugOf = resolvedSlugFrom;
 
 describe('vanityNameOf', () => {

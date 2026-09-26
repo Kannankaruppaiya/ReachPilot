@@ -1,10 +1,6 @@
 /**
- * Read-only: why did the last remaining job not send?
- *
- * The worker logged "Pacing limit hit — deferred to scheduler" with
- * nextRun = tomorrow's window open — but BOTH the daily-cap gate and the
- * working-hours gate return exactly that, so the log alone cannot say which one
- * fired. Evaluate the real gates, in order, using the real functions.
+ * Read-only: which pacing gate deferred the last job? The daily cap and working
+ * hours both return "tomorrow's open", so evaluate each gate in order.
  */
 import { getDb } from '../src/db';
 import { withWorkspace } from '../src/db/rls';

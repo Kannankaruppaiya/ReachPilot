@@ -1,15 +1,7 @@
 /**
- * Guard for test suites that WRITE rows or ENQUEUE jobs.
- *
- * These suites must only ever run against local throwaway services. The reason
- * is concrete, not theoretical: the production database is shared with the live
- * worker on the Oracle box, whose scheduler tick enumerates EVERY workspace
- * every 30 seconds. A test that inserts jobs into that database gets those jobs
- * claimed and enqueued by the production scheduler — observed in practice, with
- * the live worker logging "Account not sendable" for a test account.
- *
- * Any suite that creates jobs, leads, accounts or workspaces should call
- * assertLocalServices() in beforeAll and skip itself if it throws.
+ * Guard for suites that write rows or enqueue jobs: the production scheduler
+ * scans every workspace every 30s and would claim test jobs. Call
+ * assertLocalServices() in beforeAll and skip if it throws.
  */
 
 /** Hosts we accept as "a throwaway service on this machine". */

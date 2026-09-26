@@ -1,28 +1,9 @@
 /**
- * Regression: a SLOW link turned healthy leads into permanent failures.
- *
- * OBSERVED LIVE (job f88147ac, account 508cd4a6, link measured at ~15 kB/s with
- * 16 % packet loss):
- *
- *   target = linkedin.com/in/ACwAAAU0vUABwfrtY62Gqd90xSI4QKoYEcqst_o
- *   err    = page.goto: Timeout 30000ms exceeded.
- *            - navigating to "...", waiting until "domcontentloaded"
- *
- * The tab visibly rendered the target's profile — name, headline and the Connect
- * button all on screen — while `page.goto` threw, because a 1–2 MB profile
- * document does not finish streaming inside 30 s at that speed. The driver's
- * `finally` then closed the context (the "tab closes by itself" symptom) and the
- * job was recorded as failed.
- *
- * Two separate defects, both covered here:
- *   1. NAVIGATION waited on the wrong signal (document-complete) with an
- *      arbitrary cap, instead of on the condition it actually needed (a rendered
- *      body). Fixed by `gotoProfile`.
- *   2. CLASSIFICATION treated "we never got a usable page" as a terminal verdict
- *      about the lead (`no_connect_button`, never retried). Fixed by the
- *      `network_error` outcome, which the worker defers.
- *
- * Pure logic — no DB, no Redis, no browser, no LinkedIn traffic.
+ * Regression: a slow link (~15 kB/s) failed healthy leads. `page.goto` timed out
+ * waiting for domcontentloaded while the profile was already on screen, and the
+ * result was recorded as terminal. Covers the fix on both sides: `gotoProfile`
+ * waits for a rendered body, and `network_error` is deferred, not failed.
+ * Pure logic: no DB, Redis, browser or LinkedIn.
  */
 import { gotoProfile } from '../src/modules/drivers/playwright-linkedin.driver';
 import type { NavigablePage, NavResponse } from '../src/modules/drivers/playwright-linkedin.driver';
@@ -128,8 +109,7 @@ describe('gotoProfile — retry policy', () => {
     expect(calls.goto).toBe(2);
     expect(retries).toHaveLength(1);
     expect(retries[0]).toContain('page.goto: Timeout');
-    // The retry reason is the FIRST line only — the multi-line Playwright call
-    // log must not be smuggled into a DB `last_error` column.
+    // Only the first line of the error: the Playwright call log must not reach `last_error`.
     expect(retries[0]).not.toContain('\n');
   });
 
@@ -191,29 +171,9 @@ describe('network_error classification', () => {
 });
 
 /**
- * Regression: a SIGNED-OUT account failed every job it was handed.
- *
- * OBSERVED LIVE (narmatha@rjpinfotek.ooo, account 73fa5cf8, 2026-08-31
- * 15:10–17:01 IST). `_verify-session-store.ts` confirmed all three legs:
- *   - the vault held the LEGACY bare `li_at` (1 cookie, no JSESSIONID/bcookie/liap)
- *   - the browser profile held 15 cookies and NO `li_at` — LinkedIn had signed it out
- *   - /feed/ redirected to /login/
- *
- * Injecting that stale cookie made LinkedIn bounce /in/<slug> → /authwall →
- * /login → back until Chrome gave up, so 15 consecutive invites died as:
- *
- *   page.goto: net::ERR_TOO_MANY_REDIRECTS at http://www.linkedin.com/in/…
- *
- * …recorded as terminal `failed` with that raw string in `last_error`, no
- * notification, and the account left at status='connecting'. 15 live prospects
- * burned, 75 more queued to die the same way, and nothing told the user the one
- * thing that would fix it: reconnect the account.
- *
- * NOT a URL-format bug, though every failing URL looked malformed (`http://`,
- * `in.linkedin.com`). Verified in a signed-IN browser: both forms resolve to
- * https://www.linkedin.com in a single hop, and a pristine
- * `https://www.linkedin.com/in/vinay-hiremath/` redirect-looped just as hard.
- * The discriminator is the session, not the string.
+ * Regression: a signed-out account (stale bare `li_at`) redirect-looped and failed
+ * every job with ERR_TOO_MANY_REDIRECTS as terminal `failed`. It must halt the
+ * account instead. The session was the cause, not the URL format.
  */
 describe('gotoProfile — a signed-out account', () => {
   const REDIRECT_LOOP = () =>
@@ -279,18 +239,8 @@ describe('gotoProfile — a signed-out account', () => {
 });
 
 /**
- * The DELIVERY half of the signed-out fix.
- *
- * The driver is esbuild-bundled into every user's desktop app, so a driver-only
- * fix reaches customers only if they download and reinstall a new build — which
- * is not something users can be asked to do for each bug. What makes this fix
- * shippable is that the classification is ALSO possible from what old app
- * versions already send: the agent hands back a generic `failed` carrying the
- * raw Playwright text, and the server can read it.
- *
- * These assert the predicate against the EXACT strings recorded in production
- * against narmatha@rjpinfotek.ooo, so the server-side path is known to fire for
- * agents that have never been updated.
+ * Server-side classification of the raw Playwright errors older desktop builds
+ * send, so the signed-out fix works without an app reinstall.
  */
 describe('isSignedOutNav — what an un-updated desktop agent sends', () => {
   const PROD_ERRORS = [
@@ -311,8 +261,7 @@ describe('isSignedOutNav — what an un-updated desktop agent sends', () => {
   });
 
   it('leaves a real security challenge to the checkpoint path', () => {
-    // A challenge means LinkedIn still considers the session real — different
-    // remedy (the human verifies), so it must NOT be read as signed out.
+    // A challenge means the session is still real (the human verifies): not signed out.
     expect(isSignedOutNav('https://www.linkedin.com/checkpoint/challenge/xyz', '')).toBe(false);
   });
 
@@ -323,18 +272,9 @@ describe('isSignedOutNav — what an un-updated desktop agent sends', () => {
 });
 
 /**
- * The "Retry failed" button's safety rule.
- *
- * A failed row is normally a true verdict about the LEAD. The button exists for
- * the rows where it is not — an account that had been signed out failed every
- * job it touched while those prospects stayed perfectly contactable (17 of them
- * in one afternoon on narmatha@rjpinfotek.ooo).
- *
- * The rule is an ALLOWLIST, and these lock that down. The cost of a wrong YES is
- * a SECOND invite fired at a real person and a second pacing slot spent, so
- * anything that reached the invite composer — where "did it send?" is ambiguous
- * — must be refused. A denylist would silently admit every driver error code
- * added after this was written; that is why this is written the other way round.
+ * The "Retry failed" allowlist: re-queue only failures that provably sent nothing.
+ * Anything inside the invite composer is ambiguous and must be refused, or a real
+ * person gets invited twice.
  */
 describe('isRequeueableFailure — what the Retry button may touch', () => {
   it('requeues the signed-out failures that burned live prospects', () => {
@@ -360,8 +300,7 @@ describe('isRequeueableFailure — what the Retry button may touch', () => {
   });
 
   it('🔴 REFUSES anything that reached the invite composer — a send may have happened', () => {
-    // The whole point of the allowlist. An ambiguous send must read as "sent",
-    // because the alternative is inviting a real person twice.
+    // An ambiguous send must read as "sent".
     for (const code of [
       'invite_dialog_never_opened',
       'send_button_not_found',

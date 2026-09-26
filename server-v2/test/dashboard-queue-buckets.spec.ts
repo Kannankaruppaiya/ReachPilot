@@ -1,29 +1,8 @@
 /**
- * Regression: the dashboard's "Today's queue" counted the wrong things.
- *
- * OBSERVED LIVE (2026-08-27) — the widget read "Sending today 0 / Scheduled for
- * later 155" while invites were actively going out. Actual job rows:
- *
- *   linkedin scheduled  due today or overdue   71   <-- belongs to "Sending today"
- *   linkedin scheduled  later                  84
- *   linkedin failed                            12   <-- must never be counted
- *   linkedin canceled                           1   <-- must never be counted
- *   queued  (any)                               0
- *
- * Two defects:
- *   1. "Sending today" counted `status = 'queued'`. That is the momentary BullMQ
- *      handoff — a job sits in it for seconds — so the number read 0 essentially
- *      always, no matter how much work was due.
- *   2. "Scheduled for later" counted EVERY `scheduled` row, so the 71 jobs due
- *      today were reported as future work.
- *
- * Both counters now share PENDING_JOB_STATUSES and split on the due date instead.
- * This spec pins the invariant the operator asked for: a FAILED invite is finished
- * work and must not appear in either bucket. Same for sent and canceled — counting
- * any of them promises sends that will never happen, and every terminal
- * `no_connect_button` would inflate the queue permanently.
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: "Today's queue" counted the brief `queued` handoff as "Sending today"
+ * (so it read 0) and every `scheduled` row as later. Both buckets now share
+ * PENDING_JOB_STATUSES and split on the due date; failed/sent/canceled never count.
+ * Pure logic.
  */
 import { PENDING_JOB_STATUSES, splitQueue } from '../src/modules/dashboard/dashboard.service';
 
@@ -35,8 +14,7 @@ describe("dashboard \"Today's queue\" buckets", () => {
   });
 
   it('counts every state that still represents outstanding work', () => {
-    // `scheduled` is the backbone state, `queued` the BullMQ handoff, `running`
-    // the in-flight send. Dropping any of them under-reports the queue.
+    // Dropping any pending state under-reports the queue.
     for (const pending of ['scheduled', 'queued', 'running']) {
       expect(PENDING_JOB_STATUSES as readonly string[]).toContain(pending);
     }
@@ -58,14 +36,8 @@ describe("dashboard \"Today's queue\" buckets", () => {
 });
 
 /**
- * Second correction, from the operator: being DUE today is not GOING today.
- *
- * OBSERVED 2026-08-27, after the first fix landed: the panel read "Sending today
- * 53 / Scheduled for later 84" while account health read "Today's invites 19/20".
- * Only ONE more invite could leave that day — pacing would defer the other 52. So
- * 53 promised sends that would not happen, the mirror image of the 0 the panel
- * used to show unconditionally. Both numbers were wrong; only the direction
- * changed.
+ * Due today is not going today: the cap bounds what can leave. (53 due against a
+ * 20/day cap with 19 sent means 1 goes today.)
  */
 describe('splitQueue', () => {
   it('reports what can actually go out, not what is merely due', () => {

@@ -1,7 +1,6 @@
 /**
- * Temporary: read-only probe of what the AUTOMATION's browser actually sees on a
- * profile. Navigates under the account's real session/proxy/fingerprint and dumps
- * the signals sendConnectRequest branches on. Performs no connect/send action.
+ * Read-only probe: what the automation's browser sees on a profile, under the
+ * account's real session. Dumps the signals sendConnectRequest branches on.
  *
  *   npx ts-node -r tsconfig-paths/register scripts/_probe-profile.ts <profileUrl>
  */
@@ -52,9 +51,7 @@ const URL_ARG = process.argv[2] || 'https://in.linkedin.com/in/darshana-karnik-3
     viewport: ctx.fingerprint?.viewport,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
   } as any);
-  // Inject the FULL stored jar exactly like the driver does — li_at alone makes
-  // LinkedIn bounce the request (ERR_TOO_MANY_REDIRECTS), which is not what the
-  // real automation sees.
+  // Inject the full jar like the driver does; li_at alone redirect-loops.
   const { cookiesToInject, parseStoredSession } = await import('../src/modules/drivers/linkedin-session-store');
   const stored: any[] = (ctx as any).cookies?.length ? (ctx as any).cookies : parseStoredSession(ctx.li_at as string);
   const existing: any[] = (await context.cookies('https://www.linkedin.com')) as any[];
@@ -105,8 +102,7 @@ const URL_ARG = process.argv[2] || 'https://in.linkedin.com/in/darshana-karnik-3
   const pendingCount = await page.getByRole('button', { name: /^Pending$/i }).count().catch(() => 0);
   console.log(`\nconnect=${connectCount} follow=${followCount} message=${msgCount} pending=${pendingCount}`);
 
-  // Open the More overflow READ-ONLY (opening a dropdown sends nothing) and dump
-  // its items — this is where the driver finds Connect on the current DOM.
+  // Open "More" read-only (opening sends nothing) and dump its items.
   const more = page.locator('main').first().getByRole('button', { name: /^More$/i })
     .or(page.locator('main').first().getByRole('button', { name: /^More actions$/i })).first();
   console.log(`\nMore button found: ${(await more.count().catch(() => 0)) > 0}`);

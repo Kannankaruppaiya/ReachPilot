@@ -1,12 +1,7 @@
 /**
- * The user-facing failure sentence.
- *
- * `last_error` stays a machine code (dashboard/scheduler match on it), but the
- * notification must read as a sentence. The regression this guards: a live
- * connect job against a member whose privacy setting demands an email address
- * returned `no_connect_button`/`email_required` (verified in agent.log), and the
- * user was told "skipped: email required" — which reads as if OUR app wanted an
- * email, not as LinkedIn refusing the invite.
+ * The user-facing failure sentence: `last_error` stays a machine code, but a
+ * notification must say what LinkedIn refused (e.g. an email-gated invite), not
+ * "skipped: email required".
  */
 import { failureText } from '@/modules/drivers/linkedin-driver.interface';
 

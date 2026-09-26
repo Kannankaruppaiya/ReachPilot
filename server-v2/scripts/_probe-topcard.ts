@@ -1,8 +1,8 @@
-/** Read-only: open the AGENT'S OWN signed-in Chrome profile, in the SAME headful
- *  mode the desktop agent uses, and dump exactly what directConnect() sees.
- *  No connect, no send, no login, no clicks.
+/**
+ * Read-only: open the agent's own signed-in profile in the same headful mode and
+ * dump what directConnect() sees. No clicks, sends or logins.
  *
- *  npx ts-node -r tsconfig-paths/register scripts/_probe-topcard.ts <acctId> <url> [headless]
+ *   npx ts-node -r tsconfig-paths/register scripts/_probe-topcard.ts <acctId> <url> [headless]
  */
 import * as os from 'os';
 import * as path from 'path';
@@ -38,8 +38,7 @@ const HEADLESS = process.argv[4] === 'headless';
   const nameHeading = title.replace(/^\(\d+\+?\)\s*/, '').replace(/\s*\|.*$/, '').trim();
   console.log(`\nnameHeading (from page title) = ${JSON.stringify(nameHeading)}`);
 
-  // EVERY element on the page whose aria-label mentions connecting — the ground
-  // truth directConnect() is matched against.
+  // Every element whose aria-label mentions connecting: the ground truth.
   const conns = await page.evaluate(() => {
     const out: any[] = [];
     document.querySelectorAll('[aria-label]').forEach((el: any) => {

@@ -1,12 +1,8 @@
 /**
- * Print the CURRENT 2FA code for the LinkedIn account from the seed we already
- * store. Prints the code, never the seed.
+ * Print the account's current 2FA code from the stored seed. --seed also prints
+ * the secret (only for re-adding to an authenticator; clear the terminal after).
  *
- *   npx ts-node -r tsconfig-paths/register scripts/_totp-code.ts [email-substring]
- *   npx ts-node -r tsconfig-paths/register scripts/_totp-code.ts greatworks --seed
- *
- * `--seed` also prints the raw secret — only use that when re-adding the account
- * to an authenticator app, and clear the terminal afterwards.
+ *   npx ts-node -r tsconfig-paths/register scripts/_totp-code.ts [email-substring] [--seed]
  */
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../src/app.module';

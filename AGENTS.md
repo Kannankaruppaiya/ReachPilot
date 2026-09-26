@@ -32,6 +32,14 @@ Config lives in `server-v2/.env` (untracked). Copy `server-v2/.env.example`.
   should export only components (fast-refresh).
 - Named constants over magic numbers; `import type { … }` for type-only imports
   (`verbatimModuleSyntax` is on).
+- **Comments say why, not what, in 1–2 lines.** Comment only what the code can't
+  say: a non-obvious reason, an invariant, a cross-file rule, a safety warning.
+  Don't restate the code, and don't tell bug history ("this used to…", incident
+  dates, people, account or job IDs); that goes in the commit message, the test,
+  or `docs/`. Longer blocks are fine for a script's usage/flags header or a
+  test file's one-paragraph scope and safety note. Keep lint/TS directives, and
+  keep the invariants CLAUDE.md points at (e.g. `network_error` is never
+  terminal, `last_error` stays `agent_unavailable`) as one-line comments.
 - Baseline style rules live in `.agents/skills/coding-standards`.
 
 ## 🔴 Must-know gotchas (details in CLAUDE.md)

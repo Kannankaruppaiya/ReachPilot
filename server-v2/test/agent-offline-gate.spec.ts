@@ -1,38 +1,15 @@
 /**
- * Scheduler — DESKTOP-AGENT gate (group G).
+ * Scheduler desktop-agent gate (group G): in remote mode, a due job whose laptop
+ * is offline is deferred by the scheduler before reaching BullMQ, keeping
+ * `last_error='agent_unavailable'` for AgentController's wake-on-reconnect.
+ * Skips without Postgres + Redis.
  *
- * THE BEHAVIOUR UNDER TEST
- *   In `LINKEDIN_DRIVER=remote` the executor is the user's LAPTOP, not the
- *   server. When that laptop is off, a due job must be deferred by the SCHEDULER
- *   — before it is ever pushed to BullMQ.
- *
- * WHY IT MATTERS
- *   Without this gate an offline laptop still drags every due job through the
- *   whole pipeline every few minutes: BullMQ add → worker pickup → pacing
- *   registration (Redis) → account context (Postgres) → driver heartbeat miss →
- *   pacing rollback → DB update → defer. Overnight, a 100-job backlog repeats
- *   that thousands of times to accomplish nothing. The heartbeat is already in
- *   Redis; reading it one step earlier turns all of that into a single cheap
- *   scan per tick.
- *
- *   The deferral must also keep `last_error='agent_unavailable'`, because that
- *   is exactly the marker AgentController's wake-on-reconnect looks for when the
- *   laptop comes back — it pulls those jobs forward to now so the backlog starts
- *   draining within one tick instead of waiting out the backoff.
- *
- * REQUIREMENTS: reachable Postgres + Redis. Suite SKIPS if unreachable.
- *
- * SAFETY — read before changing this file:
- *   • We call the PRIVATE drainWorkspace(testWorkspace), never the public
- *     tick(). tick() enumerates EVERY workspace and would enqueue real due jobs
- *     for real accounts — i.e. it could fire genuine LinkedIn invites.
- *   • G2 lets a job through to BullMQ for real, so the suite REFUSES TO RUN
- *     unless REDIS_URL is local. Do not weaken that guard.
- *   • All rows live under one throwaway workspace, deleted in afterAll.
+ * Safety: uses the private drainWorkspace(testWorkspace), never tick(), which
+ * would drain every workspace. G2 enqueues for real, so the suite refuses to run
+ * unless REDIS_URL is local. One throwaway workspace.
  */
 
-// Must be set before anything calls getEnv(), which caches on first read. The
-// gate under test only applies in remote mode.
+// Before anything calls getEnv() (it caches); the gate only applies in remote mode.
 process.env.LINKEDIN_DRIVER = 'remote';
 
 import Redis from 'ioredis';
@@ -69,8 +46,7 @@ async function seedJob(kind: 'linkedin' | 'email' = 'linkedin'): Promise<string>
         action: kind === 'linkedin' ? 'connect_request' : 'send_email',
         status: 'scheduled',
         scheduled_for: pastIso(),
-        // No lead_id: the suppression and duplicate-invite gates both key off a
-        // lead, so leaving it null keeps this suite focused on the agent gate.
+        // No lead_id keeps the suppression and duplicate-invite gates out of the way.
         lead_id: null,
         linkedin_account_id: kind === 'linkedin' ? ACCT : null,
         payload: JSON.stringify({ name: 'Test Prospect', noNote: true }),
@@ -186,8 +162,7 @@ describe('Scheduler — desktop-agent gate (remote driver)', () => {
 
     expect(res.enqueued).toBe(0);
     const after = await readJob(jobId);
-    // Still 'scheduled' — an offline executor is not a failure, and the row must
-    // never be lost or marked failed just because a laptop was closed.
+    // Still 'scheduled': a closed laptop must never fail or lose the job.
     expect(after?.status).toBe('scheduled');
     expect(new Date(after!.scheduled_for as any).getTime()).toBeGreaterThan(Date.now());
   });
@@ -208,10 +183,8 @@ describe('Scheduler — desktop-agent gate (remote driver)', () => {
 
     await drainTestWorkspace();
 
-    // AgentController pulls jobs forward on exactly this triple: status
-    // 'scheduled' + last_error 'agent_unavailable' + a future scheduled_for.
-    // Drift here silently breaks recovery — the backlog would sit out the full
-    // backoff instead of resuming when the laptop comes back.
+    // AgentController wakes jobs on exactly this triple: 'scheduled' +
+    // 'agent_unavailable' + a future scheduled_for.
     const after = await readJob(jobId);
     expect(after?.status).toBe('scheduled');
     expect(after?.last_error).toBe('agent_unavailable');
@@ -224,8 +197,7 @@ describe('Scheduler — desktop-agent gate (remote driver)', () => {
 
     const res = await drainTestWorkspace();
 
-    // Email sends run server-side through the Gmail API — the user's laptop has
-    // nothing to do with them, so an offline desktop agent must not hold them.
+    // Email sends run server-side, so an offline agent must not hold them.
     expect(res.enqueued).toBe(1);
     expect((await readJob(jobId))?.status).toBe('queued');
   });

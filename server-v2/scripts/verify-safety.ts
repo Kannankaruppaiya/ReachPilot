@@ -1,9 +1,6 @@
 /**
- * Verifies the account-safety layers added for Expandi-parity:
- *  A. Inter-action spacing — a 2nd action immediately after the 1st is deferred.
- *  B. Warm-up ramp — a day-0 account's daily cap is small (~5), not the target.
- *  C. Daily-cap determinism — same account/day yields the same cap.
- *  D. Duplicate-invite guard — a 2nd connect request to an invited lead is cancelled.
+ * Verifies the account-safety layers: inter-action spacing, warm-up ramp, daily
+ * cap determinism, and the duplicate-invite guard.
  *
  *   npx ts-node -r tsconfig-paths/register scripts/verify-safety.ts
  */

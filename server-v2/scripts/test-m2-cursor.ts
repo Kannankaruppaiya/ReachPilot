@@ -1,8 +1,8 @@
 /**
- * M2 acceptance (throwaway) — proves the rerun cursor gives FRESH leads.
- * Mimics exactly what worker fleet #8 does: read cursor → search that page window
- * → advance cursor. Two runs of the SAME search must return DIFFERENT leads.
- * Needs Redis. Run:  npm run test:m2
+ * Throwaway: two runs of the same search via the cursor must return different
+ * leads. Needs Redis.
+ *
+ *   npm run test:m2
  */
 process.env.SCRAPER_ENGINE = 'crawlee';
 

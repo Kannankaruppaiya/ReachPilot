@@ -1,20 +1,8 @@
 /**
- * Remove the placeholder Gmail rows the old onboarding "Connect Gmail" step left.
- *
- * That button never ran OAuth. It inserted an email_accounts row with a
- * hardcoded address, status 'active' and NO credentials into the workspace —
- * a row nothing can send from. Senders were then picked with an unordered
- * limit(1), so whenever the placeholder came first, Auto Mail / campaign emails
- * failed NO_MAILBOX, and the Integrations page showed Gmail as connected.
- *
- * Signature: provider 'gmail', status 'active', credentials_secret_id IS NULL.
- * No real flow produces it — OAuth always stores credentials, and a disconnect
- * sets status 'disconnected'. Deleting the row nulls email_account_id on jobs
- * that named it (FK ON DELETE SET NULL); the Gmail driver then sends from the
- * workspace's real mailbox.
- *
- * Read-only unless --apply. Runs per workspace under withWorkspace, so it works
- * for a role subject to RLS as well as for the bypassing one.
+ * Delete the placeholder Gmail rows the old onboarding step created (gmail,
+ * active, no credentials); no real flow produces that shape. Jobs that named one
+ * fall back to the workspace's real mailbox (FK ON DELETE SET NULL). Runs per
+ * workspace under withWorkspace. Read-only unless --apply.
  *
  *   npx ts-node -r tsconfig-paths/register scripts/cleanup-placeholder-mailboxes.ts [--apply]
  */

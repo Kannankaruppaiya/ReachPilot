@@ -1,16 +1,7 @@
 /**
- * Pausing a campaign must stop what it already scheduled.
- *
- * Pause used to set only the ENROLLMENTS to paused. The jobs the executor had
- * already materialised (tomorrow's follow-up, this morning's message) stayed
- * 'scheduled', and the scheduler had no campaign gate, so they were sent after
- * the user pressed Pause. Measured before the fix: pause left the campaign's
- * job 'scheduled'.
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise.
- * SAFETY: calls the scheduler's PRIVATE drainWorkspace(test workspace), never
- * tick(). Every drained job here ends canceled or deferred, so nothing reaches
- * BullMQ.
+ * Pausing a campaign must cancel what it already scheduled; the scheduler also
+ * holds jobs of paused campaigns. Skips without local Postgres. Uses the private
+ * drainWorkspace, never tick(); every drained job ends canceled or deferred.
  */
 import { randomUUID } from 'crypto';
 import { getDb } from '@/db';
@@ -36,8 +27,7 @@ beforeAll(async () => {
     assertLocalServices(getEnv());
     await getDb().deleteFrom('workspaces').where('id', '=', WS).execute();
     await getDb().insertInto('workspaces').values({ id: WS, name: 'campaign-pause' }).execute();
-    // A PAUSED account: a job that passes the sequence gate is then deferred by
-    // the account-health gate instead of being enqueued.
+    // A paused account: a job past the sequence gate is deferred, not enqueued.
     await withWorkspace(WS, (db) =>
       db
         .insertInto('linkedin_accounts')

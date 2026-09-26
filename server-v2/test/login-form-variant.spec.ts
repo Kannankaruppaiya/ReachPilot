@@ -1,22 +1,8 @@
 /**
- * LinkedIn serves two different sign-in pages, and we only ever handled one.
- *
- * The driver runs each account in a PERSISTENT browser profile on purpose — a
- * remembered device gets challenged far less. But a remembered device also gets
- * a different login page: instead of the usual email+password form, LinkedIn
- * shows "Welcome back", the account's name and a MASKED email, and a password
- * field only. There is no username input at all.
- *
- * The driver's first act was to type the email into
- * `input[autocomplete="username"]`, which on that page does not exist —
- * `typeLikeHuman` waits 15s, throws, and `finally` closes the browser. So every
- * re-login through an established profile failed, which is exactly the situation
- * where a re-login is needed. Observed live on 2026-08-26.
- *
- * The masked email matters for safety: if the profile remembers a DIFFERENT
- * account, typing this account's password into it is both wrong and a failed
- * login attempt against someone else's identity. When it doesn't match (or
- * cannot be read), take the "Sign in using another account" route instead.
+ * LinkedIn's two sign-in pages. A remembered device (our persistent profiles)
+ * gets "Welcome back": name, masked email, password only, no email input. If the
+ * masked email doesn't match ours (or can't be read), use "Sign in using another
+ * account" rather than type our password into someone else's sign-in.
  */
 import {
   classifyLoginForm,
@@ -35,8 +21,7 @@ describe('which sign-in page are we on', () => {
   });
 
   it('reports an unknown page rather than guessing', () => {
-    // A checkpoint, an interstitial, or a layout we have never seen. Guessing
-    // here means typing credentials into an unknown form.
+    // Unknown layout: don't type credentials into it.
     expect(classifyLoginForm({ hasUsernameField: false, hasPasswordField: false })).toBe(
       'unknown',
     );

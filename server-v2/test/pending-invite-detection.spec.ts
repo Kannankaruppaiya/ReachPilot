@@ -1,29 +1,9 @@
 /**
- * Regression: a lead whose invite HAD gone out was recorded `failed`.
- *
- * OBSERVED LIVE (2026-08-27, job a23bdc60, Karthik Athreyan): LinkedIn showed
- * "Pending" on his profile — the invitation was genuinely delivered — while the
- * jobs table read `status=failed, last_error=no_connect_button`, and the app
- * listed him under Failed.
- *
- * Read out of the operator's signed-in browser on karthik-athreyan-17652950:
- *
- *   <a aria-label="Pending, click to withdraw invitation sent to Karthik Athreyan">
- *     Pending
- *   </a>
- *
- * It is an <a>, and its accessible name is the whole withdraw sentence — so
- * `getByRole('button', { name: /^Pending$/i })` matched nothing. Measured on that
- * page: ZERO Pending *buttons* existed, page-wide, not merely outside the top-card
- * scope. Since LinkedIn REPLACES Connect with Pending once an invite is
- * outstanding, the driver then found no Connect and returned `no_connect_button`,
- * which is in TERMINAL_FAIL_OUTCOMES — so the lead was burned permanently even
- * though the invite had been delivered.
- *
- * The same page also carries "Message <other person>" anchors for rail people, so
- * the check has to be constrained to THIS target's name.
- *
- * Real Chromium + `setContent` — no network, no LinkedIn traffic, no DB.
+ * Regression: a delivered invite was recorded `failed`. LinkedIn shows Pending as
+ * <a aria-label="Pending, click to withdraw invitation sent to <Name>">, which a
+ * button-role lookup never finds; with Connect replaced by Pending, the driver
+ * returned terminal `no_connect_button`. The check is constrained to the target's
+ * name because rail controls name other people. Real Chromium + setContent.
  */
 import { chromium, type Browser, type Page } from 'playwright';
 import { pendingControl, connectedControl } from '../src/modules/drivers/playwright-linkedin.driver';
@@ -104,11 +84,8 @@ describe('accepted-connection detection on the live LinkedIn DOM', () => {
   let page: Page;
 
   /**
-   * An ACCEPTED connection has neither Connect nor Pending — only Message, and
-   * Message is an <a>. Observed on Dinesh M after he accepted (profile reads
-   * "· 1st"): a duplicate job recorded `no_connect_button`, i.e. a failure row
-   * for a connection already won. The rail's "Message <other person>" anchors on
-   * the same page must not satisfy the check.
+   * An accepted connection shows only Message (an <a>), neither Connect nor
+   * Pending. Rail "Message <other person>" anchors must not satisfy the check.
    */
   const ACCEPTED = `
     <main>

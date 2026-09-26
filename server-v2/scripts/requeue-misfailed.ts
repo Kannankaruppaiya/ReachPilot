@@ -1,35 +1,22 @@
 /**
- * Re-drive connect jobs that were failed by the broken top-card detection.
+ * Re-drive connect jobs failed as `no_connect_button` by the old top-card
+ * detection ("More" menu never opened; Pending not recognised). The fixed driver
+ * then marks a pending invite as sent, sends a real invite if connectable, or
+ * fails with an accurate reason.
  *
- * `no_connect_button` is TERMINAL, so a lead hit by any of these defects was
- * burned permanently even when nothing was wrong with it:
- *   - the overflow trigger was never found (page tier asked for "More actions",
- *     the real button says "More"), so the menu holding Connect never opened;
- *   - an OUTSTANDING invite was invisible: Pending is an <a>, not a <button>, so
- *     a lead whose invitation had genuinely been delivered read as `failed`.
+ * ⚠️ Re-driving a lead with no outstanding invite SENDS A REAL INVITE. Dry run by
+ * default; --apply writes. Rebuild and restart the desktop app first, or the jobs
+ * re-run on the old bundled driver.
  *
- * Resetting them to `scheduled` lets the fixed driver decide again:
- *   invite already out -> `pending`  -> SKIP  -> marked sent (shows as Awaiting)
- *   connectable        -> the invite actually goes out this time
- *   truly unreachable  -> fails again, with an accurate reason
- *
- * ⚠️ Re-driving a lead whose invite never went out SENDS A REAL INVITE and spends
- * daily pacing. Dry-run by default; pass --apply to write.
- * ⚠️ Restart the desktop app FIRST — the agent runs a bundled copy of the driver,
- * so without a rebuild+restart these jobs re-run on the OLD code and fail again.
- *
- *   npx ts-node -r tsconfig-paths/register scripts/requeue-misfailed.ts [--apply]
+ *   npx ts-node -r tsconfig-paths/register scripts/requeue-misfailed.ts [--apply] [jobId…]
  */
 import { getDb } from '../src/db';
 const { sql } = require('kysely');
 
 const APPLY = process.argv.includes('--apply');
 /**
- * Restrict to specific job ids. Use this — do not requeue the whole set blind.
- * Only a lead LinkedIn ALREADY shows as "Pending" is free to re-drive: the fixed
- * driver reads Pending, returns the `pending` outcome, and the row is corrected
- * without sending anything. For a lead with no outstanding invite, re-driving
- * SENDS A REAL INVITE — a decision for the operator, not this script.
+ * Limit to these job ids; don't requeue the whole set blind. Only leads LinkedIn
+ * already shows as Pending re-drive without sending anything.
  */
 const ONLY = process.argv.filter((a) => /^[0-9a-f-]{36}$/i.test(a));
 
@@ -62,8 +49,7 @@ const ONLY = process.argv.filter((a) => /^[0-9a-f-]{36}$/i.test(a));
     process.exit(0);
   }
 
-  // Spread them over the next hour rather than dumping the whole set at once;
-  // pacing still caps them at send time, this only avoids a thundering herd.
+  // Spread over the next hour; pacing still caps them at send time.
   const ids = ONLY.length ? rows.filter((r) => ONLY.includes(r.id)).map((r) => r.id) : rows.map((r) => r.id);
   if (ONLY.length && ids.length !== ONLY.length) {
     console.error(`\nrefusing: ${ONLY.length} id(s) given but only ${ids.length} matched a failed no_connect_button job.`);

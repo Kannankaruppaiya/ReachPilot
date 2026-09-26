@@ -1,13 +1,7 @@
 /**
- * Lead import must not abort because two rows share an email.
- *
- * Reproduced against a local database before the fix — each of these rolled back
- * the ENTIRE import, not just the offending row:
- *   - two email-only rows with one address → "ON CONFLICT DO UPDATE command
- *     cannot affect row a second time"
- *   - two LinkedIn profiles with one address → duplicate key on leads_dedup_email
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise.
+ * Lead import must not abort when two rows share an email (email-only rows, or
+ * two LinkedIn profiles); before the fix either rolled back the whole import.
+ * Skips without local Postgres.
  */
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';

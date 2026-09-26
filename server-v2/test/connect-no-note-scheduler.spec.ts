@@ -1,26 +1,11 @@
 /**
- * LinkedIn connect_request — SCHEDULER gates (group E).
+ * connect_request scheduler gates (group E): suppression (cancel), duplicate
+ * invite (cancel) and account health (defer +1h). A note-less connect must be
+ * gated exactly like one with a note. Skips without Postgres.
  *
- * The scheduler is what decides whether a scheduled connect_request ever
- * reaches the worker. These tests pin the three gates that can stop one:
- *   - suppression      (blacklisted / unqualified lead → cancel)
- *   - duplicate invite (lead already has a sent connect_request → cancel)
- *   - account health   (checkpoint / paused / disconnected → defer +1h)
- *
- * As with pacing, the note is irrelevant to these gates — a note-less connect
- * is gated identically. That is the point: switching the note off must not let
- * a job slip past a gate that a with-note job would have been stopped by.
- *
- * REQUIREMENTS: reachable Postgres. Suite SKIPS (not fails) if unreachable.
- *
- * SAFETY — read before changing this file:
- *   • We call the PRIVATE drainWorkspace(testWorkspace), never the public
- *     tick(). tick() enumerates EVERY workspace and would enqueue real due jobs
- *     for real accounts — i.e. it could fire genuine LinkedIn invites from a
- *     test run. Never call tick() here.
- *   • Every case asserts a CANCEL or DEFER outcome, all of which `continue`
- *     before the enqueue step, so no BullMQ job is ever produced.
- *   • All rows live under one throwaway workspace, deleted in afterAll.
+ * Safety: uses the private drainWorkspace(testWorkspace), never tick(), which
+ * would drain every workspace. Every case cancels or defers before the enqueue
+ * step, so nothing reaches BullMQ. One throwaway workspace.
  */
 import { SchedulerService } from '@/modules/engine/scheduler.service';
 import { getDb } from '@/db';
@@ -73,10 +58,8 @@ async function seedConnectJob(leadId: string, status = 'scheduled'): Promise<str
         scheduled_for: pastIso(),
         lead_id: leadId,
         linkedin_account_id: ACCT,
-        // noNote: the flow under test — a connection request with no note.
-        // target matches seedLead's profile URL: the duplicate-invite guard keys
-        // on the profile in the payload (connect jobs from Auto Connect carry no
-        // lead_id), so a job without one could never be recognised as a repeat.
+        // The duplicate-invite guard keys on the profile in the payload (Auto Connect
+        // jobs carry no lead_id), so `target` matches seedLead's URL.
         payload: JSON.stringify({
           name: 'Test Prospect',
           noNote: true,
@@ -161,8 +144,7 @@ afterAll(async () => {
   await getDb().destroy().catch(() => undefined);
 }, 60_000);
 
-// Generous timeout: each statement is a round trip to the Supabase pooler, which
-// comfortably exceeds Jest's 5s hook default.
+// Generous timeout: several DB round trips exceed Jest's 5s hook default.
 beforeEach(async () => {
   if (!reachable) return;
   await withWorkspace(WS, (db) => db.deleteFrom('jobs').where('workspace_id', '=', WS).execute());
@@ -271,8 +253,7 @@ describe('Connect request — scheduler gates (no-note connects are gated identi
     await drainTestWorkspace();
 
     const job = await readJob(jobId);
-    // Cancelled outright — we must not keep re-deferring a job for a lead we
-    // are never allowed to contact.
+    // Cancelled, not re-deferred: this lead may never be contacted.
     expect(job?.status).toBe('canceled');
     expect(job?.last_error).toBe('suppressed:blacklisted');
   }, 60_000);

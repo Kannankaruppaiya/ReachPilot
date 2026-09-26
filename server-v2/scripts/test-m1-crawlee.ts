@@ -1,7 +1,7 @@
 /**
- * M1 acceptance (throwaway) — run the REAL LeadScraperService.search() in crawlee
- * mode end-to-end: Crawlee fetch → Gemini extract → validation gate → leads.
- * Run:  SCRAPER_ENGINE=crawlee npm run test:m1
+ * Throwaway: run LeadScraperService.search() in crawlee mode end to end.
+ *
+ *   SCRAPER_ENGINE=crawlee npm run test:m1
  */
 process.env.SCRAPER_ENGINE = process.env.SCRAPER_ENGINE || 'crawlee';
 

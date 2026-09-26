@@ -1,16 +1,9 @@
 /**
- * Read-only check that the session-cookie fixes actually took effect on a live
- * account. Run AFTER installing the rebuilt desktop app and reconnecting LinkedIn.
+ * Read-only check of the session-cookie fixes on a live account: the vault holds
+ * the full jar, the profile's li_at wasn't clobbered, and /feed/ loads signed in.
+ * Prints only lengths and short hashes.
  *
  *   npx ts-node -r tsconfig-paths/register scripts/_verify-session-store.ts [email-substring]
- *
- * Verifies, for the account:
- *   1. #12 — the vault holds the FULL cookie jar, not a bare li_at string
- *   2. #15 — the browser profile's li_at is the SAME one we stored (i.e. nothing
- *            clobbered it), or newer (profile wins — also correct)
- *   3.      the session actually authenticates (loads /feed/ signed in)
- *
- * Prints no secret values — only lengths and short hashes.
  */
 import * as crypto from 'crypto';
 import * as os from 'os';

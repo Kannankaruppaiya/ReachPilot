@@ -1,23 +1,10 @@
 /**
- * One tenant must never read or write another's rows — even while RLS is off.
- *
- * Production connects as a role that BYPASSES row-level security
- * (docs/TENANT_ISOLATION.md), so `withWorkspace` isolates nothing there: only an
- * explicit `workspace_id` filter does. These queries had none, and each one
- * crossed tenants in production:
- *   - the Leads screen listed every tenant's leads; PATCH /leads/:id edited any
- *   - saving LinkedIn limits (Settings, onboarding) rewrote EVERY tenant's accounts
- *   - connecting a LinkedIn email another tenant used overwrote THEIR account
- *   - each workspace's scheduler drain claimed every tenant's due jobs, and one
- *     tenant's sent invite cancelled another's as a "duplicate"
- *   - an Apify lookup could decrypt and spend another tenant's token
- *   - scrape history and the Connections page read other tenants' rows
- *
- * The local test user is a superuser, which bypasses RLS exactly like the
- * production role, so these tests see what production sees.
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise. The scheduler is drained for one
- * test workspace only; every drained job ends canceled or deferred.
+ * One tenant must never read or write another's rows, even with RLS bypassed
+ * (as in production, docs/TENANT_ISOLATION.md): only explicit `workspace_id`
+ * filters isolate there. Covers leads, LinkedIn limits and connect, the scheduler
+ * drain and duplicate guard, the Apify token, scrape history and Connections.
+ * The local superuser bypasses RLS like production. Skips without local Postgres;
+ * the scheduler drains one test workspace, and every job ends canceled or deferred.
  */
 import { randomUUID } from 'crypto';
 import { getDb } from '@/db';

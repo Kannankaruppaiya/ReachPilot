@@ -1,41 +1,20 @@
 /**
- * verify-connect-e2e.ts — end-to-end verification of the ENTIRE connect-with-note
- * automation, run to completion, with an explicit PASS/FAIL for every stage.
+ * verify-connect-e2e.ts: send one real connection request with a note through the
+ * production driver and session, and report PASS/FAIL per stage (driver + safety
+ * gate, account, session, note, send, confirmed).
  *
- * It reuses the exact production building blocks the worker uses — the selected
- * LinkedIn driver, LinkedInSessionService (cookie + proxy + fingerprint) — and
- * drives one real connection request (with a personalized note) all the way
- * through to the driver's own "invite actually sent" confirmation. Nothing is
- * mocked: if it prints ALL PASS, a real invite went out and was verified pending.
- *
- * Stages checked:
- *   1. Driver mode + safety gate      (playwright + --live for real sends)
- *   2. Account resolved & logged in   (has a stored session cookie)
- *   3. Session context built          (li_at + fingerprint; proxy if configured)
- *   4. Note rendered                  (personalized, no leftover {{tokens}})
- *   5. Connection request sent        (driver.sendConnectRequest → outcome)
- *   6. Invite confirmed               (outcome 'sent' = driver verified Pending/toast)
- *
- * ── Usage ───────────────────────────────────────────────────────────────────
- *   # REAL end-to-end send + verify (needs a logged-in account):
+ * Usage:
  *   LINKEDIN_DRIVER=playwright npx ts-node -r tsconfig-paths/register \
- *     scripts/verify-connect-e2e.ts --live \
- *     --url https://www.linkedin.com/in/some-profile \
- *     --first Priya --note "Hi {{firstName}}, loved your work — would love to connect."
- *
- *   # Dry run (simulator, no real contact) — checks wiring only:
+ *     scripts/verify-connect-e2e.ts --live --url https://www.linkedin.com/in/x --first Priya
  *   npx ts-node -r tsconfig-paths/register scripts/verify-connect-e2e.ts \
- *     --url https://www.linkedin.com/in/some-profile --first Priya
+ *     --url https://www.linkedin.com/in/x --first Priya       # dry run (simulator)
  *
  * Flags:
- *   --url <profileUrl>  REQUIRED. The LinkedIn profile to send the request to.
- *   --note "<tpl>"      Note template ({{firstName}}, {{company}}, {{role}}). Default provided.
- *   --first <name>      Fills {{firstName}} (a --url has no DB lead to read it from).
- *   --company <name>    Fills {{company}}.
- *   --role <title>      Fills {{role}}.
- *   --email <addr>      Act as the account with this email (else the first sendable one).
- *   --account <uuid>    Act as this linkedin_accounts.id.
- *   --live              Allow a REAL send when the driver is `playwright`. Required for real contact.
+ *   --url <profileUrl>  Required. The profile to invite.
+ *   --note "<tpl>"      Note template ({{firstName}}, {{company}}, {{role}}).
+ *   --first/--company/--role <value>  Fill the note variables.
+ *   --email <addr> | --account <uuid>  Account to act as (else the first sendable).
+ *   --live              Allow a real send with the playwright driver.
  */
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../src/app.module';
@@ -204,9 +183,7 @@ async function main() {
     const sendReturned = !!outcome && typeof outcome.status === 'string';
     R.step('5. Connection request sent', sendReturned, `outcome=${outcome?.status}${outcome?.error ? ` (${outcome.error})` : ''} in ${secs}s`);
 
-    /* ---- Stage 6: interpret the confirmed outcome ---- */
-    // The driver now confirms a real invite (Pending/toast, reload-verified)
-    // before returning 'sent', so 'sent' is a verified send, not a click-and-hope.
+    /* ---- Stage 6: interpret the outcome ('sent' means the driver confirmed it) ---- */
     const s = outcome?.status;
     if (s === 'sent') {
       R.step('6. Invite confirmed on LinkedIn', true, 'driver verified the invite is pending — REAL send ✔');

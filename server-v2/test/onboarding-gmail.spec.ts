@@ -1,14 +1,7 @@
 /**
- * Onboarding's Gmail step must not invent a mailbox, and senders must be real.
- *
- * The old step called /api/gmail/connect, which inserted an email_accounts row
- * with a hardcoded address, status 'active' and NO credentials into the
- * workspace, and reported success. Senders were picked with an unordered
- * limit(1), so when that placeholder came first every email failed NO_MAILBOX
- * although a real inbox was connected, and Integrations showed "connected".
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise. Nothing reaches Google: the
- * OAuth client is a stub that reports which credentials it was handed.
+ * Onboarding's Gmail step must not create a mailbox, and senders must be real
+ * (credentialed) mailboxes. Skips without local Postgres; the OAuth client is a
+ * stub, so nothing reaches Google.
  */
 import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';

@@ -1,7 +1,7 @@
 /**
- * Verifies the refresh-token rotation grace (cross-tab logout race fix).
- * Exercises AuthService.refresh() directly against the real DB, then cleans up.
- * Run: npx ts-node -r tsconfig-paths/register scripts/_verify-refresh-grace.ts
+ * Verifies the refresh-token rotation grace against the real DB, then cleans up.
+ *
+ *   npx ts-node -r tsconfig-paths/register scripts/_verify-refresh-grace.ts
  */
 import * as crypto from 'crypto';
 import { getDb } from '../src/db';
@@ -105,7 +105,6 @@ async function main() {
     await expect401('unknown token', () => auth.refresh(crypto.randomBytes(40).toString('hex'), meta)),
   );
 
-  // cleanup every session this script created.
   for (const h of createdHashes) {
     await db.deleteFrom('user_sessions').where('refresh_token_hash', '=', h).execute();
   }

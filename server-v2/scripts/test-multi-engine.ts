@@ -1,9 +1,8 @@
 /**
- * Multi-engine acceptance (throwaway) — run the REAL LeadScraperService.search()
- * in 'multi' mode end-to-end: rotate Google→Bing→DuckDuckGo→Brave with per-engine
- * block cooldown → Gemini extract → validation gate → leads. Proves that even when
- * Google is CAPTCHA-blocking this IP, the other engines still return leads.
- * Run:  npm run test:multi
+ * Throwaway: run LeadScraperService.search() in 'multi' mode end to end, to show
+ * other engines still return leads while Google blocks.
+ *
+ *   npm run test:multi
  */
 process.env.SCRAPER_ENGINE = 'multi';
 

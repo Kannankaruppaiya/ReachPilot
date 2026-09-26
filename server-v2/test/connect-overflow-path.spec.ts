@@ -1,34 +1,9 @@
 /**
- * Regression: the overflow ("More") path was unreachable, which is what actually
- * turned four live leads into terminal `no_connect_button` on 2026-08-27.
- *
- * READ OUT OF THE OPERATOR'S OWN SIGNED-IN BROWSER, on four separate profiles
- * (dinesh-m-84686222, ganesh-sankararaman-425ba926, achuthan-thiru-bb761440,
- * sethuraman-elumalai-b3179b55) — the current LinkedIn profile DOM behaves like
- * this, every time:
- *
- *   - The top card renders NO Connect at all. Just `Follow` and `More`
- *     (`Message` is an <a>, not a button).
- *   - The invite anchor does not exist in the document until the overflow is
- *     opened. Measured on ganesh-sankararaman-425ba926:
- *         BEFORE More opened -> a[href*="custom-invite"] : 0 matches
- *         AFTER  More opened -> a[href*="custom-invite"] : 1 match
- *     So no page-wide "find the Connect control" tier can ever help here; the
- *     menu HAS to be opened first.
- *   - The overflow trigger is labelled "More" — never "More actions":
- *         page-wide ^More$        : 2 visible
- *         page-wide ^More actions$: 0
- *
- * The card-scoped `moreButton` tiers miss whenever the top-card scope resolves to
- * the wrong subtree, and the only page-scoped tier asked for `^More actions$`.
- * With every tier missing, `more` came back null and the driver returned the bare
- * `no_connect_button` seen in the jobs table — WITHOUT EVER OPENING THE MENU that
- * holds the Connect control.
- *
- * Fix: a page-wide `^More$` tier. This spec pins the whole recovered path against
- * the real markup: trigger -> dropdown container -> Connect item -> invite anchor.
- *
- * Real Chromium + `setContent` — no network, no LinkedIn traffic, no DB.
+ * Regression: the "More" menu path was unreachable. The top card shows only Follow
+ * and More (labelled "More", never "More actions"), and the invite anchor exists
+ * only after the menu opens. Pins the page-wide `^More$` tier and the path
+ * trigger → dropdown → Connect item → invite anchor.
+ * Real Chromium + setContent; no network.
  */
 import { chromium, type Browser, type Page } from 'playwright';
 import { SELECTORS, resolveFirst, type SelectorScope } from '../src/modules/drivers/linkedin-selectors';
@@ -36,11 +11,7 @@ import { SELECTORS, resolveFirst, type SelectorScope } from '../src/modules/driv
 const SLUG = 'ganesh-sankararaman-425ba926';
 const NAME = 'Ganesh Sankararaman';
 
-/**
- * The live shapes. `#top-card` deliberately does NOT contain the action bar —
- * that is the broken card scope the driver actually computes, and the reason the
- * card-scoped tiers return nothing.
- */
+/** Live shapes. `#top-card` lacks the action bar, like the broken card scope the driver computes. */
 const FIXTURE = `
 <main>
   <section id="top-card"><h1>${NAME}</h1></section>
@@ -108,8 +79,7 @@ describe('overflow ("More") path on the live LinkedIn DOM', () => {
     const item = await resolveFirst(menuScope, SELECTORS.connectMenuItem, 'connectMenuItem');
     expect(item).not.toBeNull();
 
-    // The driver reads this href to take the deep-link route, and guards on the
-    // vanityName matching the target — so it must be the anchor, not the label div.
+    // The driver takes the deep-link route from this href and guards on vanityName.
     const href = await item!.evaluate((el) =>
       el.tagName === 'A' ? el.getAttribute('href') : el.closest('a')?.getAttribute('href') || null,
     );

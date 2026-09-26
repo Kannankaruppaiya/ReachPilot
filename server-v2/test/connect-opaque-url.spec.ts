@@ -1,14 +1,7 @@
 /**
- * Regression: scraped leads carry LinkedIn's OBFUSCATED member-URN profile slug
- * ("/in/ACwAAC551Qg…") instead of a vanity slug. LinkedIn serves the profile but
- * canonicalises the URL to the real vanity, so the Connect anchor's `vanityName`
- * can never equal the pre-redirect URN — the target-identity guard in
- * `sendConnectRequest` then aborted every such invite with
- * `connect_target_mismatch` (observed live on batch ec752579: requested
- * /in/ACwAAC551QgBdRDGE0xFJY0tnumWHwGXroYHyBM, landed /in/ramcacpa, anchor
- * href=/preload/custom-invite/?vanityName=ramcacpa).
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: scraped URN slugs ("/in/ACwAAC551Qg…") never match the Connect
+ * anchor's vanityName, so the identity guard aborted every such invite. The
+ * target slug is re-read from the landed URL. Pure logic.
  */
 import { slugOf, isOpaqueSlug } from '../src/modules/drivers/playwright-linkedin.driver';
 

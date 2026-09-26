@@ -1,8 +1,4 @@
-/**
- * Reports LinkedIn accounts + secrets. IMPORTANT: linkedin_accounts and secrets
- * are FORCE-RLS, so they MUST be read under withWorkspace — a plain getDb() read
- * silently returns 0 rows. We enumerate workspaces (not RLS'd) and scan each.
- */
+/** LinkedIn accounts + secrets per workspace (both are RLS-scoped, so read under withWorkspace). */
 import { getDb } from '../src/db';
 import { withWorkspace } from '../src/db/rls';
 

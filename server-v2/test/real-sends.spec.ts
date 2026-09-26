@@ -1,16 +1,7 @@
 /**
- * Regression: "Today's invites 22 / 20" on an account whose daily cap is 20.
- *
- * OBSERVED LIVE (2026-08-28) — the pacing probe reported base(ramp)=20,
- * jittered=20, sentToday=22. Pacing had NOT overshot: two leads resolved as
- * `already_connected` / `pending`, which the worker parks in `status='sent'`
- * (terminal, never retried) with the outcome in `last_error` while explicitly
- * releasing the pacing slot, because no invite left the account.
- *
- * The dashboard counted those rows as invites, so the panel accused the engine
- * of breaking a limit it had actually obeyed.
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: "Today's invites 22 / 20". Skipped leads (already_connected /
+ * pending) are parked in `sent` with their slot released; the dashboard counted
+ * them as invites. Pure logic.
  */
 import { DummyDriver, Kysely, PostgresAdapter, PostgresIntrospector, PostgresQueryCompiler } from 'kysely';
 import { SKIP_OUTCOMES } from '../src/modules/drivers/linkedin-driver.interface';

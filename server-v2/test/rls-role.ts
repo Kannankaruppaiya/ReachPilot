@@ -1,17 +1,10 @@
 import { Client } from 'pg';
 
 /**
- * A connection string for a role that is SUBJECT to row-level security.
- *
- * The local test database is created with POSTGRES_USER=reachpilot, which the
- * postgres image makes a superuser — and a superuser bypasses RLS just like the
- * production `postgres` role (BYPASSRLS) does. Code that forgot `withWorkspace`
- * therefore passes every test while being broken for any role that RLS applies
- * to (docs/TENANT_ISOLATION.md). Suites that need to prove "works under RLS"
- * connect through this role instead.
- *
- * Idempotent. Needs a connection allowed to CREATE ROLE and GRANT (the local
- * superuser); throws otherwise so the caller can skip.
+ * Connection string for a role subject to RLS. The local test user is a superuser,
+ * which bypasses RLS like production's role, so suites that must prove "works
+ * under RLS" connect as this one. Idempotent; needs CREATE ROLE rights, throws
+ * otherwise so the caller can skip.
  */
 export const RLS_ROLE = 'rp_rls_probe';
 

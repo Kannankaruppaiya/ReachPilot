@@ -1,7 +1,6 @@
 /**
- * Throwaway end-to-end proof for the campaign sequence engine.
- * Mints a real JWT, creates + launches a campaign via the API, then reads the DB
- * to confirm steps compiled, leads enrolled, and the runner materialised a job.
+ * Throwaway campaign-engine check: create + launch a campaign via the API with a
+ * real JWT, then confirm steps, enrollments and the first job in the DB.
  */
 import 'dotenv/config';
 import { Client } from 'pg';
@@ -63,8 +62,7 @@ async function main() {
   console.log('STEPS', detail.steps?.length, detail.steps?.map((s: any) => `${s.kind}:${s.action || s.condition}@${s.delayHours}h`));
   console.log('ENROLLMENTS', detail.enrollments?.length, detail.enrollments?.map((e: any) => `${e.name}=${e.enrollmentStatus}`));
 
-  // 3. Give the runner a moment (worker ticks ~every 60s; poke the DB directly to
-  //    show what the engine produced without waiting a full minute).
+  // 3. Read the DB directly instead of waiting for the runner's next tick.
   console.log('waiting 12s for the campaign runner…');
   await new Promise((r) => setTimeout(r, 12000));
 

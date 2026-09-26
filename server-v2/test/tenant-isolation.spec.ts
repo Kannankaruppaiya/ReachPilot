@@ -1,26 +1,7 @@
 /**
- * Regression: tenant isolation was off in production and nothing noticed.
- *
- * MEASURED 2026-08-27 against the live database:
- *
- *   connected as : {"current_user":"postgres","bypassrls":true,"superuser":false}
- *   jobs / leads / campaigns / memberships : rls_enabled=true forced=true policies>=1
- *   withWorkspace(Kannan's)  guc + current_workspace_id() correct, jobs = 370
- *   withWorkspace(RJP's)     guc + current_workspace_id() correct, jobs = 370
- *   raw getDb() (no context)                                       jobs = 370
- *
- * Every signal the codebase relied on looked healthy — RLS enabled, FORCE set,
- * policies attached, the GUC arriving, the helper returning the right uuid — while
- * four different workspaces read each other's rows. The cause was the connecting
- * ROLE: `postgres` carries BYPASSRLS, and Postgres skips policies entirely for such
- * a role. FORCE ROW LEVEL SECURITY does NOT override that; it only stops a table's
- * owner from bypassing its own policies.
- *
- * So the check that matters is not "is RLS configured" but "does it bite for the
- * identity we connect with", and BYPASSRLS has to be judged before anything else —
- * otherwise a perfectly configured schema reports a false all-clear.
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: isolation was off in production though RLS looked healthy (enabled,
+ * forced, policies, GUC set). The connecting role had BYPASSRLS, which skips every
+ * policy (FORCE only stops table owners). So BYPASSRLS is judged first. Pure logic.
  */
 import { isolationVerdict, type IsolationFacts } from '../src/db/tenant-isolation';
 
@@ -40,7 +21,7 @@ describe('tenant isolation verdict', () => {
   });
 
   it('judges BYPASSRLS before table config, so a perfect schema cannot mask it', () => {
-    // The trap: every table check passes. Only role order saves us.
+    // Every table check passes here; only the role check catches it.
     const v = isolationVerdict({ role: 'postgres', bypassrls: true, tables: healthyTables });
     expect(v.reason).not.toMatch(/FORCE|no effective RLS/);
   });
@@ -65,10 +46,8 @@ describe('tenant isolation verdict', () => {
   });
 
   it('never reports isolated when it has observed nothing', () => {
-    // An empty table list must not read as "all clear" — that is how a probe that
-    // silently matched no tables would grant a false pass.
-    // Deliberately a role that would otherwise PASS — with bypassrls true the
-    // first branch would catch it and the guard below would go untested.
+    // An empty table list must not pass. Uses a role that would otherwise pass, so
+    // the bypassrls branch doesn't mask this guard.
     const v = isolationVerdict({ role: 'reachpilot_app', bypassrls: false, tables: [] });
     expect(v.isolated).toBe(false);
     expect(v.reason).toMatch(/unverified/);

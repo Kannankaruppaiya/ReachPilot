@@ -1,29 +1,11 @@
 /**
- * Auto Connect — the MAIN batch flow (100 profiles in one shot).
+ * Auto Connect batch flow: 100 profiles with a 20/day slot → 20 queued today and
+ * 80 scheduled over the next four days, and the scheduler really drains a later
+ * day (E4). Skips without Postgres + Redis.
  *
- * THE BEHAVIOUR UNDER TEST
- *   Upload 100 profiles at once, with an account whose daily slot is 20:
- *     • 20 go out TODAY   (status 'queued', pushed to BullMQ immediately)
- *     • the other 80 are spread over the FOLLOWING days, 20/day
- *       (status 'scheduled' — the scheduler tick drains them on their day)
- *   → 5 calendar days total, 20 per day, nothing lost and nothing bursting.
- *
- * WHY IT MATTERS
- *   Day-one is the only part that enqueues inline. Everything after day one
- *   depends on the scheduler tick, so a regression there silently strands 80
- *   invites as rows nobody ever runs. E4 below proves a later day's jobs really
- *   are picked up, rather than just asserting the rows exist.
- *
- * REQUIREMENTS: reachable Postgres + Redis. Suite SKIPS if unreachable.
- *
- * SAFETY — read before changing this file:
- *   • createBatch() and the scheduler both ENQUEUE to BullMQ for real. This
- *     suite therefore REFUSES TO RUN unless REDIS_URL points at localhost, so a
- *     stray run can never push invites onto the production queue that the live
- *     worker consumes. Do not weaken that guard.
- *   • No LinkedIn traffic occurs: nothing here runs a driver. We only assert on
- *     rows and queue state.
- *   • All rows live in one throwaway workspace, deleted in afterAll.
+ * Safety: createBatch() and the scheduler enqueue to BullMQ for real, so this
+ * suite refuses to run unless REDIS_URL is localhost. Do not weaken that guard.
+ * No driver runs; everything lives in one throwaway workspace.
  */
 import Redis from 'ioredis';
 import { JobsService } from '@/modules/jobs/jobs.service';
@@ -94,8 +76,7 @@ beforeAll(async () => {
     .onConflict((oc) => oc.column('id').doNothing())
     .execute();
 
-  // warmup_target 20 + connected 60 days ago ⇒ the ramp is long finished and
-  // computeWarmup().todayLimit is exactly 20 — the "20 slots today" premise.
+  // warmup_target 20, connected 60 days ago ⇒ todayLimit is exactly 20.
   await withWorkspace(WS, (db) =>
     db
       .insertInto('linkedin_accounts')
@@ -180,9 +161,7 @@ describe('Auto Connect — 100 profiles in one shot, 20/day drip', () => {
   });
 
   t('F2: the client-sent cap is IGNORED — the account warm-up limit wins', async () => {
-    // We passed cap=999 above. If the client cap were honoured, all 100 would
-    // have gone out today. Settings → LinkedIn limits must stay the only place
-    // the daily ceiling is controlled.
+    // cap=999 was passed; Settings → LinkedIn limits must stay the only daily ceiling.
     expect(created.today).toBe(PER_DAY);
     expect(created.today).not.toBe(TOTAL);
   });
@@ -243,19 +222,14 @@ describe('Auto Connect — 100 profiles in one shot, 20/day drip', () => {
     expect(times).toHaveLength(PER_DAY);
 
     const hourOf = (d: Date) => d.getUTCHours() + d.getUTCMinutes() / 60;
-    // The whole day's quota is RELEASED at the window open (09:00 here) rather
-    // than pinned to a slot grid across the window. The grid was written for a
-    // cloud executor; ours is the user's laptop, and a job pinned to 15:40 only
-    // sends if the laptop happens to be open at 15:40. Releasing the quota at the
-    // open lets pacing drain it whenever the machine is actually on — the user
-    // opens the laptop once, the queue empties, they close it again.
+    // The day's whole quota is released at the window open (09:00), not spread
+    // across a slot grid; pacing drains it whenever the laptop is on.
     for (const d of times) expect(hourOf(d)).toBe(9);
     expect(new Set(times.map((d) => d.getTime())).size).toBe(1);
   });
 
   t('F6: a LATER day\'s jobs are actually picked up by the scheduler when due', async () => {
-    // This is the heart of "the rest send automatically". Simulate day 2
-    // arriving by back-dating that day's 20 rows, then run one scheduler pass.
+    // Simulate day 2 arriving (back-date its rows), then run one scheduler pass.
     const rows = await allJobs();
     const targetDay = dayKey(new Date(Date.now() + 2 * 86400_000));
     const dayTwoIds = rows
@@ -271,14 +245,12 @@ describe('Auto Connect — 100 profiles in one shot, 20/day drip', () => {
         .execute(),
     );
 
-    // drainWorkspace, never tick() — tick() would drain EVERY workspace and
-    // could enqueue real invites for real accounts.
+    // drainWorkspace, never tick(): tick() drains every workspace.
     const res = await (scheduler as any).drainWorkspace(WS);
 
     expect(res.enqueued).toBe(PER_DAY);
 
-    // The scheduler claims each row (scheduled → queued) before enqueuing, so
-    // a restart or a concurrent tick cannot double-send them.
+    // The scheduler claims each row (scheduled → queued) before enqueuing.
     const after = await allJobs();
     const stillScheduledOnThatDay = after.filter(
       (r) => dayTwoIds.includes(r.id) && r.status === 'scheduled',
@@ -301,19 +273,9 @@ describe('Auto Connect — 100 profiles in one shot, 20/day drip', () => {
 });
 
 /**
- * createBatch() dedupe — already-invited profiles are dropped from a new
- * upload before any rows are queued.
- *
- * WHY IT MATTERS
- *   The dedupe reads prior SENT connect_request jobs and builds its
- *   exclusion set from BOTH payload fields (`target`, the URL we were given,
- *   and `resolvedSlug`, the vanity slug LinkedIn actually landed on — see
- *   profile-key.ts). A regression that drops the workspace_id predicate would
- *   leak another tenant's sent history into this one's exclusion set; a
- *   regression that breaks the "everything skipped" early return would fall
- *   through to crypto.randomUUID() and mint a batch for zero rows. This
- *   suite uses its own throwaway workspace/account so it never collides with
- *   the drip suite above.
+ * createBatch() drops already-invited profiles (matched on `target` and
+ * `resolvedSlug`) before queuing. Guards the workspace_id predicate and the
+ * "everything skipped" early return. Own workspace, separate from the drip suite.
  */
 const WS2 = '00000000-0000-0000-0000-0000000000f3';
 const ACCT2 = '00000000-0000-0000-0000-0000000000f4';
@@ -341,11 +303,8 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
   beforeAll(async () => {
     try {
       assertLocalServices(getEnv());
-      // G1/G3 both produce a "today: 1" job, which createBatch pushes onto
-      // BullMQ for real (new Redis(...) with maxRetriesPerRequest: null does
-      // NOT fail fast). Without this check, Postgres-up-but-Redis-down would
-      // hang this suite against an unreachable queue instead of skipping —
-      // mirrors the F-suite's reachability check above.
+      // createBatch enqueues for real and the Redis client doesn't fail fast, so skip
+      // when Redis is down instead of hanging.
       redis2 = new Redis(getEnv().REDIS_URL, {
         maxRetriesPerRequest: 1,
         lazyConnect: true,
@@ -371,10 +330,8 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
       .onConflict((oc) => oc.column('id').doNothing())
       .execute();
 
-    // warmup_target well above the 3 rows this suite sends, so nothing spills
-    // into a second day and every kept row is "today" — keeps assertions simple.
-    // 45 is the ceiling: linkedin_accounts CHECKs warmup_daily_limit BETWEEN 1
-    // AND 45 (migration 0001), and a higher value aborts this whole beforeAll.
+    // Target well above this suite's 3 rows so everything is "today". 45 is the
+    // CHECK ceiling on warmup_daily_limit (migration 0001).
     await withWorkspace(WS2, (db) =>
       db
         .insertInto('linkedin_accounts')
@@ -420,10 +377,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
         .execute()
         .catch(() => undefined);
 
-      // G1 and G3 each queue a day-one job, which createBatch pushes onto the
-      // LOCAL BullMQ queue for real. Drop it, exactly as the F-suite above does
-      // — otherwise this suite leaves orphaned jobs on the developer's queue
-      // pointing at workspace rows it has just deleted.
+      // Drop the day-one jobs this suite pushed onto the local queue.
       await redis2?.del('bull:linkedin-actions:meta').catch(() => undefined);
       const keys2 = await redis2?.keys('bull:linkedin-actions:*').catch(() => []);
       if (keys2?.length) await redis2.del(...keys2).catch(() => undefined);
@@ -432,8 +386,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
   }, 60_000);
 
   t2('G1: a row matching a SENT job by target URL is excluded, and skipped counts it', async () => {
-    // Pre-seed a sent connect_request whose payload.target is the profile the
-    // new upload will also carry.
+    // A sent connect_request for the profile the new upload also carries.
     await withWorkspace(WS2, (db) =>
       db
         .insertInto('jobs')
@@ -481,10 +434,8 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
   });
 
   t2('G2: a row matching a SENT job only by resolvedSlug is also excluded', async () => {
-    // The sent job's payload.target was an obfuscated URN; LinkedIn resolved it
-    // to a readable slug at send time, recorded as payload.resolvedSlug. A later
-    // upload carrying that readable URL must still be recognised as the same
-    // person (this is exactly what Task 4's resolvedSlug field exists for).
+    // The sent job targeted a URN that resolved to a readable slug; an upload with
+    // that readable URL must match the same person.
     await withWorkspace(WS2, (db) =>
       db
         .insertInto('jobs')
@@ -498,9 +449,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
           payload: JSON.stringify({
             name: 'Resolved Slug Person',
             target: 'https://www.linkedin.com/in/ACwAADY3-obfuscated-urn/',
-            // Bare slug, not a URL — this is the actual shape the driver writes
-            // (see playwright-linkedin.driver.ts's slugOf/vanityNameOf, both of
-            // which return a bare slug like 'resolved-slug-person', never a URL).
+            // A bare slug, the shape the driver writes.
             resolvedSlug: 'resolved-slug-person',
           }),
         } as any)
@@ -543,8 +492,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
       { name: 'Cross Tenant Prospect', target: 'https://www.linkedin.com/in/cross-tenant-prospect/' },
     ];
 
-    // Same URL was marked SENT in OTHER_WS, but this call runs as WS2 — a
-    // dropped workspace_id predicate would incorrectly exclude it here.
+    // Sent in OTHER_WS only; a dropped workspace_id predicate would exclude it here.
     const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
       noNote: true,
     });
@@ -573,20 +521,15 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
 
     const rows = [{ name: 'All Skipped', target }];
 
-    // Count WS2's rows immediately before the call. G1 and G3 each left a KEPT
-    // job behind in this same workspace (status 'queued' — nothing runs a worker
-    // here to advance them), so an absolute "no non-sent rows exist" assertion
-    // would be order-dependent and fail. A delta is the honest assertion: if the
-    // early return were removed, createBatch would insert a job for this row and
-    // the count would go up by one.
+    // Earlier tests left kept jobs in WS2, so assert a delta: without the early
+    // return, this call would insert one row.
     const countRows = () =>
       withWorkspace(WS2, (db) =>
         db.selectFrom('jobs').select(['id']).where('workspace_id', '=', WS2).execute(),
       );
     const before = (await countRows()).length;
 
-    // If the early return were broken and fell through to the empty-input
-    // guard, this would throw BadRequestException instead of resolving.
+    // A broken early return would hit the empty-input guard and throw.
     const result = await jobs2.createBatch(WS2, 'linkedin', 999, rows, 'Hi {{firstName}}', undefined, {
       noNote: true,
     });
@@ -596,8 +539,7 @@ describe('createBatch — already-invited profiles are excluded from a new uploa
     // No batch id means no rows were inserted at all: WS2's job count is unchanged…
     expect((await countRows()).length).toBe(before);
 
-    // …and specifically, THIS upload's target has no unsent job of its own — the
-    // only job carrying it is the pre-seeded 'sent' one.
+    // …and this upload's target has no job besides the pre-seeded sent one.
     const forThisTarget = await withWorkspace(WS2, (db) =>
       db
         .selectFrom('jobs')

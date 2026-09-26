@@ -1,14 +1,9 @@
 /**
- * Local finance-lead pull → Excel.
+ * Scrape finance decision-makers (default: Tamil Nadu) from public SERPs into an
+ * .xlsx. No DB, Redis or worker needed.
  *
- * Runs the free local scraper (public SERPs only — never linkedin.com directly)
- * for finance decision-makers in Tamil Nadu, India, sweeps pages with the cursor
- * until the target count is reached, and writes an .xlsx you can open in Excel.
- *
- *   npm run export:finance            # 100 leads, Tamil Nadu
+ *   npm run export:finance
  *   TARGET=50 LOCATION="Chennai" npm run export:finance
- *
- * No DB / Redis / worker needed — this only touches the scraper + Gemini extract.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -49,9 +44,7 @@ async function main() {
   console.log(`▶ location : ${LOCATION}, India`);
   console.log(`▶ target   : ${TARGET} unique profiles\n`);
 
-  // Cursor sweep: each round advances the SERP page window so a rerun sees NEW
-  // results instead of re-reading page 1. Stop on target, page exhaustion, or
-  // two consecutive empty rounds (every engine blocked / results ran out).
+  // Advance the page window each round; stop on target, exhaustion, or two empty rounds.
   let startPage = 0;
   let emptyRounds = 0;
   for (let round = 1; round <= 12 && bySlug.size < TARGET && emptyRounds < 2; round++) {

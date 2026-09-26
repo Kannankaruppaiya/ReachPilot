@@ -1,9 +1,8 @@
 /**
- * Multi-engine STRESS test (throwaway) — run several searches back-to-back in ONE
- * process so the per-engine block cooldown PERSISTS across runs (exactly how the
- * long-lived worker behaves). Proves: repeated runs don't kill the scraper, a
- * blocked engine gets skipped on later runs, and different queries still produce
- * diverse leads. Run:  npm run test:multi:runs
+ * Throwaway stress test: several searches in one process, so engine cooldowns
+ * persist across runs like in the worker.
+ *
+ *   npm run test:multi:runs
  */
 process.env.SCRAPER_ENGINE = 'multi';
 

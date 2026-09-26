@@ -1,12 +1,9 @@
 /**
- * Every 2FA seed ever stored for the greatworks workspace, oldest first, with the
- * code each one produces RIGHT NOW. Compare against what LinkedIn accepts (or
- * what your authenticator app shows) to find which enrolment is still live.
+ * Every stored 2FA seed for the greatworks workspace with its current code, to
+ * find which enrolment LinkedIn still accepts. --seed also prints the secrets
+ * (clear the terminal afterwards).
  *
- *   npx ts-node -r tsconfig-paths/register scripts/_totp-all.ts
- *   npx ts-node -r tsconfig-paths/register scripts/_totp-all.ts --seed   (also prints the secrets)
- *
- * Codes are short-lived; seeds are not. Clear the terminal after using --seed.
+ *   npx ts-node -r tsconfig-paths/register scripts/_totp-all.ts [--seed]
  */
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../src/app.module';

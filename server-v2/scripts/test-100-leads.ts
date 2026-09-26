@@ -1,6 +1,7 @@
 /**
- * Volume test (throwaway) — can one run pull ~100 leads? Requests 100 (→ 10 pages)
- * and reports valid + unique yield. Run:  SCRAPER_ENGINE=crawlee npm run test:100
+ * Throwaway volume test: request 100 leads and report the valid, unique yield.
+ *
+ *   SCRAPER_ENGINE=crawlee npm run test:100
  */
 process.env.SCRAPER_ENGINE = 'crawlee';
 

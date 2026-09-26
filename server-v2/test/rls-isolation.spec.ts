@@ -4,11 +4,8 @@ import { assertLocalServices } from './local-only';
 import { rlsRoleUrl } from './rls-role';
 
 /**
- * RLS policies hide one workspace's rows from another.
- *
- * Runs as `rp_rls_probe` (see rls-role.ts): the local test user is a superuser,
- * and a superuser bypasses RLS entirely — this test then failed on every correct
- * schema, because it was measuring the connecting role rather than the policies.
+ * RLS policies hide one workspace's rows from another. Runs as `rp_rls_probe`
+ * (rls-role.ts): the local superuser would bypass RLS and test nothing.
  */
 let getDb: () => Kysely<any>;
 let withWorkspace: <T>(ws: string, fn: (db: Kysely<any>) => Promise<T>) => Promise<T>;
@@ -31,7 +28,7 @@ describe('Row Level Security (RLS) Tenant Isolation', () => {
     ({ getDb } = require('@/db'));
     ({ withWorkspace } = require('@/db/rls'));
 
-    // Workspaces table has no RLS — insert directly
+    // workspaces has no RLS.
     const db = getDb();
     await db
       .insertInto('workspaces')
@@ -66,7 +63,6 @@ describe('Row Level Security (RLS) Tenant Isolation', () => {
     }
     const leadId = crypto.randomUUID();
 
-    // Insert lead under Workspace A (must set RLS context)
     await withWorkspace(wsA, async (trx) => {
       await trx
         .insertInto('leads')
@@ -108,7 +104,6 @@ describe('Row Level Security (RLS) Tenant Isolation', () => {
 
     expect(leadB).toBeUndefined();
 
-    // Cleanup (under workspace A context)
     await withWorkspace(wsA, async (trx) => {
       await trx.deleteFrom('leads').where('id', '=', leadId).execute();
     });

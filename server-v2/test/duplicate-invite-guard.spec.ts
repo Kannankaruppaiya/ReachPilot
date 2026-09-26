@@ -1,27 +1,8 @@
 /**
- * Regression: the duplicate-invite guard had never fired, for any job.
- *
- * OBSERVED LIVE (2026-08-27). Dinesh M held three connect jobs on ONE target:
- *
- *   10:01  failed   no_connect_button
- *   14:08  sent                        <-- invite delivered, he ACCEPTED it
- *   14:42  failed   no_connect_button  <-- ran anyway, against a lead already won
- *
- * The scheduler is supposed to cancel a second `connect_request` to someone we
- * already invited. It looked the lead up by id:
- *
- *   .where('lead_id', '=', job.lead_id!)
- *
- * ...nested inside `if (job.lead_id)`. Every connect job carries `lead_id` NULL —
- * measured on live data, 366 of 366 — so the enclosing block was skipped and the
- * guard never ran once. Silently: no error, no log, just no protection. Duplicate
- * invites annoy prospects and burn the weekly invite quota.
- *
- * The identity that IS always present is the profile itself, in the payload. It
- * arrives in two forms — the obfuscated member URN a scrape produced, and the
- * vanity slug LinkedIn redirected a send to — so both are indexed.
- *
- * Pure logic — no DB, no Redis, no browser.
+ * Regression: the duplicate-invite guard never fired. It looked leads up by
+ * `lead_id`, which is NULL on every connect job. The guard now keys on the
+ * profile in the payload: both the uploaded target (often a URN) and the vanity
+ * slug LinkedIn resolved it to. Pure logic.
  */
 import { invitedProfileKeys, profileKey } from '../src/modules/jobs/profile-key';
 
@@ -35,8 +16,7 @@ describe('duplicate-invite guard keys', () => {
   });
 
   it('a lead_id-keyed guard could never have matched', () => {
-    // What the shipped code compared, reproduced: SQL `lead_id = NULL` is never
-    // true, so no amount of history would have produced a hit.
+    // The old comparison: SQL `lead_id = NULL` is never true.
     const jobLeadId: string | null = null;
     const sentLeadId: string | null = null;
     // eslint-disable-next-line eqeqeq
@@ -44,8 +24,7 @@ describe('duplicate-invite guard keys', () => {
   });
 
   it('matches a later job that carries the vanity slug of a URN-addressed send', () => {
-    // The send resolved the URN to a vanity and recorded it; a re-upload of the
-    // same person as a readable URL must still be recognised as already invited.
+    // A re-upload of the same person as a readable URL must still match.
     const invited = invitedProfileKeys([{ target: URN, resolvedSlug: 'dinesh-m-84686222' }]);
     expect(invited.has(profileKey(VANITY)!)).toBe(true);
     expect(invited.has(profileKey(URN)!)).toBe(true);

@@ -1,39 +1,10 @@
 /**
- * Regression: `no_connect_button` on a profile whose Connect control is right there.
- *
- * OBSERVED LIVE (2026-08-27, account 508cd4a6 / greatworksramesh, four leads in one
- * batch — Dinesh M, Ganesh Sankararaman, Achuthan Thiru, Aparna Gopalakrishnan —
- * all recorded `last_error = 'no_connect_button'` with no sub-reason).
- *
- * The DOM was read out of the operator's own signed-in browser on
- * linkedin.com/in/dinesh-m-84686222. LinkedIn renders Connect like this:
- *
- *   <a role="menuitem" aria-label=""                      <-- own label EMPTY
- *      href="/preload/custom-invite/?vanityName=dinesh-m-84686222">
- *     <div aria-label="Invite Dinesh M to connect">       <-- label here, NO role
- *       Connect
- *     </div>
- *   </a>
- *
- * The driver looked for it with
- *   getByRole('button', { name: /^invite <name> to connect$/i })
- *     .or(getByRole('link',   { name: ... }))
- * and that can NEVER resolve this control:
- *   - the <div> carries the matching accessible name but has no role at all, so
- *     it is neither a `button` nor a `link`;
- *   - the <a> has an explicit role="menuitem", which overrides the implicit
- *     `link` role, and its own aria-label is empty.
- *
- * So the miss is about ROLE and WHERE THE LABEL LIVES — not about the control
- * being hidden behind "More". The same markup on a top card fails identically,
- * which is what the operator reported ("direct-ah irundhaalum fire aagudhu").
- *
- * The fix matches the invite ANCHOR by its href, whose `vanityName` is the same
- * identity guard the deep-link path already applies — so it is role-independent
- * AND strictly target-scoped: the "People also viewed" rail carries its own
- * custom-invite anchors and must never be resolved.
- *
- * Real Chromium + `setContent` — no network, no LinkedIn traffic, no DB.
+ * Regression: `no_connect_button` while Connect was on screen. LinkedIn renders it
+ * as <a role="menuitem" aria-label=""> around a role-less
+ * <div aria-label="Invite <Name> to connect">, which a role + name lookup can never
+ * resolve. `connectControl` also matches the invite anchor by its `vanityName`
+ * href, so it stays target-scoped (rail anchors must never match).
+ * Real Chromium + setContent; no network.
  */
 import { chromium, type Browser, type Page } from 'playwright';
 import { connectControl } from '../src/modules/drivers/playwright-linkedin.driver';
@@ -91,8 +62,7 @@ describe('Connect control resolution on the live LinkedIn DOM', () => {
   });
 
   it('the shipped role-based matcher cannot see this Connect at all', async () => {
-    // Not an aspiration — this is the production failure, pinned. The target's
-    // own Connect is on the page and visible, and the matcher still finds zero.
+    // The production failure, pinned: Connect is visible and the old matcher finds zero.
     await expect(page.locator('[aria-label="Invite Dinesh M to connect"]').isVisible()).resolves.toBe(true);
     await expect(roleOnlyMatcher(page).count()).resolves.toBe(0);
   });

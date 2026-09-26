@@ -1,21 +1,8 @@
 /**
- * LinkedIn connect_request — PACING gates (group D).
- *
- * Covers only what is specific to sending a connection request: invite
- * accounting, inter-action spacing, and the daily/weekly caps. The note itself
- * is irrelevant here — pacing runs BEFORE the driver is ever called, so a
- * note-less connect is paced exactly like any other invite. That is precisely
- * what these tests pin down: turning the note off must not buy extra quota.
- *
- * REQUIREMENTS: a reachable Redis (pacing counters) and Postgres (account
- * settings). If either is unavailable the whole suite SKIPS with a message
- * rather than failing — so `npm test` stays green on a machine without them.
- *
- *   Redis:  docker compose up -d redis
- *
- * SAFETY: everything is scoped to one throwaway workspace + LinkedIn account
- * created by this file and deleted in afterAll. No real account's counters are
- * touched, no queue is created, and no LinkedIn traffic occurs.
+ * connect_request pacing (group D): invite accounting, inter-action spacing, and
+ * the daily/weekly caps. Pacing runs before the driver, so turning the note off
+ * must not buy extra quota. Skips without Redis + Postgres (see CLAUDE.md for
+ * local services). One throwaway workspace and account; no LinkedIn traffic.
  */
 import Redis from 'ioredis';
 import { PacingService } from '@/modules/engine/pacing.service';
@@ -60,9 +47,7 @@ beforeAll(async () => {
     return;
   }
 
-  // --- Step 2: seeding. Deliberately NOT wrapped in try/catch: if the infra is
-  // up but the fixture is wrong (bad enum, check constraint, schema drift) the
-  // suite must FAIL loudly rather than quietly report green while skipping. ---
+  // --- Step 2: seeding. Not caught: a broken fixture must fail, not skip. ---
 
   // Workspaces is NOT RLS'd — insert directly.
   await getDb()
@@ -71,8 +56,8 @@ beforeAll(async () => {
     .onConflict((oc) => oc.column('id').doNothing())
     .execute();
 
-  // A predictable account: wide-open hours + weekends, so ONLY the gate under
-  // test can block. warmup_daily_limit is capped at 45 by a CHECK constraint.
+  // Wide-open hours + weekends so only the gate under test can block.
+  // warmup_daily_limit has a CHECK ceiling of 45.
   await withWorkspace(WS, (db) =>
     db
       .insertInto('linkedin_accounts')
@@ -89,8 +74,7 @@ beforeAll(async () => {
         hours_end: '23:59',
         send_weekends: true,
         timezone: 'UTC',
-        // Backdated so the warm-up ramp is already at full target and cannot
-        // itself be the thing that blocks a send.
+        // Backdated so the warm-up ramp can't be what blocks.
         connected_at: new Date(Date.now() - 120 * 86400_000).toISOString(),
       } as any)
       .onConflict((oc) => oc.column('id').doNothing())
@@ -152,8 +136,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
 
     expect(deferred.allowed).toBe(false);
     const gapMin = (new Date(deferred.nextScheduledAt!).getTime() - before) / 60_000;
-    // Lower bound uses `before` (captured pre-send) so clock/RTT slop can only
-    // shrink the measured gap, never inflate it past the upper bound.
+    // `before` was captured pre-send, so timing slop can only shrink the gap.
     expect(gapMin).toBeGreaterThanOrEqual(1.4);
     expect(gapMin).toBeLessThanOrEqual(20.1);
   });
@@ -166,9 +149,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
     await pacing.checkPacingAndRegister(ACCT, 'linkedin', WS, true); // deferred by spacing
     const countAfterDefer = Number(await redis.get(dailyAfterFirst[0]));
 
-    // The spacing check runs BEFORE the daily counter, so a blocked send must
-    // leave the day's quota untouched — otherwise deferrals would silently eat
-    // the daily allowance.
+    // Spacing is checked before the daily counter, so a deferred send uses no quota.
     expect(countAfterDefer).toBe(countAfterFirst);
   });
 
@@ -177,8 +158,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
     const afterInvite = Number((await redis.get(`${KEY_PREFIX}:weekly`)) || 0);
     expect(afterInvite).toBe(1);
 
-    // A non-invite action (follow / visit_profile) is paced by the daily counter
-    // only — it must not eat into the ~100/week invite cap.
+    // Non-invite actions use the daily counter only, not the weekly invite cap.
     await redis.del(`${KEY_PREFIX}:nextallowed`); // bypass spacing to isolate the weekly counter
     await pacing.checkPacingAndRegister(ACCT, 'linkedin', WS, false); // isInvite=false
     const afterFollow = Number((await redis.get(`${KEY_PREFIX}:weekly`)) || 0);
@@ -192,8 +172,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
     const dailyBefore = Number(await redis.get(dailyKeys[0]));
     const weeklyBefore = Number(await redis.get(`${KEY_PREFIX}:weekly`));
 
-    // The worker calls release() when a job defers or fails after registering,
-    // so a retry doesn't double-count against the caps.
+    // release() runs when a job defers or fails, so a retry isn't double-counted.
     await pacing.release(ACCT, 'linkedin', WS, true);
 
     expect(Number(await redis.get(dailyKeys[0]))).toBe(dailyBefore - 1);
@@ -217,16 +196,12 @@ describe('Connect request — pacing gates (no-note connects are paced identical
     const a = await pacing.checkPacingAndRegister(ACCT, 'linkedin', WS, true);
     const b = await pacing.checkPacingAndRegister(ACCT, 'linkedin', WS, true);
 
-    // Same account + same day ⇒ same computed gap, so repeated pacing checks
-    // agree instead of drifting the target time on every retry.
+    // Same account + day ⇒ same gap, so re-checks don't drift.
     expect(a.nextScheduledAt).toBe(b.nextScheduledAt);
   });
   /**
-   * Drive N successful actions back-to-back, returning the gap (in minutes) the
-   * pacer chose after each one. Only the spacing stamp is cleared between calls
-   * so the DAILY COUNTER keeps advancing — that counter is the action sequence the
-   * gap is rolled from, so clearing it too would hand every sample an identical
-   * seed and hide the very variation these tests exist to prove.
+   * Run N actions back to back and return each chosen gap (minutes). Only the
+   * spacing key is cleared; the daily counter is the roll's seed and must advance.
    */
   async function sampleGaps(n: number): Promise<number[]> {
     const gaps: number[] = [];
@@ -244,8 +219,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
   t('D9: the gap is re-rolled per action, not fixed for the whole day', async () => {
     const gaps = await sampleGaps(40);
 
-    // A gap that is constant all day is itself a fingerprint: every action on the
-    // account lands on the same metronome. Real sessions vary action to action.
+    // A gap that's constant all day is itself a fingerprint.
     expect(new Set(gaps.map((g) => g.toFixed(2))).size).toBeGreaterThan(5);
   }, 30_000);
 
@@ -261,9 +235,7 @@ describe('Connect request — pacing gates (no-note connects are paced identical
   t('D11: the rhythm mixes quick follow-ups with occasional long pauses', async () => {
     const gaps = await sampleGaps(40);
 
-    // The point of the re-roll: a human sometimes fires twice in under two
-    // minutes, then steps away for a quarter of an hour. The old per-day gap
-    // could produce neither — it pinned every action to one value in 3–6 min.
+    // Humans sometimes act twice within two minutes, then step away for longer.
     expect(Math.min(...gaps)).toBeLessThan(3);
     expect(Math.max(...gaps)).toBeGreaterThan(7);
   }, 30_000);

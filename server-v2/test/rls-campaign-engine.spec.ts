@@ -1,17 +1,8 @@
 /**
- * Tenant-scoped code must work for a role that RLS actually applies to.
- *
- * Production connects as a BYPASSRLS role (docs/TENANT_ISOLATION.md), so code
- * that reads tenant tables through raw getDb() "works" there — and silently
- * breaks the day the app moves to a role subject to RLS. Measured before this
- * fix: under such a role the campaign runner found 0 due enrollments where the
- * bypassing role found 1, so every campaign would have stopped with no error.
- *
- * Every case here runs as `rp_rls_probe` (NOSUPERUSER NOBYPASSRLS), so a raw
- * read of an RLS'd table returns nothing and the assertion fails.
- *
- * REQUIREMENTS: local Postgres + Redis whose user may CREATE ROLE (the local
- * superuser). SKIPS otherwise — never runs against a shared database.
+ * Tenant code must work under a role RLS applies to. Runs as `rp_rls_probe`
+ * (NOSUPERUSER NOBYPASSRLS), so a raw getDb() read of a tenant table returns
+ * nothing and fails the test. Needs local Postgres + Redis whose user may CREATE
+ * ROLE; skips otherwise.
  */
 import type { Kysely } from 'kysely';
 import { randomUUID } from 'crypto';
@@ -25,8 +16,7 @@ const USER = '00000000-0000-0000-0000-0000000000f3';
 let reachable = false;
 let skipReason = '';
 
-// Loaded only AFTER DATABASE_URL points at the RLS-bound role: getEnv() and
-// getDb() both cache the first URL they see.
+// Load after DATABASE_URL points at the probe role: getEnv() and getDb() cache.
 let getDb: () => Kysely<any>;
 let withWorkspace: <T>(ws: string, fn: (db: Kysely<any>) => Promise<T>) => Promise<T>;
 let CampaignsService: any;

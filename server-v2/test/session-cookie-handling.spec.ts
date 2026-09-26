@@ -1,23 +1,9 @@
 /**
- * The session-cookie policy, unit-tested without a browser.
- *
- * These three rules were all learned from one live incident (2026-08-26), where a
- * LinkedIn account was signed out server-side and the automation made it strictly
- * worse instead of noticing:
- *
- *  1. The driver injected the DB's copy of `li_at` over the persistent profile's
- *     own cookie on EVERY action. Observed live: the profile's cookie and the DB
- *     cookie were different (sha efb01d35f59f vs 21c3b1be62ac), and the injection
- *     replaced the profile's with the stale one — so a user who signed in by hand
- *     had their good session destroyed by the very next job.
- *  2. Only `li_at` was ever stored. A LinkedIn session is a SET of cookies
- *     (JSESSIONID, bcookie, bscookie, liap, lidc …); `li_at` alone could not even
- *     load /feed/ (ERR_TOO_MANY_REDIRECTS), so the stored "session" was never
- *     restorable on its own.
- *  3. The login flow typed a TOTP code into ANY pin field it found, without
- *     checking whether LinkedIn had asked for the authenticator code or for one
- *     emailed/SMSed to the member. A wrong code is a failed login attempt, which
- *     is precisely the signal that gets an account challenged harder.
+ * Session-cookie policy, without a browser:
+ *  1. Never inject the vault's cookie over a signed-in profile's own.
+ *  2. Store the whole jar; `li_at` alone can't restore a session.
+ *  3. Type a TOTP code only into the authenticator challenge; a wrong PIN is a
+ *     failed login.
  */
 import {
   parseStoredSession,
@@ -53,9 +39,7 @@ describe('stored session — the whole jar, not just li_at', () => {
   });
 
   it('BACK-COMPAT: reads an account stored under the old bare-li_at format', () => {
-    // Every account connected before this change has a plain cookie string in
-    // the vault. Those must keep working — a migration that signs everyone out
-    // would be a worse outage than the bug being fixed.
+    // Accounts stored before the jar hold a plain string; they must keep working.
     const restored = parseStoredSession('OLD_FORMAT_LI_AT');
 
     expect(restored).toEqual([
@@ -76,8 +60,7 @@ describe('stored session — the whole jar, not just li_at', () => {
 
 describe('cookie injection — the persistent profile owns the session', () => {
   it('THE BUG: never overwrites a profile that is already signed in', () => {
-    // The profile has a live li_at; the vault holds an older one. Injecting the
-    // vault copy here is what destroyed a hand-made login on the next job.
+    // The profile has a live li_at and the vault an older one: inject nothing.
     const stored: StoredCookie[] = [
       { name: 'li_at', value: 'STALE_FROM_DB', domain: LI_AT_DOMAIN, path: '/' },
     ];
@@ -86,8 +69,7 @@ describe('cookie injection — the persistent profile owns the session', () => {
   });
 
   it('seeds a fresh profile from the stored jar', () => {
-    // First run on a new machine (or after %TEMP% was cleared): the profile has
-    // no LinkedIn session, so the stored one is all we have.
+    // A fresh profile (new machine, or %TEMP% cleared): the stored jar is all we have.
     expect(cookiesToInject([], liveJar)).toEqual(liveJar);
   });
 
@@ -134,17 +116,13 @@ describe('PIN challenge — answer only the challenge we can actually answer', (
   });
 
   it('does not guess when the challenge text is unfamiliar', () => {
-    // LinkedIn rewords these pages often. An unrecognised wording must not be
-    // assumed to be the authenticator — typing a TOTP code into an email
-    // challenge is a FAILED login attempt, the exact signal that gets an
-    // account challenged harder.
+    // Unrecognised wording must not be taken for the authenticator challenge.
     expect(classifyPinChallenge('Quick security check')).toBe('unknown');
     expect(classifyPinChallenge('')).toBe('unknown');
   });
 
   it('reads an email challenge even when the page also names the app', () => {
-    // The email page often links "use your authenticator app instead". The code
-    // being ASKED for is still the emailed one.
+    // The email page may link "use your authenticator app instead"; it still wants the emailed code.
     expect(
       classifyPinChallenge(
         "We've sent a verification code to your email. Use your authenticator app instead",

@@ -1,13 +1,7 @@
 /**
- * A reply must end the sequence — including the follow-up already scheduled.
- *
- * Reply detection set the enrollment to 'replied', but the executor creates each
- * step's job as soon as the previous one sends, so the next follow-up was already
- * 'scheduled' days ahead. The scheduler sent it, and the worker's post-send
- * advanceEnrollment set the enrollment back to 'active': the prospect answered
- * and still received "just following up", then the rest of the sequence.
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise. No job is ever enqueued.
+ * A reply must end the sequence, including the follow-up already scheduled days
+ * ahead, and a mid-flight send must not reactivate it. Skips without local
+ * Postgres; nothing is enqueued.
  */
 import { randomUUID } from 'crypto';
 import { getDb } from '@/db';

@@ -1,13 +1,7 @@
 /**
- * FULL DATA RESET — wipes all users, sessions, workspaces and tenant data so you
- * can sign up from scratch. Preserves system-seed tables only: plans, proxies,
- * migrations_log.
- *
- * RLS-safe: tenant tables are FORCE-RLS, so they're deleted per-workspace under
- * withWorkspace; non-tenant tables are deleted globally. FK ordering is handled
- * by repeating passes until nothing is left (each pass frees the next layer).
- *
- * Guarded: refuses to run without --yes.
+ * FULL DATA RESET: deletes all users, sessions, workspaces and tenant data. Keeps
+ * plans, proxies and migrations_log. Tenant tables are deleted per workspace under
+ * withWorkspace; repeated passes resolve FK order. Refuses to run without --yes.
  *
  *   npx ts-node -r tsconfig-paths/register scripts/reset-db.ts --yes
  */

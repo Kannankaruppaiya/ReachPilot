@@ -1,18 +1,7 @@
 /**
- * When may we (re-)log an account into LinkedIn?
- *
- * Learned live on 2026-08-26. An account was signed out server-side, so its
- * stored cookie was dead. The user pressed "Update LinkedIn login" three times
- * (16:00, 16:48, 17:04); each press stored a fresh password + TOTP seed and the
- * UI cheerfully said "reconnecting your account…" — but `enqueueLogin` bailed out
- * every time on "this account already has a session", so no login was ever
- * enqueued and `last_sync_at` stayed on 2026-07-21. A dead cookie made itself
- * unreplaceable: the only state that could fix the account was the one thing the
- * guard refused to let us change.
- *
- * The guard itself is right — repeated automated logins are the top ban trigger.
- * What it lacked was the distinction between "something asked for a login" and
- * "the human just re-entered their credentials on purpose".
+ * When may an account be logged in again? A stored session blocks automatic
+ * logins (the top ban trigger), but a user re-entering credentials must get
+ * one, or a dead cookie makes the account unrecoverable.
  */
 import { decideLogin } from '@/modules/accounts/login-policy';
 
@@ -39,8 +28,7 @@ describe('login enqueue policy', () => {
   });
 
   it('THE BUG: and drops the stored session, so the dead cookie cannot block again', () => {
-    // Without this the account is stuck forever: the stale cookie blocks the
-    // login that would replace it, and nothing else can clear it.
+    // Otherwise the stale cookie blocks the login that would replace it, forever.
     const d = decideLogin({ hasSession: true, forced: true, cooldownActive: false });
 
     expect(d.clearStoredSession).toBe(true);
@@ -61,8 +49,7 @@ describe('login enqueue policy', () => {
   });
 
   it('respects the cooldown even when forced — a double-click is not two logins', () => {
-    // Forcing bypasses the SESSION guard, never the rate limit. The user pressed
-    // the button three times in an hour; that must stay one login attempt.
+    // Forcing bypasses the session guard, never the rate limit: three presses, one login.
     const d = decideLogin({ hasSession: true, forced: true, cooldownActive: true });
 
     expect(d.enqueue).toBe(false);
@@ -77,9 +64,7 @@ describe('login enqueue policy', () => {
   });
 
   it('cools a forced login down for minutes, not the unforced six hours', () => {
-    // 6h is right for automatic retries. For a human who just fixed their
-    // password it is a lockout: one failed attempt and they cannot try again
-    // today. Long enough to swallow a double-click, short enough to retry.
+    // 6h suits automatic retries; after a manual fix it would be a lockout.
     const forced = decideLogin({ hasSession: false, forced: true, cooldownActive: false });
     const auto = decideLogin({ hasSession: false, forced: false, cooldownActive: false });
 

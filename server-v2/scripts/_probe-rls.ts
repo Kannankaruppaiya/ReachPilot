@@ -1,17 +1,6 @@
 /**
- * Read-only: why does `withWorkspace` not isolate?
- *
- * Observed 2026-08-27: four different workspaces each report an identical
- * `unlinked=366 sent=205` for connect jobs — i.e. every workspace scan returns the
- * same rows. Four causes produce that symptom and they need different fixes, so
- * measure which one it is instead of assuming:
- *
- *   1. the connecting role has BYPASSRLS       -> policies are skipped entirely
- *   2. the role owns the table + no FORCE RLS  -> owner bypasses its own policies
- *   3. RLS not enabled / no policy on the table
- *   4. the GUC never arrives (pooling, SET LOCAL outside a transaction)
- *
- * Writes nothing.
+ * Read-only: why doesn't `withWorkspace` isolate? Checks BYPASSRLS, table owner
+ * without FORCE, RLS/policies missing, and whether the GUC arrives. Writes nothing.
  */
 import { getDb } from '../src/db';
 import { withWorkspace } from '../src/db/rls';

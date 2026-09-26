@@ -1,9 +1,6 @@
 /**
- * Uploading a list re-invites everyone on it, because the scheduler's duplicate
- * guard matches on lead_id and spreadsheet rows have none (verified against the
- * live batch of 2026-08-25: all 18 rows had lead_id null). Every duplicate
- * spends weekly invite allowance a new prospect needed, and repeatedly inviting
- * the same member is the pattern automation detection looks for.
+ * Upload dedupe by profile key: spreadsheet rows carry no lead_id, so without it
+ * every upload re-invites everyone, wasting weekly allowance and looking automated.
  */
 import {
   profileKey,
@@ -66,11 +63,7 @@ describe('profileKey', () => {
 });
 
 describe('profileKeyFromSlug', () => {
-  // The LinkedIn driver's slugOf/vanityNameOf both return a bare slug like
-  // 'ramcacpa' — never a URL — and that bare value is what gets stored as
-  // payload.resolvedSlug (see playwright-linkedin.driver.ts). profileKey
-  // itself requires a literal `linkedin.com/in/` segment, so feeding it a
-  // bare slug directly is the exact bug this helper exists to close.
+  // resolvedSlug is stored as a bare slug, which profileKey alone rejects.
   it('THE BUG: profileKey alone returns null for a bare slug — no linkedin.com/in/ segment', () => {
     expect(profileKey('ramcacpa')).toBeNull();
   });
@@ -91,12 +84,7 @@ describe('profileKeyFromSlug', () => {
     expect(profileKeyFromSlug(undefined)).toBeNull();
   });
 
-  // Defence in depth. Today every producer of resolvedSlug returns a BARE slug,
-  // so this cannot happen — but the helper concatenates its argument into
-  // `https://www.linkedin.com/in/<slug>`, and a full URL passed in would build
-  // `.../in/https://www.linkedin.com/in/john-doe`, whose first path segment is
-  // `https:`. That is not a miss, it is a WRONG key that would silently match
-  // any other doubled URL and never match the real person. Accept either shape.
+  // A full URL passed in anyway must give the same key, not a doubled URL's `https:`.
   it('a full URL that reaches it anyway yields the same key, not the garbage `https:`', () => {
     expect(profileKeyFromSlug('https://www.linkedin.com/in/john-doe')).toBe('john-doe');
     expect(profileKeyFromSlug('https://www.linkedin.com/in/John-Doe/')).toBe('john-doe');
@@ -161,8 +149,7 @@ describe('selectNewRows', () => {
   });
 
   it('KEEPS a row whose URL cannot be parsed, rather than dropping it silently', () => {
-    // Discarding input we could not classify would hide a malformed spreadsheet.
-    // A kept row fails later with a reason the operator can read.
+    // Unclassifiable rows are kept, so a bad sheet fails later with a readable reason.
     const rows = [row('not a url at all')];
 
     const { kept, skipped } = selectNewRows(rows, new Set(['john-doe']));

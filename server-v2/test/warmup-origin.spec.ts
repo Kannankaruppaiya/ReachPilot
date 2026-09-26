@@ -1,16 +1,7 @@
 /**
- * The warm-up ramp must measure how long the ACCOUNT has been running, not how
- * recently someone re-typed its password.
- *
- * `connect()` writes `connected_at = now` whenever credentials are saved,
- * including for an account that already exists. The ramp reads `connected_at`,
- * so every credential update silently restarted the warm-up at day zero.
- *
- * Observed 2026-08-26: an account connected on 2026-07-21 that had already sent
- * 159 invites was knocked back to 5/day after its password was re-entered — the
- * ramp thought it was a brand-new account. Anchoring to the EARLIER of
- * connected_at and created_at makes the ramp immune to that, and repairs
- * already-damaged rows without a migration, because created_at never moves.
+ * The warm-up ramp measures how long the account has run, not when its password
+ * was last saved (connect() rewrites connected_at). Anchored to the earlier of
+ * connected_at and created_at.
  */
 import { warmupOrigin } from '@/modules/engine/warmup';
 
@@ -44,8 +35,7 @@ describe('warm-up origin', () => {
   });
 
   it('ignores an unparseable date instead of treating it as the epoch', () => {
-    // new Date('nonsense') is NaN; letting that win would make every account
-    // look infinitely old and skip warm-up entirely — the dangerous direction.
+    // NaN must not win: an "infinitely old" account would skip warm-up.
     expect(warmupOrigin('nonsense', JULY)).toBe(JULY);
     expect(warmupOrigin(JULY, 'nonsense')).toBe(JULY);
   });

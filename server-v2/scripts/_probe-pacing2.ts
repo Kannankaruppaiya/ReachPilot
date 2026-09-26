@@ -1,7 +1,6 @@
 /**
- * Read-only: which of the three gates that all return "tomorrow's opening hour"
- * actually fired — the daily cap (a REDIS counter, not the DB sent count), the
- * per-campaign cap, or the weekly invite cap.
+ * Read-only: which "tomorrow's open" gate fired: the daily cap (Redis counter),
+ * the campaign cap, or the weekly cap?
  */
 import { getDb } from '../src/db';
 import { withWorkspace } from '../src/db/rls';
@@ -27,9 +26,8 @@ const { sql } = require('kysely');
   console.log(`invites last 7d   : ${week}`);
   console.log(`   -> weekly gate : ${week >= acct.weekly_invite_cap ? 'WOULD BLOCK' : `${acct.weekly_invite_cap - week} left`}`);
 
-  // The daily REDIS counter is incremented on every ATTEMPT and only rolled back
-  // when release() runs. Terminal failures and defers that did not release leave
-  // it above the number actually sent — which is what the daily gate compares.
+  // The Redis counter counts attempts until release() runs, so it can exceed the
+  // number actually sent.
   const today = await sql`
     select status, coalesce(last_error,'-') err, count(*)::int n
       from jobs

@@ -1,18 +1,11 @@
 /**
- * M0 SPIKE (throwaway) — de-risk the Crawlee re-architecture bet.
+ * Throwaway spike: can Crawlee's PlaywrightCrawler run patchright past Google's
+ * checks, dedupe via RequestQueue, and paginate? Not wired into the app.
  *
- * Proves three things before we build anything real:
- *   1. Crawlee's PlaywrightCrawler can use the **patchright** stealth launcher and
- *      still pass Google's bot checks (no CAPTCHA on the home IP).
- *   2. RequestQueue gives dedup for free (re-adding a URL is caught).
- *   3. Pagination works (seed pages start=0/10/20, each parsed).
- *
- * Not wired into the app. Run:  npm run spike:crawlee
- * GO  → build M1 (engine swap).   NO-GO → fall back to hand-built frontier.
+ *   npm run spike:crawlee
  */
 
-// In-memory Crawlee storage so the spike leaves no disk state and dedup is
-// measured within this run only. Must be set before Crawlee initializes.
+// In-memory storage (set before Crawlee initialises) so dedup is per run.
 process.env.CRAWLEE_PERSIST_STORAGE = '0';
 process.env.CRAWLEE_PURGE_ON_START = '1';
 
@@ -50,7 +43,7 @@ async function main() {
       launcher: chromium as any,
       launchOptions: { headless: false, channel: 'chrome' } as any,
     },
-    // Let patchright own the stealth — don't layer Crawlee's own fingerprints on top.
+    // Let patchright own the stealth; no Crawlee fingerprints on top.
     browserPoolOptions: { useFingerprints: false },
     maxConcurrency: 1,
     maxRequestRetries: 1,

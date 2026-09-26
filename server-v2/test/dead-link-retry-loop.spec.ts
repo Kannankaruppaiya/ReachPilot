@@ -1,25 +1,8 @@
 /**
- * Regression: a dead (404) profile link was re-run as a job forever.
- *
- * OBSERVED: a lead URL LinkedIn no longer serves a profile for renders as a
- * plain "LinkedIn"-titled page — no name, no action bar — while STAYING on its
- * own /in/<slug> URL. The driver read that as "we never got a usable page"
- * (`network_error` / `profile_not_loaded`), the worker deferred it (+10 min),
- * the scheduler re-queued it, and the desktop agent opened the same dead link
- * again. Nothing in that circle ever ended it: the same link was re-run every
- * ten minutes, day and night, burning a queue slot and a browser tab.
- *
- * Two defects, both covered here:
- *   1. CLASSIFICATION — LinkedIn's "this page doesn't exist" copy is CLIENT
- *      rendered, so the one check at navigation time ran too early and missed
- *      it. Re-asking after the page settles (`profileUnavailable`) names the
- *      link dead on the first try.
- *   2. THE LOOP ITSELF — a `network_error` defer had no budget. Even a link no
- *      check can classify must stop being retried eventually, which is what
- *      `networkDeferExhausted` bounds. This is the fix that holds regardless of
- *      what any future page shape does, and the one that ships server-side.
- *
- * Pure logic — no DB, no Redis, no browser, no LinkedIn traffic.
+ * Regression: a dead profile link was re-run every 10 minutes forever. It looked
+ * like a slow page (`network_error`), and deferrals had no budget. Covers the
+ * late-rendered "doesn't exist" check (`profileUnavailable`), the /404/ redirect,
+ * and the defer budget (`networkDeferExhausted`). Pure logic.
  */
 import {
   MAX_NETWORK_DEFERS,
@@ -44,10 +27,8 @@ const pageShowing = (body: string) => ({
 });
 
 /**
- * The page LinkedIn ACTUALLY serves for a dead profile, verified from a live
- * screenshot of /in/darwin-ponraj-77939020: a 302 to `linkedin.com/404/`, a 200,
- * and a body with neither <main> nor <h1> — only the illustration and the words
- * "This page doesn't exist".
+ * What LinkedIn serves for a dead profile: a redirect to `linkedin.com/404/`, a
+ * 200, and a body with neither <main> nor <h1>.
  */
 const deadProfilePage = (landsOn = 'https://www.linkedin.com/404/'): NavigablePage => {
   let here = 'about:blank';
@@ -83,10 +64,8 @@ describe('a dead profile link stops being re-run', () => {
       expect(isProfileGoneNav('https://evil-linkedin.com.attacker.io/404/')).toBe(false);
     });
 
-    // 🔴 THE REGRESSION. The /404/ page fails the rendered-body probe, so before
-    // the fix gotoProfile returned {resp: null, error: 'body never rendered'} —
-    // a NULL response, which skipped every dead-link check downstream and made
-    // the worker defer and re-drive the same dead URL every 10 minutes forever.
+    // 🔴 The regression: the /404/ page fails the body probe, and a null response
+    // skipped every dead-link check downstream.
     it('answers 404 instead of "body never rendered", even though nothing renders', async () => {
       const nav = await gotoProfile(deadProfilePage(), 'https://www.linkedin.com/in/darwin-ponraj-77939020');
       expect(nav.error).toBeUndefined();
@@ -122,8 +101,7 @@ describe('a dead profile link stops being re-run', () => {
       ).toBe(false);
     });
 
-    // A checkpoint means LinkedIn wants the human to verify a session it still
-    // considers real. Different remedy, different outcome — never "profile gone".
+    // A checkpoint is a live session the human must verify, never "profile gone".
     it('does NOT fire on a security checkpoint', async () => {
       expect(
         await profileUnavailable(pageShowing("Let's do a quick security check — verify it's you")),
@@ -133,8 +111,7 @@ describe('a dead profile link stops being re-run', () => {
     it('names the dead link terminal and the slow link retryable', () => {
       expect(TERMINAL_FAIL_OUTCOMES).toContain('profile_gone');
       expect(DEFER_OUTCOMES).toContain('network_error');
-      // 🔴 The invariant the retry loop must never break: a page that merely
-      // failed to load is NOT a verdict about the lead.
+      // 🔴 A page that failed to load is not a verdict about the lead.
       expect(TERMINAL_FAIL_OUTCOMES).not.toContain('network_error');
     });
   });

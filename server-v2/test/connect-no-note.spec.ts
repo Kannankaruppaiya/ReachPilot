@@ -1,22 +1,8 @@
 /**
- * LinkedIn "send connection request" — NOTE-LESS flow.
- *
- * SCOPE: only the connect_request path, and only the variant that goes out
- * WITHOUT a personalized note (the "Include a personalized note" toggle OFF in
- * Auto Connect). The with-note cases appear only as controls, to prove the
- * no-note branch is genuinely different rather than accidentally identical.
- *
- * THE CHAIN UNDER TEST
- *   AutoSend (withNote=false) → payload { noNote: true }
- *     → ConnectionNoteService.build()          ⇒ ''            (group A)
- *       → connectWithNoteFallback(driver, target, '')          (group B)
- *         → driver.sendConnectRequest(target, '', ctx)
- *           → outcome classification policy                    (group C)
- *
- * These tests are PURE: no database, no Redis, no browser, and no LinkedIn
- * traffic whatsoever. The driver is a recording fake, so nothing can reach a
- * real account. Pacing (Redis+DB) lives in connect-no-note-pacing.spec.ts and
- * the scheduler gates in connect-no-note-scheduler.spec.ts.
+ * Note-less connect (Auto Connect with the note toggle off): payload
+ * { noNote: true } → ConnectionNoteService.build() = '' (A) →
+ * connectWithNoteFallback (B) → the driver, then the outcome policy (C).
+ * With-note cases are controls. Pure: the driver is a recording fake.
  */
 import { ConnectionNoteService } from '@/modules/ai/connection-note.service';
 import { connectWithNoteFallback, NOTE_CAP_ERROR } from '@/modules/drivers/connect-with-fallback';
@@ -90,8 +76,7 @@ describe('Connect request — WITHOUT a personalized note', () => {
       });
 
       expect(note).toBe('');
-      // The point of the no-note path: we must not spend an AI call or an Apify
-      // scrape credit on a note that will never be sent.
+      // No AI call or Apify credit for a note that is never sent.
       expect(ai.generateConnectionNote).not.toHaveBeenCalled();
       expect(scraper.scrapeLinkedInProfile).not.toHaveBeenCalled();
     });
@@ -128,8 +113,7 @@ describe('Connect request — WITHOUT a personalized note', () => {
     });
 
     it('B3: on the no-note path a note_cap result never triggers a retry', async () => {
-      // If the driver somehow reports note_cap for a note-less send, retrying
-      // without a note would be identical and would burn a second invite.
+      // Retrying a note-less send without a note would just burn a second invite.
       const { driver } = makeDriver(noteCapped());
 
       const res = await connectWithNoteFallback(driver, TARGET, '', undefined);
@@ -143,8 +127,7 @@ describe('Connect request — WITHOUT a personalized note', () => {
 
       const res = await connectWithNoteFallback(driver, TARGET, '', undefined);
 
-      // fellBackToNoNote means "we wanted a note and had to drop it" — it must
-      // not appear when the user deliberately chose to send without one.
+      // fellBackToNoNote means a wanted note was dropped, not a deliberate no-note send.
       expect(res.fellBackToNoNote).toBeUndefined();
     });
 
@@ -181,11 +164,7 @@ describe('Connect request — WITHOUT a personalized note', () => {
   });
 
   /* ------------------------------------------------------------------ *
-   * C. Outcome policy — how the worker must classify each driver result.
-   *
-   * These constants ARE the policy the worker switches on, so asserting
-   * their membership pins the behaviour: which outcomes skip-and-advance,
-   * which pause the whole account, and which fail terminally.
+   * C. Outcome policy: these constants are what the worker switches on.
    * ------------------------------------------------------------------ */
   describe('C. Outcome classification policy for a connect result', () => {
     it('C1: "sent" is in no special bucket — it is the normal success path', () => {

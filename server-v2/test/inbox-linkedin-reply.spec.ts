@@ -1,13 +1,6 @@
 /**
- * A LinkedIn reply from the inbox is recorded only if it was actually sent.
- *
- * sendMessage used to call the LinkedIn driver with no account and ignore the
- * result. In production (remote driver) a call without an account fails at once
- * with `no_account_id` — yet the message was saved as sent and the thread marked
- * read, so the user believed they had answered the prospect.
- *
- * REQUIREMENTS: local Postgres. SKIPS otherwise. The driver and the session
- * builder are stubs — nothing reaches LinkedIn or a desktop agent.
+ * An inbox LinkedIn reply is recorded only if it was actually sent, from a real
+ * account. Skips without local Postgres; driver and session builder are stubs.
  */
 import { randomUUID } from 'crypto';
 import { getDb } from '@/db';

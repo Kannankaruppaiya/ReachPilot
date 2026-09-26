@@ -1,15 +1,8 @@
 /**
- * Build the Excel/CSV deliverable from the scraped lead rows.
+ * Build the leads .xlsx (+ BOM'd .csv) from exports/_leads.tsv (no header:
+ * first, last, title, company, location, linkedinSlug, premium, relevance).
  *
  *   node scripts/build-leads-xlsx.js
- *
- * Input : exports/_leads.tsv  (tab-separated, no header)
- *         first \t last \t title \t company \t location \t linkedinSlug \t premium \t relevance
- * Output: exports/finance-leads-tamilnadu-<date>.xlsx  (+ .csv, BOM'd for Excel)
- *
- * Every row came from a LinkedIn people search filtered to
- * `recentlyPostedOnLinkedIn` — i.e. posted in the last 30 days — so the whole
- * sheet is the "active profiles" cut, not a raw title dump.
  */
 const fs = require('fs');
 const path = require('path');
@@ -55,8 +48,7 @@ for (const [first, last, title, company, location, slug, premium, relevance] of 
   });
 }
 
-// Tamil Nadu first, then strongest finance match, then premium (a paid account
-// is a decent proxy for someone who actually uses LinkedIn).
+// Tamil Nadu first, then finance match, then premium.
 leads.sort(
   (a, b) =>
     (a['In Tamil Nadu'] === 'Yes' ? 0 : 1) - (b['In Tamil Nadu'] === 'Yes' ? 0 : 1) ||
