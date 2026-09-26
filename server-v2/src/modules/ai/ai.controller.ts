@@ -16,13 +16,7 @@ interface ChatBody {
   conversationId?: string;
 }
 
-/**
- * AI personalization endpoints. Protected by the global AuthGuard.
- *
- * `preview-note` is the tuning surface: send a prospect + campaign voice, get a
- * generated note back so you can eyeball tone/length before wiring generation
- * into the campaign enrollment flow. It never sends anything to LinkedIn.
- */
+/** AI endpoints. `preview-note` generates a note to check tone; it never sends. */
 @Controller('api/ai')
 export class AiController {
   constructor(
@@ -66,10 +60,8 @@ export class AiController {
   }
 
   /**
-   * Agentic chat (Server-Sent Events). The body carries the full conversation;
-   * we stream back the assistant's tool calls, tool results, and final text as
-   * they happen so the UI can render them live (Claude-style). The workspace is
-   * taken from the auth context — tools only ever see this tenant's data.
+   * Agentic chat over SSE: streams tool calls, results and the final text. Tools
+   * only see this workspace's data.
    */
   @Post('chat')
   async chat(@Body() body: ChatBody, @Req() req: Request, @Res() res: Response) {
@@ -89,9 +81,8 @@ export class AiController {
       res.flush?.();
     };
 
-    // Resolve (or create) the conversation this turn belongs to, then persist the
-    // user's message. A new conversation is titled from the first message; its id
-    // is streamed to the client so follow-up turns land in the same thread.
+    // Resolve or create the conversation, save the user's message, and stream the id
+    // so follow-up turns land in the same thread.
     const lastUser = [...messages].reverse().find((m) => m.role === 'user')?.content?.trim() || '';
     let conversationId = body?.conversationId;
     try {
@@ -104,8 +95,6 @@ export class AiController {
       conversationId = undefined; // persistence is best-effort — chat still works
     }
 
-    // Accumulate the assistant's reply (text + tool traces) as it streams so we
-    // can persist the final turn once the run completes.
     let answer = '';
     const traces: ToolTrace[] = [];
     const capture = (e: AgentEvent) => {
@@ -122,9 +111,7 @@ export class AiController {
       send(e);
     };
 
-    // Pull in this workspace's Apify MCP tools (empty if Apify isn't connected),
-    // append them to the local tool set, and make sure the MCP session is closed
-    // when the run finishes.
+    // Add the workspace's Apify tools, and close the MCP session when the run ends.
     const apifySet = await this.apify.toolsFor(workspaceId).catch(() => ({
       tools: [],
       dispose: async () => undefined,

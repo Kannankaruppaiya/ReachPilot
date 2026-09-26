@@ -73,9 +73,8 @@ function TrustPanel({ items, quote }: { items: { icon: React.ReactNode; title: s
 }
 
 /**
- * The LinkedIn email / password / country fields — the SINGLE source shared by
- * the onboarding "Connect LinkedIn" step AND the Integrations "Update LinkedIn
- * login" modal, so both stay in lockstep.
+ * LinkedIn email/password/country fields, shared by onboarding and the
+ * "Update LinkedIn login" modal.
  */
 export function LinkedinCredentialFields({
   email,
@@ -141,10 +140,7 @@ export function LinkedinCredentialFields({
   )
 }
 
-/**
- * The 2FA instructions + secret-key input — shared by the onboarding "2FA" step
- * and the Integrations "Update LinkedIn login" modal.
- */
+/** 2FA instructions + secret-key input, shared by onboarding and the update modal. */
 export function TwoFaInstructions({
   secret,
   setSecret,
@@ -354,8 +350,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [skipModal, setSkipModal] = useState(false)
   const [limit, setLimit] = useState(10)
   const [busy, setBusy] = useState(false)
-  // Back from Google OAuth (/?gmail=connected|error) — Google lands the user
-  // here, on the Gmail step, when onboarding is not finished yet.
+  // Back from Google OAuth (/?gmail=connected|error) on the Gmail step.
   const [oauthReturn] = useState(() => new URLSearchParams(window.location.search))
   const [error, setError] = useState(() =>
     oauthReturn.get("gmail") === "error" ? oauthReturn.get("reason") || "Gmail connection failed" : "",
@@ -592,10 +587,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                     variant="outline"
                     disabled={busy}
                     onClick={() =>
-                      // Real Google OAuth. Google redirects back to /?gmail=…,
-                      // onboarding reloads on this step and sees the mailbox.
-                      // (This used to call /api/gmail/connect directly, which
-                      // "connected" a placeholder mailbox nothing could send from.)
+                      // Real Google OAuth; Google redirects back to /?gmail=… on this step.
                       run(async () => {
                         const { url } = await api.googleConnectUrl()
                         window.location.href = url
@@ -830,11 +822,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
 }
 
 /**
- * "Update LinkedIn login" — reuses the SAME two onboarding pages (credentials +
- * 2FA) as a standalone modal, for when a user changes their LinkedIn password
- * and needs ReachPilot to sign in again. Hits the same endpoints
- * (connectLinkedin → verify2fa / skip2fa), which upsert the account by email and
- * re-enqueue the login to re-capture the session — no separate "update" backend.
+ * "Update LinkedIn login": the onboarding credentials + 2FA pages as a modal. Same
+ * endpoints, which upsert the account and re-enqueue the login.
  */
 export function LinkedinUpdateModal({
   currentEmail,

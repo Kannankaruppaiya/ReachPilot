@@ -1,24 +1,8 @@
 import { Kysely, sql } from 'kysely';
 
-/**
- * Is tenant isolation actually in force on this connection?
- *
- * 🔴 It was not, and nothing noticed. Measured 2026-08-27 against the production
- * database: every tenant table had RLS enabled, FORCE ROW LEVEL SECURITY set and a
- * policy attached, `withWorkspace` set the GUC correctly, and
- * `current_workspace_id()` returned the right uuid — yet four different workspaces
- * each counted the same 370 jobs, identical to an unscoped read.
- *
- * The cause was the connecting ROLE: the app connects as `postgres`, which carries
- * `rolbypassrls`. Postgres skips every policy for such a role — FORCE RLS does not
- * override BYPASSRLS, it only stops a table's OWNER from bypassing. So the schema
- * looked perfect while isolation was off, and a cross-tenant read or write would
- * have succeeded silently.
- *
- * That is the failure mode worth guarding: not "is RLS configured" — it was — but
- * "does it actually bite for the identity we connect with". This module answers the
- * second question, so the invariant is CHECKED at boot rather than assumed.
- */
+// Is tenant isolation in force for the role we connect as? RLS can be fully
+// configured and still bypassed: a role with BYPASSRLS skips every policy (FORCE
+// RLS only stops table owners). So this is checked at boot, not assumed.
 
 /** What we observe about the live connection. Kept plain so the verdict is pure. */
 export interface IsolationFacts {
@@ -32,17 +16,10 @@ export interface IsolationVerdict {
   reason: string;
 }
 
-/** Tenant tables whose policies are load-bearing. Not exhaustive — a representative
- *  set is enough to catch a database-wide misconfiguration. */
+/** A representative set of tenant tables; enough to catch a database-wide misconfiguration. */
 export const TENANT_TABLES = ['jobs', 'leads', 'campaigns', 'memberships'];
 
-/**
- * Decide whether this connection is genuinely isolated.
- *
- * Order matters: BYPASSRLS is checked FIRST because it makes every other signal
- * meaningless. A table can be flawlessly configured and still return every
- * tenant's rows.
- */
+/** Is this connection isolated? BYPASSRLS is checked first: it overrides everything else. */
 export function isolationVerdict(facts: IsolationFacts): IsolationVerdict {
   if (facts.bypassrls) {
     return {
@@ -53,9 +30,7 @@ export function isolationVerdict(facts: IsolationFacts): IsolationVerdict {
     };
   }
 
-  // Observing nothing is not an all-clear. A probe that matched no tables (schema
-  // renamed, wrong search_path, permissions) would otherwise sail through every
-  // remaining check and report isolation that was never verified.
+  // Observing no tables is not an all-clear (renamed schema, wrong search_path).
   if (facts.tables.length < TENANT_TABLES.length) {
     const missing = TENANT_TABLES.filter((n) => !facts.tables.some((t) => t.name === n));
     return {
@@ -72,8 +47,7 @@ export function isolationVerdict(facts: IsolationFacts): IsolationVerdict {
     };
   }
 
-  // A table's OWNER bypasses its own policies unless FORCE is set — the one case
-  // FORCE actually exists for.
+  // Without FORCE, a table's owner bypasses its own policies.
   const unforced = facts.tables.filter((t) => !t.forced);
   if (unforced.length) {
     return {
@@ -116,14 +90,8 @@ export async function readIsolationFacts(db: Kysely<any>): Promise<IsolationFact
 }
 
 /**
- * Boot-time gate.
- *
- * Logs loudly by default rather than refusing to start: isolation has been off for
- * the whole life of this deployment, so failing closed today would take the app
- * down instead of protecting anything. Set `REQUIRE_TENANT_ISOLATION=true` once the
- * app connects as a non-BYPASSRLS role — from then on a regression (someone points
- * DATABASE_URL back at `postgres`) stops the process instead of silently
- * un-isolating every tenant.
+ * Boot-time check. Logs by default; set `REQUIRE_TENANT_ISOLATION=true` once the
+ * app connects as a non-BYPASSRLS role, so a regression stops the process.
  */
 export async function assertTenantIsolation(
   db: Kysely<any>,

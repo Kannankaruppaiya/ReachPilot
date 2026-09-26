@@ -4,20 +4,9 @@ import { withWorkspace } from '@/db/rls';
 import { GraphExecutor } from './graph-executor';
 
 /**
- * The heartbeat of the campaign sequence engine.
- *
- * `GraphExecutor.executeStep` knows how to run ONE step of ONE enrollment, and
- * the worker's post-send `advanceEnrollment` flips a finished step's enrollment
- * back to `active`. What was missing is the thing that drives the loop: on each
- * tick this finds every enrollment that is ready to move — freshly `active`, or
- * `waiting` with its wait window elapsed — inside a currently-active campaign,
- * and hands it to the executor. Without it a sequence never advances past the
- * step the enroll call kicked off.
- *
- * Enrollments are RLS-scoped, so we enumerate workspaces (not RLS'd) and drive
- * each under its own tenant context — the same pattern the scheduler uses.
- * `executeStep` is idempotent (one live job per enrollment+step), so re-visiting
- * a still-parked enrollment is a no-op.
+ * Drives enrollments: each tick hands every ready enrollment (active, or waiting
+ * with its window elapsed, in an active campaign) to GraphExecutor.executeStep,
+ * which is idempotent. Runs per workspace under its own RLS context.
  */
 @Injectable()
 export class CampaignRunnerService {
@@ -49,18 +38,10 @@ export class CampaignRunnerService {
     return { advanced };
   }
 
-  /**
-   * Drive one workspace's due enrollments. Tests call this directly — never
-   * tick(), which walks every tenant in the database.
-   */
+  /** Drive one workspace's due enrollments. Tests call this, never tick(). */
   private async drainWorkspace(workspaceId: string): Promise<{ advanced: number }> {
     const nowIso = new Date().toISOString();
-    // Due enrollments: active now, or waiting with the wait window elapsed,
-    // belonging to a campaign that is actively running.
-    //
-    // 🔴 Read under the workspace's RLS context. This used raw getDb(), which
-    // returned rows only because production connects as a BYPASSRLS role — under
-    // a role subject to RLS it read nothing, and every campaign stopped.
+    // Due enrollments in active campaigns, read under the workspace's RLS context.
     const due = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('enrollments')

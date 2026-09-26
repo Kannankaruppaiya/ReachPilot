@@ -4,15 +4,8 @@ import { createHash } from 'crypto';
 import { getEnv } from '@/config/env';
 
 /**
- * Per-workspace scrape cursor (the "frontier" of the lead engine).
- *
- * Remembers, per (workspace, search), how many Google result pages have already
- * been consumed — so a RERUN of the same search continues at the next unseen page
- * instead of re-fetching page 1 and returning the same leads (which import-dedup
- * then drops → "0 new"). This is the fix for the "rerun repeats" problem.
- *
- * Stored in Redis (shared by the worker whether it scrapes locally or offloads to
- * the VPS — the cursor stays on the worker side; the browser fetch is stateless).
+ * Per-workspace scrape cursor in Redis: how many result pages a search has
+ * consumed, so a rerun continues at the next unseen page instead of page 1.
  */
 @Injectable()
 export class ScrapeCursorService {

@@ -1,11 +1,8 @@
-// Shim for @nestjs/common — the reused server driver only needs Injectable
-// (a no-op decorator here) and Logger (mapped to console). No DI container.
+// Shim for @nestjs/common: Injectable is a no-op, Logger maps to console.
 function Injectable() {
   return function () {}; // no-op class decorator
 }
-// Nest's Logger takes (payload, message) — forward BOTH. Keeping only the first
-// arg dropped the message half of every `logger.log({ data }, 'what happened')`
-// in the driver, which is the half that says which branch ran.
+// Forward both (payload, message) args; the message says which branch ran.
 class Logger {
   constructor(context) { this.context = context || ''; }
   log(...a) { console.log(`[${this.context}]`, ...a); }

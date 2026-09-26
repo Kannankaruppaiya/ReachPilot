@@ -42,10 +42,8 @@ function timeAgo(iso: string | null): string {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" })
 }
 
-// ── Outcome column temporarily disabled ───────────────────────────────
-// LinkedIn sync is OFF (LINKEDIN_SYNC_ENABLED=false), so acceptance/reply
-// detection never runs — every sent invite would show a misleading "Awaiting".
-// Re-enable outcomeMeta + the <th>/<td>/`om` below when sync is turned back on.
+// Outcome column disabled while LinkedIn sync is off (every invite would read
+// "Awaiting"). Re-enable outcomeMeta and the column below when sync is back.
 /*
 const outcomeMeta: Record<ConnectionOutcome, { tone: string; label: string; icon: React.ReactNode }> = {
   accepted: { tone: "success", label: "Accepted", icon: <UserCheck size={12} /> },
@@ -82,10 +80,8 @@ function initials(name: string): string {
 }
 
 /**
- * Whether the desktop agent shows its browser window. Per-machine, not workspace
- * state (localStorage, read by desktop/main.js each poll) — which machine puts a
- * window on screen is a property of that machine, so it lives here beside the
- * live queue rather than in the server-saved Settings form.
+ * Whether the desktop agent shows its browser. Per machine, so it lives in
+ * localStorage (read by desktop/main.js).
  */
 function ShowBrowserSwitch() {
   const [on, setOn] = useState(() => localStorage.getItem(HEADLESS_KEY) !== "1")
@@ -191,11 +187,7 @@ export function Connections() {
     }
   }
 
-  // Put back leads a failure burned that was never their fault — an account that
-  // had been signed out, or a profile that never loaded. The SERVER decides which
-  // failures qualify (an allowlist of failures that provably sent nothing), so a
-  // lead whose invite may already have gone out is left alone and reported as
-  // skipped rather than being invited twice.
+  // Re-queue leads whose failure sent nothing; the server decides which qualify.
   const [requeueing, setRequeueing] = useState(false)
   const requeueFailed = async () => {
     if (!window.confirm("Put the recoverable failed leads back in the queue?")) return
@@ -467,8 +459,7 @@ function ConnectionRowView({ r, onDelete }: { r: ConnectionRow; onDelete: () => 
       <td className="px-4 py-3">
         {r.linkedinUrl ? (
           <a
-            // A bare "linkedin.com/in/x" without a protocol resolves against the
-            // app domain (→ Vercel 404). Force an absolute URL.
+            // Force an absolute URL; a bare "linkedin.com/in/x" would be relative.
             href={/^https?:\/\//i.test(r.linkedinUrl) ? r.linkedinUrl : `https://${r.linkedinUrl.replace(/^\/+/, '')}`}
             target="_blank"
             rel="noreferrer noopener"

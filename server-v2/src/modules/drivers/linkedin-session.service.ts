@@ -26,9 +26,8 @@ const UA_POOL = [
 ];
 
 /**
- * Turns a stored linkedin_accounts row into the concrete context a driver
- * needs — decrypting the session cookie / password / TOTP seed via the vault,
- * and pinning a geo-consistent fingerprint + proxy.
+ * Turns a linkedin_accounts row into a driver context: decrypted session and
+ * credentials, plus a geo-consistent fingerprint and proxy.
  */
 @Injectable()
 export class LinkedInSessionService {
@@ -60,9 +59,7 @@ export class LinkedInSessionService {
         ip: proxy?.ip || undefined,
       };
     }
-    // 'local' = the machine's own IP (worker runs here) → direct egress, no
-    // routing. 'simulator' = fake dev seed IP → never route through it either.
-    // The account still records the IP for display/tracking.
+    // 'local' (this machine's IP) and 'simulator' (fake) proxies mean direct egress.
     if (!proxy?.ip || proxy.provider === 'local' || proxy.provider === 'simulator') return undefined;
     // A real per-account residential proxy: route through host:port.
     const server = /:\d+$/.test(proxy.ip) ? proxy.ip : `${proxy.ip}:8000`;
@@ -102,10 +99,7 @@ export class LinkedInSessionService {
     const acct = await this.loadAccount(accountId, workspaceId);
     if (!acct) return null;
 
-    // Defense-in-depth (the scheduler already gates on this): never build an
-    // action context for a flagged/paused account. Returning null makes the
-    // worker treat it as "not sendable" rather than driving a browser at
-    // LinkedIn with an account it has just challenged.
+    // Defense in depth (the scheduler gates this too): no context for a flagged account.
     if (['checkpoint', 'paused', 'disconnected'].includes(acct.status as string)) {
       this.logger.warn({ accountId, status: acct.status }, 'Refusing to act on non-sendable account');
       return null;
@@ -117,10 +111,8 @@ export class LinkedInSessionService {
         .decrypt(acct.session_secret_id, { workspaceId: acct.workspace_id })
         .catch(() => undefined);
     }
-    // The vault may hold either the full jar (current) or a bare li_at (accounts
-    // connected before the jar existed) — `parseStoredSession` normalises both.
-    // `li_at` is still populated because the desktop-agent wire and older bundles
-    // read that field.
+    // The vault holds a full jar or a legacy bare li_at; `li_at` is still set for the
+    // desktop-agent wire.
     const cookies = parseStoredSession(secret);
     const li_at = cookies.find((c) => c.name === 'li_at')?.value;
 

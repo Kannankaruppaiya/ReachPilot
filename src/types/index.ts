@@ -1,5 +1,4 @@
-// Shared API/domain types. Kept separate from the client so screens can import
-// types without pulling in the fetch layer.
+// Shared API/domain types, separate from the client so screens needn't import the fetch layer.
 
 export type OnboardingState = {
   workspace: { name: string; goal: string } | null

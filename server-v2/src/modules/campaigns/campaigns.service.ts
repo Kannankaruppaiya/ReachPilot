@@ -212,10 +212,7 @@ export class CampaignsService {
     };
   }
 
-  /**
-   * Per-campaign send trend (last 14 days, count of 'sent' jobs per day). One
-   * query grouped by campaign+day, returned as a map of campaignId → number[].
-   */
+  /** Sent jobs per day for the last 14 days, as campaignId → number[]. */
   private async trendsByCampaign(
     db: any,
     workspaceId: string,
@@ -242,7 +239,6 @@ export class CampaignsService {
 
     const rows = await q.execute();
 
-    // Build the day axis.
     const axis: string[] = [];
     for (let i = 0; i < DAYS; i++) {
       const d = new Date(since);
@@ -272,8 +268,6 @@ export class CampaignsService {
         .where('workspace_id', '=', workspaceId)
         .limit(1)
         .executeTakeFirst();
-      // A mailbox that can actually send — never an unordered pick over every
-      // row, which could land on a credential-less placeholder (see mailbox.ts).
       const emailAcct = await sendableMailboxes(db, workspaceId).select('id').executeTakeFirst();
 
       const created = await db
@@ -299,8 +293,7 @@ export class CampaignsService {
       return { ...created, entry_step_id: entryStepId };
     });
 
-    // Enroll the chosen audience, then (if launching) kick the enrollments so the
-    // runner picks them up on its next tick.
+    // Enroll the audience, then (if launching) kick the enrollments for the runner.
     if (dto.leadIds?.length && campaign.entry_step_id) {
       await this.enroll(workspaceId, campaign.id, dto.leadIds, dto.launch ? 'active' : 'paused');
     }
@@ -320,10 +313,9 @@ export class CampaignsService {
   }
 
   /**
-   * Compile a linear builder node list into campaign_steps:
-   *   - `wait` nodes fold their days into the delay_hours of the NEXT real step.
-   *   - a `branch` becomes a condition step: on_true continues the main line, and
-   *     an optional else-action becomes a one-shot fallback step (on_false).
+   * Compile builder nodes into campaign_steps: `wait` days fold into the next step's
+   * delay_hours; a `branch` becomes a condition step whose else-action is a
+   * fallback step on on_false.
    */
   private compile(nodes: BuilderNode[]): { list: Compiled[]; entry: number } {
     const list: Compiled[] = [];
@@ -392,14 +384,9 @@ export class CampaignsService {
     return { list, entry: primary.length ? primary[0] : 0 };
   }
 
-  /**
-   * Replace a campaign's whole sequence: drop the existing steps, recompile the
-   * builder nodes, insert + wire the links, and set the entry step. Shared by
-   * create and update (editing). Returns the new entry step id (or null).
-   */
+  /** Replace a campaign's whole sequence and return the new entry step id. */
   private async persistSteps(db: any, campaignId: string, nodes: BuilderNode[]): Promise<string | null> {
-    // FK campaign_steps.* and campaigns.entry_step_id are ON DELETE SET NULL, so
-    // dropping the rows detaches enrollments/entry safely.
+    // These FKs are ON DELETE SET NULL, so enrollments and the entry detach safely.
     await db.deleteFrom('campaign_steps').where('campaign_id', '=', campaignId).execute();
 
     const compiled = this.compile(nodes);
@@ -441,11 +428,7 @@ export class CampaignsService {
     return entryStepId;
   }
 
-  /**
-   * Turn a persisted step graph back into linear builder nodes so the UI can edit
-   * an existing campaign. Inverse of compile(): delays become wait nodes, and a
-   * condition's on_false fallback step collapses back into the branch's elseAction.
-   */
+  /** Inverse of compile(): steps back into builder nodes for editing. */
   private decompile(stepRows: any[], entryStepId: string | null): BuilderNode[] {
     const byId = new Map<string, any>(stepRows.map((r) => [r.id, r]));
     const REVERSE: Record<string, BuilderNode['kind']> = {
@@ -613,13 +596,9 @@ export class CampaignsService {
             .where('campaign_id', '=', id)
             .where('status', 'in', ['active', 'waiting'] as any)
             .execute();
-          // 🔴 …and stop what is already materialised. Pausing used to touch
-          // only the enrollments, so every job the executor had already created
-          // (a follow-up due in two days, a message queued for this morning) was
-          // still sent by the scheduler after the user pressed Pause. Resuming
-          // re-creates them: the executor treats a 'campaign_paused' cancel as
-          // "make this step's job again" (graph-executor.ts, onCanceledJob).
-          // A 'running' job is mid-action on the agent and cannot be recalled.
+          // 🔴 Also cancel jobs already created, or the scheduler still sends them.
+          // Resume re-creates them (onCanceledJob treats 'campaign_paused' as recreate).
+          // A 'running' job is mid-action and can't be recalled.
           await db
             .updateTable('jobs')
             .set({ status: 'canceled', last_error: 'campaign_paused' })
@@ -637,9 +616,8 @@ export class CampaignsService {
         }
       }
 
-      // Editing the sequence: rebuild steps and restart enrolled leads from the
-      // new entry (their old step is gone). Cancel pending jobs so a stale-step
-      // job never fires.
+      // Sequence edited: rebuild steps, restart enrollments from the new entry, and
+      // cancel pending jobs for the old steps.
       if (Array.isArray(data.steps)) {
         const newEntry = await this.persistSteps(db, id, data.steps);
         await db

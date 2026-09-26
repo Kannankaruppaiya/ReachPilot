@@ -1,15 +1,6 @@
-/**
- * How a LinkedIn session is stored, restored, and (crucially) NOT overwritten.
- *
- * A LinkedIn session is a SET of cookies, and the authoritative copy of it lives
- * in the account's persistent browser profile — not in our vault. What we keep in
- * the vault is a SEED: enough to bring a brand-new profile back to life (a fresh
- * machine, or after Windows cleared %TEMP%). Treating the vault copy as the
- * authority is what let a stale cookie destroy a working session.
- *
- * These functions are pure so the policy is testable without launching a browser
- * (see `test/session-cookie-handling.spec.ts`).
- */
+// How a LinkedIn session is stored and restored. The authoritative cookies live
+// in the account's browser profile; the vault holds a seed for a fresh profile.
+// Pure, so the policy is testable (test/session-cookie-handling.spec.ts).
 
 /** The domain LinkedIn actually sets `li_at` on — not the broader `.linkedin.com`. */
 export const LI_AT_DOMAIN = '.www.linkedin.com';
@@ -31,13 +22,7 @@ export function serializeSession(cookies: StoredCookie[]): string {
   return JSON.stringify(cookies);
 }
 
-/**
- * Decode whatever the vault holds for an account.
- *
- * Accounts connected before the jar existed have a bare `li_at` string stored.
- * Those must keep working: signing every existing account out to fix a bug would
- * be a worse outage than the bug.
- */
+/** Decode the vault value: a cookie jar, or a legacy bare `li_at` string (still supported). */
 export function parseStoredSession(stored?: string | null): StoredCookie[] {
   const raw = (stored || '').trim();
   if (!raw) return [];
@@ -57,12 +42,8 @@ export function parseStoredSession(stored?: string | null): StoredCookie[] {
 }
 
 /**
- * Decide what to put into a freshly-opened browser context.
- *
- * The rule is one line, and it is the whole fix: **if the profile is already
- * signed in, leave it alone.** The profile's cookie is by definition at least as
- * fresh as the vault's — it is what LinkedIn last handed this browser — whereas
- * the vault's was captured at the last login and never updated since.
+ * Cookies to inject into a new context: none if the profile is already signed in,
+ * because its cookie is at least as fresh as the vault's.
  */
 export function cookiesToInject(
   existing: StoredCookie[],
@@ -77,17 +58,9 @@ export function cookiesToInject(
 export type PinChallenge = 'totp' | 'email' | 'sms' | 'unknown';
 
 /**
- * Read WHICH code LinkedIn wants before typing one.
- *
- * A stored TOTP seed can only answer the authenticator challenge. Typing that
- * code into an email or SMS challenge submits a wrong PIN — a failed login
- * attempt, which is exactly the signal that gets an account challenged harder.
- * So an unfamiliar wording returns `unknown` and the caller must stop rather
- * than guess; LinkedIn rewords these pages often.
- *
- * Email and SMS are matched FIRST: those pages routinely offer "use your
- * authenticator app instead" as an alternative link, so the mere presence of the
- * word "authenticator" does not mean the app code is what is being asked for.
+ * Which code is LinkedIn asking for? A TOTP seed only answers the authenticator
+ * challenge; a wrong PIN is a failed login. Unfamiliar wording → `unknown`, and
+ * the caller stops. Email/SMS match first: those pages also mention the authenticator.
  */
 export function classifyPinChallenge(pageText: string): PinChallenge {
   const t = (pageText || '').trim();

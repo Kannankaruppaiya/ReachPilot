@@ -6,8 +6,7 @@ import { getEnv } from '@/config/env';
 import { JwtPayload } from '@/common/auth.guard';
 import { ScrapeJobsService } from './scrape-jobs.service';
 
-// Lazy singleton producer (same pattern as jobs.service) — the browser scrape
-// runs in the worker, so the API only enqueues and returns immediately.
+// Lazy producer: the worker runs the scrape, the API only enqueues.
 let redisClient: Redis | null = null;
 let scrapeQueue: Queue | null = null;
 function getScrapeQueue(): Queue {
@@ -39,9 +38,8 @@ export class ScrapingController {
   }
 
   /**
-   * Kick off a free local Google → LinkedIn lead scrape. Enqueues a worker job
-   * (headful stealth browser lives in the worker) and returns at once; scraped
-   * profiles land in the leads table via the normal import path (with dedup).
+   * Start a Google → LinkedIn lead scrape. Enqueues a worker job and returns at once;
+   * leads arrive through the normal import path.
    */
   @Post('scrape')
   async scrape(
@@ -60,12 +58,10 @@ export class ScrapingController {
     }
     const location = body.location ? String(body.location).trim() : undefined;
     const maxResults = Math.min(Math.max(Number(body.maxResults) || 15, 1), 100);
-    // startFresh re-sweeps from page 0 (ignore the rerun cursor) — used when the
-    // user wants to re-scan a search space from the top.
+    // startFresh ignores the rerun cursor and starts at page 0.
     const startFresh = body.startFresh === true;
 
-    // Create the history/progress row first, then hand its id to the worker so it
-    // can report status as it runs.
+    // Create the progress row first so the worker can report into it.
     const scrapeJobId = await this.scrapeJobs.create(workspaceId, { titles, location, maxResults });
     await getScrapeQueue().add('scrape', { workspaceId, titles, location, maxResults, startFresh, scrapeJobId });
     return { ok: true, queued: true, scrapeJobId, titles, location, maxResults, startFresh };

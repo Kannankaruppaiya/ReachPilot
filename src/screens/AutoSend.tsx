@@ -47,16 +47,12 @@ const detect = (headers: string[], patterns: RegExp[]): string => {
 }
 
 function fillTemplate(tpl: string, r?: Row) {
-  // r can be undefined — the preview calls this with buildRows()[0], which is
-  // undefined right after an upload whose columns aren't mapped yet (all rows
-  // filtered out). Guard so the preview shows the fallback text instead of
-  // crashing the whole page (white screen).
+  // r is undefined right after an upload with unmapped columns; show the fallback.
   const filled = tpl
     .replace(/\{\{firstName\}\}/g, r?.firstName || "there")
     .replace(/\{\{company\}\}/g, r?.company || "your company")
     .replace(/\{\{role\}\}/g, r?.role || "your role")
-  // Preview spintax like the backend does — but pick the FIRST option so the
-  // preview is stable while typing (the real send randomizes per recipient).
+  // Preview spintax with the first option so it's stable while typing.
   let out = filled
   let prev: string
   do {
@@ -76,8 +72,7 @@ const dayLabel = (day: number) => {
 
 export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAccountState | null }) {
   const toast = useToast()
-  // The safe daily ceiling comes from the account's real warm-up state (LinkedIn),
-  // not a hardcoded number. Falls back sensibly when there's no account yet.
+  // Daily ceiling from the account's real warm-up state.
   const safeMax = mode === "linkedin" ? account?.warmup?.todayLimit ?? 15 : 50
   const [fileName, setFileName] = useState("")
   const [headers, setHeaders] = useState<string[]>([])
@@ -85,9 +80,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
   const [mapping, setMapping] = useState<Mapping>({ name: "", target: "", company: "", role: "" })
   const [rows, setRows] = useState<Row[]>([])
   const [cap, setCap] = useState(safeMax)
-  // LinkedIn limits live ONLY in Settings → LinkedIn limits — this screen just
-  // mirrors the account's enforced daily limit (the backend enforces it too, so
-  // there's no way to send above it from here).
+  // LinkedIn limits are set in Settings only; this mirrors the enforced limit.
   useEffect(() => {
     if (mode === "linkedin" && account?.warmup) setCap(account.warmup.todayLimit)
   }, [account?.warmup?.todayLimit, mode])
@@ -97,14 +90,11 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       ? "Hi {{firstName}}, impressed by your work at {{company}}. I'd love to connect and share how we help {{role}}s grow."
       : "Hi {{firstName}},\n\nI came across your profile at {{company}} and wanted to reach out about an opportunity that fits your experience as {{role}}.\n\nOpen to a quick chat this week?",
   )
-  // Personalization (LinkedIn Auto Connect only). AI writes a unique note per
-  // person; Apify (only when AI is on) scrapes each profile first for grounding.
+  // AI writes a note per person; Apify (with AI on) scrapes each profile first.
   const [useAi, setUseAi] = useState(false)
   const [useApify, setUseApify] = useState(false)
   const [aiGuidance, setAiGuidance] = useState("")
-  // "Include a personalized note" (LinkedIn only). Off ⇒ requests go out with NO
-  // note — the worker sends straight through the note-less connect flow, which
-  // skips LinkedIn's monthly personalized-note limit entirely.
+  // Off: invites go out with no note, which skips LinkedIn's monthly note limit.
   const [withNote, setWithNote] = useState(true)
   const [running, setRunning] = useState(false)
   const [done, setDone] = useState(false)
@@ -123,7 +113,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
 
   const parseWorkbook = (buf: ArrayBuffer, name: string) => {
     const wb = XLSX.read(buf, { type: "array" })
-    // pick the sheet with the most usable columns for this mode
+    // Pick the sheet with the most usable columns for this mode.
     let best: { sheet: string; rows: Record<string, unknown>[]; score: number } | null = null
     for (const sheetName of wb.SheetNames) {
       const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[sheetName], {
@@ -186,13 +176,8 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       })
       .filter((r) => r.name && r.target)
 
-  // Key a row against its backend job. The server normalizes every LinkedIn
-  // target with its own `withProtocol` before storing it on the job payload
-  // (`jobs.service.ts` — keep the two in step), so a CSV carrying a bare
-  // "linkedin.com/in/x" comes back as "https://linkedin.com/in/x". Matching on
-  // the raw client value missed EVERY such row, and reconciliation drops rows
-  // with no matching job — the whole table would empty out. Idempotent, so
-  // applying it to both sides is safe.
+  // Normalise like the server's `withProtocol` (jobs.service.ts; keep in step) so
+  // a bare "linkedin.com/in/x" row matches its job.
   const targetKey = (t: string): string => {
     const s = String(t || "").trim()
     if (!s || mode !== "linkedin") return s
@@ -209,8 +194,7 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
     return "pending" // queued
   }
 
-  // "Close" a queued/scheduled profile: drop it from the queue view and cancel
-  // the backend job so it never sends.
+  // Remove a queued/scheduled row and cancel its job.
   const cancelRow = async (row: Row) => {
     setRows((rs) => rs.filter((r) => r.id !== row.id))
     if (row.jobId) {
@@ -255,40 +239,22 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
               (res.queuedDays > 1 ? ` · rest scheduled over ${res.queuedDays} days (9:00 AM)` : ""),
       )
       if (res.total === 0) {
-        // Nothing was queued at all, so there is no batch to poll and nothing
-        // will ever reconcile the speculative rows. Clear them here; the
-        // partial case is reconciled against the first poll below.
+        // Nothing was queued, so there's nothing to reconcile: clear the rows.
         setRows([])
         setRunning(false)
         return
       }
     } catch (e) {
-      // The request failed, so NOTHING was queued and no polling starts — the
-      // speculative rows would sit on "pending" forever. Same reconciliation
-      // rule as everywhere else: a row with no job behind it is not in the
-      // queue and must not be shown as if it were.
+      // The request failed and nothing was queued: clear the speculative rows.
       setRows([])
       setRunning(false)
       toast(e instanceof Error ? e.message : "Couldn't start the send")
       return
     }
 
-    // Poll the backend for real job statuses (worker paces sends with jitter).
-    //
-    // RECONCILIATION — why the first poll rewrites the table rather than just
-    // updating statuses. The backend now drops rows whose profile was already
-    // sent a connection request, so a 106-row upload can queue 18 jobs. The
-    // speculative setRows(list) at the top of start() listed all 106, and
-    // createSend answers with COUNTS only (total/today/skipped) — never which
-    // rows survived — so the counts alone cannot tell us what to remove. The
-    // batch listing is the first and only thing that names the surviving
-    // targets. Until we apply it, the table shows 88 rows that no job will ever
-    // resolve (stuck on "pending" forever) and the header's todayTotal is
-    // client-side `Math.floor(i / cap)` arithmetic over rows the server never
-    // accepted — it would claim ~20 today while 5 were really queued, and
-    // disagree with the toast. So: drop every row with no matching job, and take
-    // `day` from the server instead of recomputing it. The first poll runs
-    // immediately rather than after the 3s interval, to keep that window short.
+    // Poll job statuses. The first poll reconciles: the server skips profiles it
+    // already invited and only returns counts, so drop rows with no job and take
+    // `day` from the server. It runs immediately to keep that window short.
     let ticks = 0
     let reconciled = false
     const poll = async () => {
@@ -296,12 +262,9 @@ export function AutoSend({ mode, account }: { mode: Mode; account?: LinkedInAcco
       try {
         const jobs = await api.listJobs(batchId)
         const byTarget = new Map(jobs.map((j) => [targetKey(j.target), j]))
-        // An empty listing is a transient read, not proof the batch vanished —
-        // createSend already told us total > 0. Never reconcile against it.
+        // An empty listing is a transient read; never reconcile against it.
         if (jobs.length > 0) {
-          // Read the flag HERE, not inside the updater: React runs the updater
-          // on the next render, by which point `reconciled` is already true —
-          // the drop would never happen.
+          // Read the flag here: the updater runs after `reconciled` is already true.
           const firstPass = !reconciled
           reconciled = true
           setRows((rs) =>

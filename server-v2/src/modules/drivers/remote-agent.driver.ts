@@ -14,17 +14,9 @@ import {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * RemoteAgentDriver — selected when LINKEDIN_DRIVER=remote (set this on the DC VM
- * / any server that must NOT run a browser). It NEVER launches Playwright. Instead
- * it hands each action to the user's DESKTOP AGENT (which runs the REAL driver on
- * the user's own residential IP) and waits for the result.
- *
- * Bridge = Redis (already on the server):
- *   - action pushed to `agent:inbox:<accountId>` (a queue the agent polls)
- *   - result read from `agent:result:<token>` (the agent posts it via REST)
- *
- * Implements the same LinkedInDriver interface, so the worker's linkedin-actions
- * loop (worker.ts ~line 298) dispatches to it unchanged.
+ * LINKEDIN_DRIVER=remote: never launches a browser. Hands each action to the
+ * user's desktop agent over Redis (`agent:inbox:<accountId>` in,
+ * `agent:result:<token>` out) and waits for the result.
  */
 @Injectable()
 export class RemoteAgentDriver implements LinkedInDriver {
@@ -37,21 +29,10 @@ export class RemoteAgentDriver implements LinkedInDriver {
   }
 
   /**
-   * Push one job to the account's desktop agent and await its result JSON.
-   *
-   * Returns `{ result, accepted }`:
-   *   - result  = the parsed result JSON, or null if none arrived in time.
-   *   - accepted = whether the agent actually PICKED UP the job (rpop'd it, which
-   *                stamps `agent:accepted:<token>`). This lets the caller tell a
-   *                slow-but-running send apart from one the agent never took.
-   *
-   * Two timeouts:
-   *   - pickupMs: if the agent never accepts the job within this window it's
-   *     treated as unavailable (busy/stuck/offline) — nothing was sent, defer.
-   *   - hardCapMs: once ACCEPTED, wait this much longer for the result. The desktop
-   *     always posts a result, so this only elapses if the agent died mid-job; a
-   *     real (slow) send now returns its true outcome in-flow instead of being
-   *     misreported as agent_unavailable and rescheduled after it already went out.
+   * Push a job to the account's desktop agent and wait for its result.
+   * `accepted` says whether the agent picked it up. Not picked up within
+   * `pickupMs` → unavailable, nothing sent. Once accepted, wait up to `hardCapMs`
+   * so a slow real send returns its true outcome.
    */
   private async pushAndWait(
     accountId: string,
@@ -65,11 +46,8 @@ export class RemoteAgentDriver implements LinkedInDriver {
     const resultKey = `agent:result:${token}`;
     const acceptedKey = `agent:accepted:${token}`;
 
-    // Fast offline check. The desktop agent writes a heartbeat (`agent:hb:<id>`)
-    // on every poll (~5s). If none is present the agent is offline (laptop off /
-    // app closed) — don't lpush into an inbox nobody reads and then block a worker
-    // slot for the full timeout. Report unavailable immediately so the worker
-    // defers the job cheaply; one user's offline laptop can't starve other tenants.
+    // No heartbeat = agent offline: report unavailable at once instead of blocking a
+    // worker slot for the full timeout.
     if (!(await redis.get(`agent:hb:${accountId}`))) {
       this.logger.warn(`no agent heartbeat for ${accountId} — agent offline, deferring ${jobObj.action}`);
       return { result: null, accepted: false };
@@ -91,19 +69,16 @@ export class RemoteAgentDriver implements LinkedInDriver {
           return { result: null, accepted: true };
         }
       }
-      // Once the agent has picked the job up, be patient — the result is coming.
       if (!accepted) accepted = !!(await redis.get(acceptedKey));
       const elapsed = Date.now() - start;
       if (accepted) {
         if (elapsed > opts.hardCapMs) {
-          // Accepted but no result even after the hard cap — the agent likely died
-          // mid-job. Rare. Leave the (already rpop'd) job alone and report pending.
+          // Accepted but no result: the agent likely died mid-job. Report pending.
           this.logger.warn(`agent accepted ${jobObj.action}/${accountId} but never returned — deferring`);
           return { result: null, accepted: true };
         }
       } else if (elapsed > opts.pickupMs) {
-        // Never picked up within the pickup window → busy/stuck agent. Pull it back
-        // so it can't run late, and defer. Nothing was sent.
+        // Never picked up: pull it back so it can't run late, and defer. Nothing was sent.
         await redis.lrem(inbox, 0, job).catch(() => undefined);
         this.logger.warn(`agent never picked up ${jobObj.action}/${accountId} — deferring`);
         return { result: null, accepted: false };
@@ -120,25 +95,17 @@ export class RemoteAgentDriver implements LinkedInDriver {
   ): Promise<LinkedInActionResult> {
     const accountId = ctx?.accountId;
     if (!accountId) return { status: 'failed', error: 'no_account_id' };
-    // The desktop agent runs jobs SERIALLY, and a connect flow includes a profile
-    // load LinkedIn often stalls on (observed 30s+ gotos) plus note typing — so a
-    // single action can run well past a minute. pushAndWait waits patiently ONCE
-    // the agent has accepted the job (up to hardCapMs) so a slow-but-successful
-    // send returns its true outcome instead of being misreported as offline and
-    // rescheduling an already-sent invite; it only fast-fails (pickupMs) when the
-    // agent never took the job at all (nothing sent → safe to defer).
+    // The agent runs jobs serially and a connect can take over a minute; the
+    // timeouts are explained on pushAndWait.
     const res = await this.pushAndWait(
       accountId,
-      // Forward the session cookie so the desktop agent acts as the logged-in
-      // user. proxy/fingerprint are intentionally NOT sent — actions run on the
-      // user's own residential IP + persistent profile, same as the login did.
+      // Send the session cookies. Proxy/fingerprint are not sent: the agent uses the
+      // user's own IP and persistent profile.
       { token: randomUUID(), action, accountId, workspaceId: ctx?.workspaceId, li_at: ctx?.li_at, cookies: ctx?.cookies, ...payload },
       { pickupMs: 120_000, hardCapMs: 420_000 },
     );
     if (res.result) return res.result as LinkedInActionResult;
-    // accepted (agent had it, no result) vs never-picked-up are handled differently
-    // by the worker: 'agent_result_pending' means "may have gone out, re-verify"
-    // while 'agent_unavailable' means "definitely not sent, agent offline/busy".
+    // 'agent_result_pending' = may have been sent; 'agent_unavailable' = not sent.
     return { status: 'failed', error: res.accepted ? 'agent_result_pending' : 'agent_unavailable' };
   }
 
@@ -164,17 +131,14 @@ export class RemoteAgentDriver implements LinkedInDriver {
     return this.dispatch('endorse_skill', ctx, { targetUrl });
   }
 
-  // Sync + withdraw run on the desktop agent's own timer (not dispatched per-job);
-  // return safe no-ops here so the server-side sync loop stays quiet in remote mode.
+  // Sync and withdraw run on the desktop agent's own timer; no-ops here.
   async syncAccount(_ctx?: LinkedInActionContext): Promise<LinkedInSyncResult> {
     return { accepted: [], replies: [] };
   }
   async withdrawStaleInvites() {
     return { withdrawn: 0 };
   }
-  // Login runs ON the desktop agent (one-time, on the user's own residential IP) —
-  // never server-side. Dispatch the credentials to the agent and await the result.
-  // Longer timeout than actions: a real login may involve a 2FA/checkpoint step.
+  // Login runs on the desktop agent, never server-side; longer timeout for 2FA.
   async login(ctx: LinkedInLoginContext): Promise<LinkedInLoginResult> {
     const accountId = ctx.accountId;
     if (!accountId) return { status: 'failed', error: 'no_account_id' };
@@ -189,7 +153,6 @@ export class RemoteAgentDriver implements LinkedInDriver {
         password: ctx.password,
         totpSecret: ctx.totpSecret,
       },
-      // A login can involve a 2FA/checkpoint step → be generous once accepted.
       { pickupMs: 120_000, hardCapMs: 420_000 },
     );
     if (res.result) return res.result as LinkedInLoginResult;

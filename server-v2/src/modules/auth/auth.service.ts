@@ -69,10 +69,8 @@ export class AuthService {
   }
 
   /**
-   * Find the workspace a user belongs to. `memberships` is RLS-scoped and we
-   * have no workspace context at login time, so we probe each workspace under
-   * its own context. Fine for now; production should use a BYPASSRLS service
-   * role or a denormalized lookup.
+   * Find the user's workspace. `memberships` is RLS-scoped and there is no
+   * workspace context at login, so each workspace is probed in turn.
    */
   private async findMembership(
     userId: string,
@@ -172,8 +170,7 @@ export class AuthService {
     const db = getDb();
     const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
-    // Look up the session regardless of revocation state so we can tell a
-    // concurrent-refresh race apart from an explicit logout / stale replay.
+    // Look up the session even if revoked, to tell a refresh race from a logout.
     const session = await db
       .selectFrom('user_sessions')
       .selectAll()
@@ -189,11 +186,8 @@ export class AuthService {
     }
 
     if (session.revoked_at) {
-      // This token was already spent. Distinguish two cases:
-      //   - rotated within the grace window → a second tab racing the same
-      //     token; issue fresh tokens instead of logging it out.
-      //   - revoked by logout (rotated_at NULL), or rotated outside the grace
-      //     window (stale replay / possible theft) → reject.
+      // Token already spent. Rotated within the grace window → a second tab racing;
+      // issue fresh tokens. Logged out, or rotated earlier (replay/theft) → reject.
       const graceMs = getEnv().REFRESH_ROTATION_GRACE_MS;
       const rotatedAt = session.rotated_at ? new Date(session.rotated_at).getTime() : null;
       const withinGrace = rotatedAt !== null && Date.now() - rotatedAt <= graceMs;
@@ -218,9 +212,8 @@ export class AuthService {
       meta,
     );
 
-    // Mark the presented token rotated + revoked and link it to its replacement.
-    // Only on the first (non-revoked) rotation — a grace-path hit leaves the
-    // original replaced_by pointing at the first replacement.
+    // Mark the token rotated + revoked and link it to its replacement (first
+    // rotation only).
     if (!session.revoked_at) {
       const now = new Date().toISOString();
       await db
@@ -344,10 +337,7 @@ export class AuthService {
     return { accessToken, refreshToken, sessionId: row.id };
   }
 
-  /**
-   * Ensures the dev bypass user and workspace exist.
-   * Called once on startup when AUTH_BYPASS=true.
-   */
+  /** Create the dev bypass user and workspace (AUTH_BYPASS=true only). */
   async ensureBypassUser(): Promise<void> {
     const db = getDb();
     const userId = '00000000-0000-0000-0000-000000000001';

@@ -2,15 +2,8 @@ import { Kysely, sql } from 'kysely';
 import { DatabaseSchema, getDb } from './kysely';
 
 /**
- * Executes a callback inside a PostgreSQL transaction with RLS tenant scoping.
- *
- * Before any user query runs, we `SET LOCAL app.workspace_id = '<uuid>'` so that
- * every RLS policy on tenant-scoped tables automatically filters by that workspace.
- * SET LOCAL is transaction-scoped — it reverts on COMMIT/ROLLBACK.
- *
- * @param workspaceId The UUID of the workspace to scope the transaction to.
- * @param callback    A function that receives the transactional Kysely instance.
- * @returns           The return value of the callback.
+ * Run `callback` in a transaction with `SET LOCAL app.workspace_id`, so every RLS
+ * policy filters to that workspace. Reverts on commit/rollback.
  */
 export async function withWorkspace<T>(
   workspaceId: string,
@@ -23,14 +16,7 @@ export async function withWorkspace<T>(
   });
 }
 
-/**
- * Executes a callback inside a transaction WITHOUT RLS scoping.
- * Used for auth/identity queries (users, sessions, tokens) that are not
- * workspace-scoped and should bypass tenant isolation policies.
- *
- * @param callback A function that receives the transactional Kysely instance.
- * @returns        The return value of the callback.
- */
+/** Run `callback` in a transaction with no tenant scope (users, sessions, tokens). */
 export async function withoutTenant<T>(
   callback: (trx: Kysely<DatabaseSchema>) => Promise<T>,
 ): Promise<T> {

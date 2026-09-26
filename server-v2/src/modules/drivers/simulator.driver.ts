@@ -14,11 +14,8 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const fakeId = (p: string) => p + Math.random().toString(36).slice(2, 9);
 
 /**
- * Fake driver for dev/tests — never contacts LinkedIn. It mirrors the *shape* of
- * the real driver: every action resolves to a classified outcome, and
- * `syncAccount` is read-only (returns observations; the worker applies DB
- * writes), exactly like the Playwright driver. That parity means the worker's
- * dispatch + sync flow is exercised identically whichever driver is selected.
+ * Fake driver for dev/tests; never contacts LinkedIn. Same outcome shapes as the
+ * real driver, and `syncAccount` is read-only, so the worker's flow is identical.
  */
 @Injectable()
 export class SimulatorDriver implements LinkedInDriver, EmailDriver {
@@ -69,10 +66,8 @@ export class SimulatorDriver implements LinkedInDriver, EmailDriver {
   }
 
   /**
-   * Read-only simulated sync: promotes a share of `invited` leads to "accepted"
-   * and a share of already-`accepted` leads to "replied", returning them as
-   * observations. The worker applies the state changes — so a lead progresses
-   * invited → accepted → replied across successive sync passes, just like prod.
+   * Simulated read-only sync: reports some invited leads as accepted and some
+   * accepted leads as replied; the worker applies the changes.
    */
   async syncAccount(ctx?: LinkedInActionContext): Promise<LinkedInSyncResult> {
     const wsId = ctx?.workspaceId;

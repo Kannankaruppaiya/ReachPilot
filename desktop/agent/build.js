@@ -1,7 +1,6 @@
-// Bundles the REAL server driver (playwright-linkedin.driver.ts) for the desktop
-// agent — no code duplication. NestJS/env/ioredis are aliased to local shims;
-// playwright stays external (provided by the desktop app at runtime). Output:
-// agent/driver.bundle.js, requirable from the Electron main process.
+// Bundles the real server driver (playwright-linkedin.driver.ts) into
+// agent/driver.bundle.js. NestJS/env/ioredis map to local shims; playwright is
+// external (the app provides it).
 const esbuild = require('esbuild');
 const path = require('path');
 

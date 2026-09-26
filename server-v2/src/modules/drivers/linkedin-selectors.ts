@@ -1,71 +1,40 @@
 /**
- * Central LinkedIn selector registry + a self-healing resolver.
- *
- * WHY THIS FILE EXISTS
- * --------------------
- * LinkedIn ships hashed CSS classes, auto-generated ember IDs, A/B-tested
- * layouts and lazy-loaded content — any single selector breaks on a redesign.
- * The durable pattern (2026 best practice) is a LAYERED CASCADE: try the most
- * meaningful, most stable locator first (visible text / ARIA role), fall back to
- * progressively looser ones, and LOG which tier won so drift is visible before it
- * breaks in production.
- *
- * Instead of scattering these cascades across the 900-line driver, every element
- * the driver needs is defined ONCE here as an ordered list of candidate locators.
- * A LinkedIn redesign is then a one-file edit, not an archaeology dig through the
- * driver. `resolveFirst()` walks the list and returns the first match.
- *
- * Ordering rule (most stable → least):
- *   1. visible TEXT / accessible NAME   (getByRole … { name })   — survives class churn
- *   2. ARIA attributes                  ([aria-label=…])         — a11y is stable
- *   3. data-* / test ids                ([data-test-…])          — semi-stable
- *   4. structural / class hints         (.artdeco-…)             — last resort
+ * LinkedIn selector registry. Each element the driver needs is an ordered
+ * cascade, most stable first: accessible name → ARIA attributes → data-test ids →
+ * class hints. `resolveFirst()` returns the first match and logs when a fallback
+ * tier wins, so a LinkedIn redesign shows up in logs and is a one-file fix.
  */
 import type { Page, Locator } from 'playwright';
 
 /**
- * The scopes a candidate can anchor against.
- *  - `page`  : always present — the whole document.
- *  - `card`  : the profile top-card action bar (the <main> region). Scoping here
- *              avoids matching stray "Connect"/"More" strings in posts, the
- *              "People also viewed" rail, or recent-activity cards.
- *  - `modal` : an open dialog (e.g. the send-invite modal), when one is present.
- * Candidates fall back to `page` when the tighter scope isn't available.
+ * Where a candidate can anchor: `page`, `card` (the profile top card, which
+ * avoids matching rails and posts) or `modal` (an open dialog). Falls back to `page`.
  */
 export interface SelectorScope {
   page: Page;
   card?: Locator;
   modal?: Locator;
-  /** The opened overflow ("More") dropdown. Connect-menu items MUST resolve from
-   *  inside this, never page-wide: the "People also viewed" / "More profiles"
-   *  rails carry their own Connect anchors, and a page-wide match sent invites to
-   *  the wrong (rail) person. */
+  /**
+   * The open "More" dropdown. Menu items resolve only inside it, never page-wide
+   * (the rails have their own Connect anchors).
+   */
   menu?: Locator;
 }
 
 export type Candidate = (s: SelectorScope) => Locator;
 
 /**
- * The connect control's accessible name. LinkedIn labels it "Invite <Name> to
- * connect" (aria-label) while rendering the visible word "Connect". Match the
- * invite phrase as a SUBSTRING (the name/trailing text varies) and "Connect"
- * anchored (so it never catches "Connected" / "Reconnect").
+ * Connect's accessible name: "Invite <Name> to connect" as a substring, or exactly
+ * "Connect" (never "Connected" / "Reconnect").
  */
 export const CONNECT_NAME = /invite .* to connect|^connect$/i;
 
-// Both Page and Locator expose getByRole/locator with identical signatures, so a
-// candidate can anchor against either; the union keeps the fallback-to-page ergonomic.
 const scoped = (s: SelectorScope): Page | Locator => s.card ?? s.page;
 const modalScoped = (s: SelectorScope): Page | Locator => s.modal ?? s.page;
-// Menu items resolve ONLY from inside the open dropdown when we have it. Falling
-// back to the whole page is what let a rail profile's Connect anchor win — so
-// there is deliberately NO page fallback here.
+// Menu items resolve only inside the open dropdown; deliberately no page fallback.
 const menuScoped = (s: SelectorScope): Page | Locator => s.menu ?? s.page;
 
-/**
- * The registry. Each key is an ordered candidate cascade for ONE logical element.
- * Add/adjust selectors here — never inline them back into the driver.
- */
+/** Candidate cascades per element. Add selectors here, never inline in the driver. */
 export const SELECTORS = {
   /** The "Connect" button on the profile top card (direct, not via More menu). */
   connectButton: [
@@ -79,16 +48,14 @@ export const SELECTORS = {
     (s) => scoped(s).getByRole('button', { name: /^More actions$/i }),
     (s) => scoped(s).getByRole('button', { name: /^More$/i }),
     (s) => s.page.getByRole('button', { name: /^More actions$/i }),
-    // Page-wide `^More$` too. The card-scoped tiers miss whenever the top-card
-    // scope resolves wrong, and the observed button is labelled "More" — not
-    // "More actions" — so without this the whole overflow path was unreachable.
+    // Page-wide `^More$` too, for when the card scope resolves wrong.
     (s) => s.page.getByRole('button', { name: /^More$/i }),
   ] as Candidate[],
 
-  /** The Connect item inside the opened overflow dropdown. LinkedIn A/B-tests the
-   *  item's element: role=menuitem, role=button, or — very commonly — a plain
-   *  <a href="/preload/custom-invite/…"> anchor (role=link). The anchor tiers are
-   *  what the deep-link goto path in the driver relies on resolving. */
+  /**
+   * The Connect item in the open dropdown: a menuitem, button, or (commonly) a
+   * custom-invite <a>, which the driver's deep-link path relies on.
+   */
   connectMenuItem: [
     (s) => menuScoped(s).getByRole('menuitem', { name: CONNECT_NAME }),
     (s) => menuScoped(s).getByRole('button', { name: CONNECT_NAME }),
@@ -163,13 +130,8 @@ export interface DriftLogger {
 }
 
 /**
- * Walk a candidate cascade and return the first locator that actually matches an
- * element on the page (count > 0). Returns null if none match.
- *
- * When a fallback tier wins (tier > 0), it logs a drift warning: the primary
- * selector stopped matching, which usually means LinkedIn shipped a redesign.
- * Piping these warnings to alerting turns "automation silently broke" into "we
- * were told the day the DOM changed".
+ * Return the first candidate that matches a visible element, or null. Logs a
+ * drift warning when a fallback tier wins (LinkedIn likely changed the DOM).
  */
 export async function resolveFirst(
   scope: SelectorScope,
@@ -178,11 +140,8 @@ export async function resolveFirst(
   logger?: DriftLogger,
 ): Promise<Locator | null> {
   for (let tier = 0; tier < candidates.length; tier++) {
-    // CRITICAL: only match VISIBLE elements. LinkedIn ships hidden duplicate
-    // controls (a real "Connect" button plus off-screen copies); a bare
-    // `.first()` can resolve to a hidden clone, and clicking that either no-ops
-    // or — via a force-click fallback — lands at a stale coordinate somewhere
-    // else on the page. Filtering to visible picks the button the user sees.
+    // Visible only: LinkedIn ships hidden duplicate controls, and clicking one no-ops
+    // or misfires.
     const loc = candidates[tier](scope).filter({ visible: true }).first();
     const hit = await loc.count().catch(() => 0);
     if (hit > 0) {

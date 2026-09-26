@@ -48,18 +48,10 @@ interface PoolAccount {
 }
 
 /**
- * Private email warm-up loop (the mechanic behind Instantly/Mailwarm-style
- * warm-up, scoped to the workspace's OWN connected mailboxes):
- *
- *  - SEND: each Gmail mailbox mails a random peer mailbox a short, natural,
- *    spintax-varied note, on a ramped daily budget with randomized gaps.
- *  - RECEIVE: each mailbox finds warm-up mail addressed to it (matched by a
- *    per-workspace token in the body), and produces the engagement signals
- *    Gmail's filter weighs: rescue from spam → inbox, mark read, star some,
- *    reply to some (threaded).
- *
- * Everything is Gmail API only — no browser. Needs ≥2 active Gmail mailboxes
- * in a workspace and the gmail.modify scope (re-connect older mailboxes).
+ * Warm-up between the workspace's own Gmail mailboxes. Send: each mails a random
+ * peer on a ramped budget. Receive: mail found by a per-workspace token is moved
+ * out of spam, read, starred and sometimes replied to. Gmail API only; needs ≥2
+ * mailboxes and the gmail.modify scope.
  */
 @Injectable()
 export class EmailWarmupService {
@@ -100,8 +92,7 @@ export class EmailWarmupService {
   private async runPool(workspaceId: string, pool: PoolAccount[]): Promise<void> {
     const token = this.token(workspaceId);
 
-    // Receive side first: engagement on already-delivered mail matters more
-    // than sending new mail, and it must run even outside sending hours.
+    // Receive side first; it runs even outside sending hours.
     for (const acct of pool) {
       try {
         await this.engageInbox(acct, pool, token);

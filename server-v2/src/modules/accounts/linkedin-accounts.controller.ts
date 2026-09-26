@@ -14,10 +14,7 @@ export class LinkedinAccountsController {
     return this.linkedin.getAccountState(user.workspaceId);
   }
 
-  /**
-   * Save LinkedIn limits — the single place limits are controlled (Settings →
-   * LinkedIn limits). The pacing engine enforces exactly what's stored here.
-   */
+  /** Save LinkedIn limits (Settings); pacing enforces exactly what's stored. */
   @Patch('limits')
   async updateLimits(
     @Body() body: {
@@ -78,9 +75,7 @@ export class LinkedinAccountsController {
 
   @Post('2fa/verify')
   async verify2fa(@Body() body: { secret?: string }, @Req() req: Request) {
-    // Fall back to the JWT's workspace (like every other endpoint) — NOT a
-    // hardcoded demo workspace. Using the wrong workspace made enqueueLogin
-    // look in an empty tenant, so no login job was ever created.
+    // Use the JWT's workspace, like every other endpoint.
     const user = (req as any).user as JwtPayload;
     const workspaceId = (req as any).workspaceId || user.workspaceId;
     const secret = body.secret;

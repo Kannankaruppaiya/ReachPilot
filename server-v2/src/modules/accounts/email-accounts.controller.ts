@@ -8,9 +8,8 @@ export class EmailAccountsController {
   constructor(private readonly email: EmailAccountsService) {}
 
   /**
-   * Onboarding Gmail step. The mailbox itself is connected through Google OAuth
-   * (/api/integrations/google/connect); this saves its daily limit and marks the
-   * step done. `skip: true` finishes the step with no mailbox connected.
+   * Onboarding Gmail step: save the daily limit for the OAuth-connected mailbox.
+   * `skip: true` finishes the step without one.
    */
   @Post('connect')
   async connect(@Body() body: { dailyLimit?: number; skip?: boolean }, @Req() req: Request) {

@@ -10,10 +10,7 @@ import pino from 'pino';
 
 const logger = pino({ name: 'exception-filter' });
 
-/**
- * Global exception filter that transforms all errors into the frontend's
- * expected `{ error: "human-readable message" }` shape with proper HTTP status.
- */
+/** Turns every error into the frontend's `{ error: "message" }` shape with its status. */
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
@@ -29,9 +26,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       if (typeof exResponse === 'string') {
         message = exResponse;
       } else if (typeof exResponse === 'object' && exResponse !== null) {
-        // Nest's HttpException shape is { statusCode, message, error } where
-        // `message` holds the human-readable reason and `error` is just the
-        // status name ("Bad Request") — prefer the real message.
+        // HttpException's `message` is the real reason; `error` is only the status name.
         const obj = exResponse as Record<string, unknown>;
         if (typeof obj['message'] === 'string') {
           message = obj['message'];

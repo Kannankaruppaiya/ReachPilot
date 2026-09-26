@@ -15,11 +15,7 @@ export interface AuditEntry {
   ip?: string;
 }
 
-/**
- * Writes rows to the audit_log table for security-relevant events:
- * logins, secret access, limit changes, exports, etc.
- * Never logs secrets, passwords, or tokens.
- */
+/** Audit log for security events (logins, secret access, limit changes). Never logs secrets. */
 @Injectable()
 export class AuditService {
   async log(entry: AuditEntry): Promise<void> {
@@ -33,7 +29,6 @@ export class AuditService {
       ip: entry.ip || null,
     };
     try {
-      // audit_log is RLS-scoped — write under the workspace context when known.
       const insert = (db: any) => db.insertInto('audit_log').values(values).execute();
       if (entry.workspaceId) {
         await withWorkspace(entry.workspaceId, insert);

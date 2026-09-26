@@ -7,23 +7,8 @@ import { KeyManagementService } from './key-management.service';
 import { AuditService } from '@/modules/audit/audit.service';
 
 /**
- * Secrets service implementing AES-256-GCM envelope encryption.
- *
- * Every secret (LinkedIn password, TOTP codes, OAuth tokens, etc.) is
- * encrypted with a DEK (data encryption key). The DEK itself is wrapped
- * by the master key and stored in `encryption_keys`.
- *
- * Flow for encrypt:
- *   1. Generate or reuse a DEK (via KeyManagementService).
- *   2. Generate a random 12-byte GCM nonce.
- *   3. Encrypt plaintext with DEK using AES-256-GCM.
- *   4. Store ciphertext + nonce + key_id in `secrets` table.
- *
- * Flow for decrypt:
- *   1. Load secret row (ciphertext, nonce, key_id).
- *   2. Unwrap the DEK via KeyManagementService.
- *   3. Decrypt ciphertext with DEK + nonce.
- *   4. Return plaintext (NEVER log it).
+ * AES-256-GCM envelope encryption. Each secret is encrypted with a DEK, which is
+ * wrapped by the master key (KeyManagementService). Never log plaintext.
  */
 @Injectable()
 export class SecretsService {
@@ -32,10 +17,7 @@ export class SecretsService {
     private readonly audit: AuditService,
   ) {}
 
-  /**
-   * Encrypts a plaintext value and stores it in the secrets table.
-   * Returns the secret row ID.
-   */
+  /** Encrypt and store a value; returns the secret id. */
   async encrypt(
     plaintext: string,
     kind: string,
@@ -71,17 +53,13 @@ export class SecretsService {
       return row.id as string;
     };
 
-    // Use withWorkspace to set RLS context when workspaceId is available
     if (options.workspaceId) {
       return withWorkspace(options.workspaceId, doInsert);
     }
     return doInsert(getDb());
   }
 
-  /**
-   * Decrypts a secret by its ID. Returns the plaintext string.
-   * Logs an audit entry for the access.
-   */
+  /** Decrypt a secret by id; the access is audited. */
   async decrypt(
     secretId: string,
     auditContext?: { userId?: string; workspaceId?: string; ip?: string },
@@ -124,7 +102,7 @@ export class SecretsService {
     if (auditContext?.workspaceId) {
       return withWorkspace(auditContext.workspaceId, doDecrypt);
     }
-    // Fallback: resolve workspace from the secret row using subquery
+    // No workspace given: resolve it from the secret row.
     const db = getDb();
     return db.transaction().execute(async (trx) => {
       await sql`SELECT set_config('app.workspace_id', COALESCE((SELECT workspace_id::text FROM secrets WHERE id = ${secretId}), ''), true)`.execute(trx);
@@ -132,9 +110,6 @@ export class SecretsService {
     });
   }
 
-  /**
-   * Deletes a secret by ID.
-   */
   async remove(secretId: string, workspaceId?: string): Promise<void> {
     const doDelete = async (db: any) => {
       await db.deleteFrom('secrets').where('id', '=', secretId).execute();
@@ -143,7 +118,7 @@ export class SecretsService {
     if (workspaceId) {
       return withWorkspace(workspaceId, doDelete);
     }
-    // Fallback: resolve workspace from the row
+    // No workspace given: resolve it from the secret row.
     const db = getDb();
     return db.transaction().execute(async (trx) => {
       await sql`SELECT set_config('app.workspace_id', COALESCE((SELECT workspace_id::text FROM secrets WHERE id = ${secretId}), ''), true)`.execute(trx);

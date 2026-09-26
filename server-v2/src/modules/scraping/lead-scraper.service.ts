@@ -28,22 +28,10 @@ export interface SearchOptions {
 }
 
 /**
- * Free, local lead scraper. Instead of paying Apify per profile (and hitting the
- * free-tier run limit), this queries a public search engine for LinkedIn profile
- * results and parses the SERP cards — the same signal our Apify rag-web-browser
- * fallback used, run locally with no credits.
- *
- * Plain HTTP and headless browsers get bot-blocked (Google/Bing/DuckDuckGo all
- * return CAPTCHA challenges). So it drives **patchright** — a drop-in Playwright
- * fork that patches the CDP/webdriver leaks bot-detectors look for — as a HEADFUL
- * real-Chrome session, which passes Google's checks even from a plain home IP.
- * (Add a residential proxy later, per account, when scaling volume.)
- *
- * It NEVER touches a LinkedIn account session or scrapes linkedin.com directly
- * (that authwalls and risks the account) — it only reads Google results, so a
- * scrape run can never get an outreach account banned.
- *
- * patchright is CommonJS-friendly but loaded lazily so a missing browser channel
+ * Free local lead scraper: searches Google for LinkedIn profile results and
+ * parses the result cards. Uses patchright (a patched Playwright fork) in headful
+ * Chrome, because plain HTTP and headless browsers get CAPTCHA-blocked. Never
+ * touches a LinkedIn session or linkedin.com. Loaded lazily so a missing browser
  * can't break worker boot.
  */
 @Injectable()
@@ -75,9 +63,8 @@ export class LeadScraperService {
   }
 
   /**
-   * Parse a LinkedIn SERP title + snippet into a lead. Titles read like
-   * "Ramasamy Soundararajan - Finance Head" (optionally "... | LinkedIn"); the
-   * snippet usually carries "Role · Company ... City, Tamil Nadu, India".
+   * Parse a SERP title ("Name - Role | LinkedIn") and snippet
+   * ("Role · Company … City, State, India") into a lead.
    */
   private parseResult(rawTitle: string, snippet: string, url: string): ScrapedLead | null {
     const linkedinUrl = this.cleanProfileUrl(url);
@@ -112,7 +99,7 @@ export class LeadScraperService {
     };
   }
 
-  /* ---------------- data-quality guards (kill false leads) ---------------- */
+  /* ---------------- data-quality guards ---------------- */
 
   // Company/entity markers — a "name" containing these is not a person.
   private static readonly NAME_JUNK =
@@ -197,9 +184,8 @@ export class LeadScraperService {
   }
 
   /**
-   * The anti-false gate: normalize + validate every candidate, ground its fields
-   * against the original SERP text, drop non-persons / off-target titles /
-   * wrong-region leads, and dedup by profile slug (subdomain-agnostic).
+   * Normalise and validate each candidate, ground its fields in the SERP text,
+   * drop non-persons, off-target titles and wrong regions, and dedup by slug.
    */
   private validateClean(
     cands: (ScrapedLead & { sourceText: string })[],
@@ -234,24 +220,21 @@ export class LeadScraperService {
   }
 
   /**
-   * Search Google for LinkedIn profiles matching the titles + location and return
-   * up to `maxResults` unique, parsed leads. Best-effort: a blocked/empty load
-   * returns whatever was gathered rather than throwing.
+   * Search Google for matching profiles, up to `maxResults`. Best-effort: a
+   * blocked load returns what was gathered instead of throwing.
    */
   async search(opts: SearchOptions): Promise<ScrapedLead[]> {
     const env = getEnv();
     const maxResults = Math.min(Math.max(opts.maxResults ?? 15, 1), 100);
     const query = this.buildQuery(opts.titles, opts.location);
-    // Cursor-driven pagination: start at opts.startPage and fetch `pages` pages so
-    // a rerun (given a later startPage) sweeps NEW results, not the same page 1.
+    // Start at the cursor so a rerun sweeps new results, not page 1 again.
     const startPage = Math.max(opts.startPage ?? 0, 0);
     const pages = Math.min(Math.max(opts.pages ?? Math.ceil(maxResults / 8), 1), 10);
     this.logger.log(
       `Scraping Google for "${query}" (target ${maxResults}, engine=${env.SCRAPER_ENGINE}, pages ${startPage}..${startPage + pages - 1})`,
     );
 
-    // Fetch is pluggable; every engine returns the same raw SERP rows and feeds
-    // the one extract + validate pipeline below.
+    // Every engine returns the same raw rows for the one extract + validate pipeline.
     let raw: SerpRaw[];
     if (env.SCRAPER_ENGINE === 'multi') {
       raw = await this.fetchRawMulti(query, startPage, pages, maxResults);
@@ -271,9 +254,8 @@ export class LeadScraperService {
   }
 
   /**
-   * Multi-engine: rotate across search engines with per-engine block cooldown so
-   * one CAPTCHA can't kill the run, and aggregate results across all of them.
-   * `target` overshoots maxResults to absorb dedup/validation loss downstream.
+   * Rotate across search engines with a per-engine block cooldown and merge the
+   * results. `target` overshoots maxResults to absorb dedup losses.
    */
   private fetchRawMulti(
     query: string,
@@ -308,8 +290,7 @@ export class LeadScraperService {
       await page.waitForTimeout(3500);
       await this.dismissConsent(page);
 
-      // Pull title / href / snippet from each result whose link is a profile. The
-      // result <a> is the only linkedin/in anchor that also wraps an <h3>.
+      // The result <a> is the only linkedin.com/in anchor that wraps an <h3>.
       return await page
         .evaluate(() => {
           const items: { title: string; href: string; snippet: string }[] = [];
@@ -335,9 +316,8 @@ export class LeadScraperService {
   }
 
   /**
-   * Engine-agnostic: turn raw SERP rows into clean leads. One batched Gemini
-   * clean-extract, merged PER-URL with the regex parse (a partial/failed AI
-   * extraction never loses leads), then the anti-false validation gate.
+   * Raw SERP rows → clean leads: one batched Gemini extraction merged per URL with
+   * the regex parse (AI failures never lose leads), then the validation gate.
    */
   private async assembleLeads(
     raw: SerpRaw[],

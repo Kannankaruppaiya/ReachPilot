@@ -10,7 +10,6 @@ export class BillingService {
   }
 
   async getSubscription(workspaceId: string): Promise<any> {
-    // subscriptions is RLS-scoped (plans is not).
     const sub = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('subscriptions')
@@ -20,7 +19,7 @@ export class BillingService {
     );
 
     if (!sub) {
-      // Auto-provision free trial if none exists
+      // No subscription yet: provision one (currently 'pro').
       return this.createSubscription(workspaceId, 'pro');
     }
 

@@ -53,10 +53,7 @@ export class JobsController {
     return this.jobs.listJobs(workspaceId, kind, batchId);
   }
 
-  /**
-   * Every LinkedIn connection request ever sent from this workspace, with live
-   * delivery + acceptance/reply outcome. Backs the "Connections" page.
-   */
+  /** Every connection request sent from this workspace, with its outcome (Connections page). */
   @Get('connections')
   async connections(@Req() req: Request) {
     const user = (req as any).user as JwtPayload;
@@ -72,8 +69,7 @@ export class JobsController {
     return this.jobs.cancelJob(workspaceId, id);
   }
 
-  /** Bulk-delete jobs — clear the queue or wipe for a fresh test.
-   *  Body: { statuses?: string[]; kind?: string }. Empty body clears everything. */
+  /** Bulk-delete jobs. Body: { statuses?: string[]; kind?: string }; empty clears everything. */
   @Post('jobs/clear')
   async clearJobs(
     @Body() body: { statuses?: string[]; kind?: string },
@@ -84,11 +80,7 @@ export class JobsController {
     return this.jobs.deleteJobs(workspaceId, { statuses: body?.statuses, kind: body?.kind });
   }
 
-  /**
-   * Put back the leads a not-their-fault failure burned (the "Retry failed"
-   * button). Only failures that provably never sent an invite are moved —
-   * `isRequeueableFailure` is the allowlist — so this can never double-send.
-   */
+  /** "Retry failed": re-queue only failures that provably never sent (isRequeueableFailure). */
   @Post('jobs/requeue-failed')
   async requeueFailed(@Body() body: { kind?: string }, @Req() req: Request) {
     const user = (req as any).user as JwtPayload;

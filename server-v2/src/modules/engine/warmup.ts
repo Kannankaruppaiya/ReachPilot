@@ -1,15 +1,6 @@
-/**
- * Warm-up ramp — the SINGLE source of truth for how a LinkedIn account's daily
- * allowance grows over time. Used by PacingService (to enforce the cap) and by
- * the accounts API (to show the user their real warm-up state). Keeping both on
- * this one function means the number the UI shows always matches what the engine
- * actually allows.
- *
- * Curve (Expandi default): start at 5/day, add 3 every 2 days, up to the
- * warm-up target — the SINGLE daily ceiling. (warmup_daily_limit is kept in
- * sync with the target and only survives as a fallback for legacy accounts
- * that were created before a target was stored.)
- */
+// LinkedIn warm-up ramp, shared by PacingService and the accounts API so the UI
+// shows what pacing enforces. Starts at 5/day and adds 3 every 2 days up to the
+// target (warmup_daily_limit is only a fallback for legacy accounts).
 
 export interface WarmupState {
   /** Base actions allowed today (before the ±15% daily jitter). */
@@ -34,20 +25,9 @@ function asTime(d: Date | string | null | undefined): number | null {
 }
 
 /**
- * Which date the warm-up ramp should measure from: the EARLIER of when the
- * account was connected and when its row was created.
- *
- * `connect()` rewrites `connected_at` every time credentials are saved — even
- * for an account that already exists — so on its own it answers "when was the
- * password last re-entered", not "how long has this account been running". A
- * long-lived account was knocked back to 5/day by a password change while
- * holding 159 sent invites. `created_at` never moves, so taking the earlier of
- * the two makes the ramp immune to that AND repairs rows already damaged, with
- * no migration.
- *
- * An unparseable date is ignored rather than trusted: `new Date('nonsense')` is
- * NaN, and letting that through would make an account look infinitely old and
- * skip warm-up altogether — failure in the dangerous direction.
+ * Ramp origin: the earlier of connected_at and created_at (connect() rewrites
+ * connected_at on every credential save). Unparseable dates are ignored, never
+ * treated as "infinitely old".
  */
 export function warmupOrigin<T extends Date | string | null | undefined>(
   connectedAt: T,
@@ -66,8 +46,7 @@ export function computeWarmup(
   warmupTarget?: number | null,
   now: Date = new Date(),
 ): WarmupState {
-  // Single ceiling = the warm-up target. Fall back to warmup_daily_limit only
-  // for legacy accounts that never had a target set.
+  // Fall back to warmup_daily_limit only for legacy accounts with no target.
   const target = Number(warmupTarget) || Number(warmupDailyLimit) || 21;
 
   const ageDays = connectedAt

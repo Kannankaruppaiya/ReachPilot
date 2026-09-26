@@ -32,18 +32,12 @@ export class LinkedinAccountsService {
     private readonly workspaces: WorkspacesService,
   ) {}
 
-  /**
-   * Enqueue the one-time login job that logs in through the account's proxy
-   * and captures + stores the li_at session cookie. Runs after credentials
-   * (password + optional 2FA) are in place.
-   */
+  /** Enqueue the one-time login that captures and stores the session cookies. */
   private async enqueueLogin(
     workspaceId: string,
     opts: { forced?: boolean } = {},
   ): Promise<void> {
-    // Scope EXPLICITLY by workspace_id — the DB connection bypasses RLS, so
-    // relying on withWorkspace alone would pick the globally-first account (a
-    // cross-tenant leak). Pick the most recently connected one in THIS workspace.
+    // Explicit workspace scope: the DB role bypasses RLS.
     const account = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('linkedin_accounts')
@@ -55,8 +49,7 @@ export class LinkedinAccountsService {
     );
     if (!account) return;
 
-    // Is a login already rate-limited? Peek first so the decision below sees the
-    // real state (the SET NX that claims the window happens once we've decided).
+    // Peek at the cooldown first; the SET NX claim happens after the decision.
     const cdKey = `login:cooldown:${account.id}`;
     const cooldownActive = !!(await getLoginRedis().get(cdKey).catch(() => null));
 
@@ -71,16 +64,13 @@ export class LinkedinAccountsService {
       return;
     }
 
-    // A forced login means the user just re-entered their credentials, so the
-    // stored cookie is by definition suspect. Drop it BEFORE enqueuing: while it
-    // is still there it blocks the very login meant to replace it, which is how
-    // a signed-out account became unrecoverable (three "Update login" presses,
-    // three stored credential sets, zero logins). See `login-policy.ts`.
+    // A forced login means new credentials, so the stored cookie is suspect. Drop it
+    // first, or it blocks the login meant to replace it (see login-policy.ts).
     if (decision.clearStoredSession) {
       await withWorkspace(workspaceId, (db) =>
         db
           .updateTable('linkedin_accounts')
-          // Explicit workspace scope — the DB role bypasses RLS.
+          // Explicit workspace scope: the DB role bypasses RLS.
           .where('workspace_id', '=', workspaceId)
           .where('id', '=', account.id)
           .set({ session_secret_id: null })
@@ -89,8 +79,8 @@ export class LinkedinAccountsService {
       this.logger.log(`Cleared the stale stored session for ${account.id} before re-login`);
     }
 
-    // Claim the cool-down window. SET NX so two concurrent presses still yield
-    // one login; Redis down → don't block the connect flow.
+    // Claim the cooldown (SET NX, so two concurrent presses are one login).
+    // Redis down → don't block.
     await getLoginRedis()
       .set(cdKey, String(Date.now()), 'EX', decision.cooldownSeconds, 'NX')
       .catch(() => 'OK');
@@ -130,9 +120,7 @@ export class LinkedinAccountsService {
       const existing = await db
         .selectFrom('linkedin_accounts')
         .select('id')
-        // Explicit workspace scope — the DB role bypasses RLS, so matching on
-        // email alone found (and then overwrote) ANOTHER tenant's account that
-        // uses the same LinkedIn login.
+        // Explicit workspace scope: two tenants can use the same LinkedIn login.
         .where('workspace_id', '=', workspaceId)
         .where('email', '=', email.toLowerCase())
         .executeTakeFirst();
@@ -145,11 +133,7 @@ export class LinkedinAccountsService {
             proxy_id: proxy?.id || null,
             password_secret_id: passwordSecretId,
             status: 'connecting',
-            // NOT connected_at. It marks when this account STARTED running, and
-            // the warm-up ramp measures from it — rewriting it here restarted a
-            // month-old account's ramp at 5/day every time its password was
-            // re-entered. (warmupOrigin() now also guards against this, but the
-            // field should mean what its name says.)
+            // Not connected_at: the warm-up ramp measures from it.
           })
           .where('workspace_id', '=', workspaceId)
           .where('id', '=', existing.id)
@@ -192,8 +176,7 @@ export class LinkedinAccountsService {
     await withWorkspace(workspaceId, (db) =>
       db
         .updateTable('linkedin_accounts')
-        // Explicit workspace scope — the DB role bypasses RLS, so an un-scoped
-        // UPDATE would set twofa/totp on EVERY tenant's accounts.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .set({ twofa: 'verified', totp_secret_id: secretId })
         .execute(),
@@ -213,7 +196,7 @@ export class LinkedinAccountsService {
     await withWorkspace(workspaceId, (db) =>
       db
         .updateTable('linkedin_accounts')
-        // Explicit workspace scope — the DB role bypasses RLS.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .set({ twofa: 'skipped' })
         .execute(),
@@ -230,10 +213,8 @@ export class LinkedinAccountsService {
   }
 
   /**
-   * Live account state for the app shell: connection status, whether a session
-   * cookie is actually captured, and the REAL computed warm-up numbers (same
-   * curve the pacing engine enforces). Returns connected:false when no account
-   * exists so the UI can hide the warm-up widget/badge instead of faking data.
+   * Account state for the app shell: status, whether a session cookie exists, and
+   * the real warm-up numbers pacing enforces. connected:false when there is no account.
    */
   async getAccountState(workspaceId: string): Promise<{
     connected: boolean;
@@ -271,8 +252,7 @@ export class LinkedinAccountsService {
           'last_ip',
           'last_ip_at',
         ])
-        // Explicit workspace scope (the DB connection bypasses RLS) + deterministic
-        // pick: sendable accounts first, then most recently connected.
+        // Explicit workspace scope; sendable accounts first, then newest.
         .where('workspace_id', '=', workspaceId)
         .orderBy((eb) =>
           eb.case().when('status', 'in', ['paused', 'disconnected', 'checkpoint']).then(1).else(0).end(),
@@ -299,7 +279,7 @@ export class LinkedinAccountsService {
       dailyLimit: acct.warmup_daily_limit,
       weeklyInviteCap: acct.weekly_invite_cap,
       warmup: computeWarmup(warmupOrigin(acct.connected_at, acct.created_at), acct.warmup_daily_limit, acct.warmup_target),
-      // Postgres `time` comes back as "HH:MM:SS" — trim to "HH:MM" for <input type="time">.
+      // Postgres `time` is "HH:MM:SS"; <input type="time"> wants "HH:MM".
       hoursStart: acct.hours_start ? String(acct.hours_start).slice(0, 5) : '09:00',
       hoursEnd: acct.hours_end ? String(acct.hours_end).slice(0, 5) : '18:00',
       timezone: acct.timezone || 'UTC',
@@ -311,9 +291,8 @@ export class LinkedinAccountsService {
   }
 
   /**
-   * The ONE place limits are changed — Settings → LinkedIn limits. Persists the
-   * user's daily ceiling (warmup_daily_limit) and weekly invite cap; the pacing
-   * engine reads these same columns, so what's saved here is what's enforced.
+   * The one place LinkedIn limits change (Settings). Pacing reads the same columns,
+   * so what's saved here is what's enforced.
    */
   async updateLimits(
     workspaceId: string,
@@ -331,8 +310,7 @@ export class LinkedinAccountsService {
       throw new BadRequestException('Weekly invite cap must be between 1 and 200.');
     }
 
-    // Warm-up target = the daily ceiling the ramp climbs toward. Optional; only
-    // updated when supplied. Kept conservative (real safe limits vary per account).
+    // Warm-up target: the daily ceiling the ramp climbs toward (optional).
     const fields: {
       warmup_daily_limit: number;
       weekly_invite_cap: number;
@@ -351,13 +329,11 @@ export class LinkedinAccountsService {
         throw new BadRequestException('Warm-up target must be between 5 and 100.');
       }
       fields.warmup_target = targetVal;
-      // The target is the single daily ceiling — keep warmup_daily_limit in sync
-      // so the two columns can never disagree and secretly cap the ramp below it.
+      // Keep warmup_daily_limit in sync so the two columns never disagree.
       fields.warmup_daily_limit = targetVal;
     }
 
-    // Working hours / timezone / weekends. All optional; overnight windows
-    // (end before start) are allowed — the pacing engine wraps past midnight.
+    // Working hours, timezone, weekends; end before start wraps past midnight.
     if (schedule) {
       const timeRe = /^([01]\d|2[0-3]):[0-5]\d$/;
       if (schedule.hoursStart !== undefined) {
@@ -389,8 +365,7 @@ export class LinkedinAccountsService {
       db
         .updateTable('linkedin_accounts')
         .set(fields)
-        // 🔴 This UPDATE had no WHERE at all: under the BYPASSRLS production role,
-        // saving limits in one workspace rewrote every tenant's accounts.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .returning('id')
         .execute(),
@@ -421,7 +396,7 @@ export class LinkedinAccountsService {
           'linkedin_accounts.id',
           'proxies.ip as proxy_ip',
         ])
-        // Explicit workspace scope (DB connection bypasses RLS) + deterministic pick.
+        // Explicit workspace scope; deterministic pick.
         .where('linkedin_accounts.workspace_id', '=', workspaceId)
         .orderBy('linkedin_accounts.connected_at', 'desc')
         .limit(1)

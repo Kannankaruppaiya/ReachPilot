@@ -16,14 +16,9 @@ export interface NotePayload {
 }
 
 /**
- * Decides what connection note actually gets sent, at send time (in the worker):
- *   - neither toggle → the pre-filled template (`payload.message`)
- *   - AI on          → a unique, human-like note per prospect (Gemini)
- *   - AI + Apify on   → scrape the prospect's LinkedIn profile first, so the note
- *                       is grounded in a real detail about them
- *
- * Always resolves to a sendable string — AiService falls back to a safe template
- * internally, and this falls back to `payload.message` if AI isn't producing.
+ * The connection note to send, decided in the worker at send time: the template,
+ * an AI note (Gemini), or an AI note grounded in the scraped profile (AI + Apify).
+ * Always returns a sendable string.
  */
 @Injectable()
 export class ConnectionNoteService {
@@ -35,10 +30,7 @@ export class ConnectionNoteService {
   ) {}
 
   async build(workspaceId: string, payload: NotePayload): Promise<string> {
-    // "Send without a note" wins over everything — return an empty note so the
-    // worker's connect-with-fallback goes straight to the note-less send flow
-    // (the driver skips the whole note composer + note-cap check when message
-    // is empty). Overrides AI/Apify/template.
+    // "Send without a note" overrides everything; the driver then skips the note flow.
     if (payload?.noNote) return '';
     if (!payload?.useAi) return payload?.message || '';
 
@@ -63,8 +55,7 @@ export class ConnectionNoteService {
       },
       { valueProp: payload.aiGuidance?.trim() || undefined },
     );
-    // If the AI degraded to its own generic template and we have a user-authored
-    // one, prefer the user's; otherwise use the AI/template note.
+    // If the AI fell back to its generic template, prefer the user's own.
     if (source === 'template' && payload.message) return payload.message;
     return note;
   }

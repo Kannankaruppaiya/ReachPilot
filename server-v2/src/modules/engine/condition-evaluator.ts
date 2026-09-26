@@ -6,11 +6,8 @@ import { withWorkspace } from '@/db/rls';
 @Injectable()
 export class ConditionEvaluator {
   /**
-   * Evaluates if a specific step condition is true or false for a lead.
-   *
-   * `db` is the caller's workspace-scoped transaction when it has one (the graph
-   * executor does); otherwise the read opens its own. `leads` is RLS-scoped, so
-   * a bare getDb() read sees nothing under a role that is subject to RLS.
+   * Is this step condition true for the lead? Pass `db` to read inside the caller's
+   * workspace transaction; otherwise the read opens its own.
    */
   async evaluate(
     workspaceId: string,
@@ -38,7 +35,6 @@ export class ConditionEvaluator {
         return lead.status === 'replied';
 
       case 'if_followed_by_you':
-        // Check lead activity or metadata if we followed them
         return lead.last_activity === 'Followed profile';
 
       case 'if_has_email':

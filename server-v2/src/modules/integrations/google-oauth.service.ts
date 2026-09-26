@@ -3,10 +3,8 @@ import { OAuth2Client } from 'google-auth-library';
 import { getEnv } from '@/config/env';
 
 /**
- * Gmail scopes: send email, read replies (inbox sync), read the address, and
- * modify labels — the warm-up loop marks warm-up mail read/starred and moves
- * it out of spam, which needs gmail.modify. Mailboxes connected BEFORE this
- * scope was added must be re-connected once to grant it.
+ * Gmail scopes. gmail.modify is for the warm-up loop (read/star/move out of spam);
+ * mailboxes connected before it was added must reconnect once.
  */
 export const GMAIL_SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
@@ -15,10 +13,7 @@ export const GMAIL_SCOPES = [
   'https://www.googleapis.com/auth/userinfo.email',
 ];
 
-/**
- * Thin wrapper around Google's OAuth2 + Gmail REST API.
- * Holds no per-user state — every call takes the token it needs.
- */
+/** Stateless wrapper around Google OAuth2 and the Gmail REST API. */
 @Injectable()
 export class GoogleOAuthService {
   private readonly logger = new Logger(GoogleOAuthService.name);
@@ -35,8 +30,8 @@ export class GoogleOAuthService {
   /** Consent-screen URL. `state` carries the signed workspace/user context. */
   buildAuthUrl(state: string): string {
     return this.client().generateAuthUrl({
-      access_type: 'offline', // ← required to receive a refresh_token
-      prompt: 'consent', // ← force refresh_token even on re-connect
+      access_type: 'offline', // required for a refresh_token
+      prompt: 'consent', // forces a refresh_token on reconnect too
       scope: GMAIL_SCOPES,
       state,
       include_granted_scopes: true,

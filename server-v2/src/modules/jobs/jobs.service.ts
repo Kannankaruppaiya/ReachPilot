@@ -60,11 +60,8 @@ export class JobsService {
   }
 
   /**
-   * All LinkedIn connection-request jobs for the workspace, newest first, each
-   * enriched with its post-send OUTCOME. Delivery status comes from the job row
-   * (queued → sent/failed); the outcome (pending → accepted → replied) is joined
-   * from the matching lead by LinkedIn profile slug, since the acceptance/reply
-   * sync writes onto the leads table keyed by profile URL.
+   * The workspace's connection-request jobs, newest first, each with its outcome
+   * (pending → accepted → replied) joined from the lead by profile slug.
    */
   async listConnections(workspaceId: string): Promise<any[]> {
     return withWorkspace(workspaceId, async (db) => {
@@ -77,8 +74,7 @@ export class JobsService {
         .orderBy('created_at', 'desc')
         .execute();
 
-      // Build a slug → lead-outcome map once, then merge in memory (URLs differ
-      // by trailing slash / query, so a slug match is more reliable than SQL eq).
+      // Match leads by slug in memory: URLs differ by trailing slash or query.
       const leads = await db
         .selectFrom('leads')
         .select(['linkedin_url', 'status', 'last_activity'])
@@ -123,7 +119,6 @@ export class JobsService {
     const lead = slug ? bySlug.get(slug) : undefined;
     const delivery: string = r.status; // scheduled | queued | running | sent | failed | canceled
 
-    // Outcome: the human-meaningful state of the connection attempt.
     let outcome: 'in_queue' | 'pending' | 'accepted' | 'replied' | 'failed';
     if (delivery === 'failed' || delivery === 'canceled') outcome = 'failed';
     else if (delivery === 'sent') {
@@ -150,10 +145,8 @@ export class JobsService {
   }
 
   /**
-   * Cancel a single not-yet-sent job (the queue "close" button). Sets the row to
-   * 'canceled' — the worker's idempotency guard then skips it even if BullMQ has
-   * already dequeued it — and best-effort removes it from BullMQ so a queued job
-   * never spins up a browser. Sent/failed/already-canceled jobs are left as-is.
+   * Cancel one unsent job. The 'canceled' status makes the worker skip it even if
+   * BullMQ already dequeued it; removal from BullMQ is best-effort.
    */
   async cancelJob(workspaceId: string, jobId: string): Promise<{ ok: true; canceled: boolean }> {
     const canceled = await withWorkspace(workspaceId, async (db) => {
@@ -167,8 +160,7 @@ export class JobsService {
       return Number(res.numUpdatedRows ?? 0) > 0;
     });
 
-    // Best-effort: drop the delayed/waiting BullMQ job so it doesn't fire at all.
-    // (Already-active jobs can't be removed; the DB 'canceled' status covers those.)
+    // Best-effort; an already-active job is covered by the 'canceled' status.
     await getQueue('linkedin-actions').remove(jobId).catch(() => undefined);
     await getQueue('email-send').remove(jobId).catch(() => undefined);
 
@@ -176,13 +168,8 @@ export class JobsService {
   }
 
   /**
-   * Hard-delete jobs (the queue "delete" button + "clear" bulk action). Removes
-   * the rows from Postgres AND best-effort from BullMQ so nothing fires. Safe for
-   * any status: a deleted 'queued' row that BullMQ still dequeues is skipped by
-   * the worker's `if (!jobRow) return` guard.
-   *
-   *  - { id }               → delete one job
-   *  - { statuses, kind }   → bulk delete (e.g. clear the queue / wipe for a fresh test)
+   * Hard-delete jobs by `{ id }` or `{ statuses, kind }`, from Postgres and
+   * (best-effort) BullMQ. A deleted row BullMQ still delivers is skipped by the worker.
    */
   async deleteJobs(
     workspaceId: string,
@@ -201,7 +188,6 @@ export class JobsService {
     await withWorkspace(workspaceId, (db) =>
       db.deleteFrom('jobs').where('workspace_id', '=', workspaceId).where('id', 'in', ids).execute(),
     );
-    // Best-effort: drop any still-pending BullMQ jobs so a deleted row never fires.
     for (const id of ids) {
       await getQueue('linkedin-actions').remove(id).catch(() => undefined);
       await getQueue('email-send').remove(id).catch(() => undefined);
@@ -210,22 +196,9 @@ export class JobsService {
   }
 
   /**
-   * Put back the leads a failure BURNED that was never their fault.
-   *
-   * A terminal `failed` row is normally the right answer — the profile has no
-   * Connect button, the member is gone, LinkedIn blocked us. But some failures
-   * say nothing about the lead at all: when the account was signed out, every
-   * job it touched died with a redirect loop while the prospect stayed perfectly
-   * contactable. Measured live on one account: 17 live prospects marked failed in
-   * a single afternoon over one dead cookie.
-   *
-   * Those rows are recoverable, and without this the only way back was a DB
-   * script. `isRequeueableFailure` decides — an allowlist of failures that
-   * provably happened at or before navigation, so this can never re-send an
-   * invite that already went out.
-   *
-   * Spread over the next hour rather than dumped at once: pacing still caps them
-   * at send time, this only avoids handing the scheduler a thundering herd.
+   * Re-queue failed leads whose failure said nothing about the lead (e.g. the
+   * account was signed out). `isRequeueableFailure` only admits failures that
+   * provably happened before anything was sent. Spread over the next hour.
    */
   async requeueFailed(
     workspaceId: string,
@@ -253,7 +226,6 @@ export class JobsService {
           status: 'scheduled' as any,
           attempts: 0,
           last_error: 'requeued_by_user',
-          // Random spread across the next hour — the scheduler drains it from there.
           scheduled_for: sql<string>`now() + (random() * interval '60 minutes')` as any,
         })
         .where('workspace_id', '=', workspaceId)
@@ -280,11 +252,8 @@ export class JobsService {
       throw new BadRequestException('No profiles to send to.');
     }
 
-    // Drop profiles this workspace has already sent a connection request to.
-    // Re-inviting someone spends weekly invite allowance a new prospect needed,
-    // and repeat invites to the same member are what automation detection looks
-    // for. Only SENT jobs count: a queued one has not happened yet, and a failed
-    // one is usually a bad network window rather than a verdict about the person.
+    // Skip profiles this workspace already sent an invite to: a repeat invite
+    // wastes weekly allowance and looks automated. Only SENT jobs count.
     let skipped = 0;
     if (kind === 'linkedin') {
       const sentJobs = await withWorkspace(workspaceId, (db) =>
@@ -309,13 +278,8 @@ export class JobsService {
                 }
               })()
             : j.payload || {};
-        // Both the URL we were given and the vanity slug LinkedIn actually
-        // landed on, so a member invited under an obfuscated URN is recognised
-        // when a later list carries their readable URL (see Task 4).
-        // resolvedSlug is a BARE slug ('ramcacpa'), not a URL — profileKey
-        // requires a literal linkedin.com/in/ segment, so it goes through
-        // profileKeyFromSlug instead, which normalises it into the same shape
-        // before comparing.
+        // Match on both the given URL and the vanity slug LinkedIn served.
+        // resolvedSlug is a bare slug, so it goes through profileKeyFromSlug.
         const targetKey = profileKey(p.target);
         if (targetKey) sentKeys.add(targetKey);
         const resolvedKey = profileKeyFromSlug(p.resolvedSlug);
@@ -327,25 +291,19 @@ export class JobsService {
       rows = selection.kept;
 
       if (rows.length === 0) {
-        // Uploading a list of people you have already contacted is a normal
-        // outcome, not an error — do not fall through to the empty-input throw.
+        // Every profile was already contacted: a normal outcome, not an error.
         return { batchId: '', total: 0, today: 0, queuedDays: 0, skipped };
       }
     }
 
     const batchId = crypto.randomUUID();
 
-    // Jobs to hand to BullMQ AFTER the DB transaction commits. Enqueuing inside
-    // the transaction is a race: BullMQ (Redis) delivers the job to the worker
-    // before Postgres commits, so the worker's RLS-scoped lookup can't see the
-    // still-uncommitted row → it skips the job as "missing" and the row orphans
-    // (the scheduler only re-runs 'scheduled' rows, never 'queued'). Collect
-    // day-one sends here and enqueue them once the transaction has committed.
+    // Enqueue day-one jobs only after the transaction commits; otherwise the worker
+    // can receive a job before its row is visible and orphan it.
     const toEnqueue: { jobId: string; leadId: any; payload: unknown }[] = [];
 
-    // All inserts run under the workspace's RLS context.
     const result = await withWorkspace(workspaceId, async (db) => {
-      // Find first active LinkedIn/email account for this workspace to link
+      // First active LinkedIn account for this workspace.
       const linkedinAcct = await db
         .selectFrom('linkedin_accounts')
         .select(['id', 'warmup_daily_limit', 'warmup_target', 'connected_at', 'created_at', 'hours_start', 'hours_end', 'timezone'])
@@ -353,10 +311,8 @@ export class JobsService {
         .limit(1)
         .executeTakeFirst();
 
-      // LinkedIn batches are ALWAYS paced by the account's limit (Settings →
-      // LinkedIn limits + warm-up ramp) — the client-sent cap is ignored so the
-      // settings page stays the single place limits are controlled. Email batches
-      // still honor the requested cap.
+      // LinkedIn batches always use the account's limits (Settings); the client cap
+      // only applies to email.
       const perDay =
         kind === 'linkedin' && linkedinAcct
           ? computeWarmup(
@@ -366,49 +322,29 @@ export class JobsService {
             ).todayLimit
           : Math.max(1, Number(cap) || 15);
 
-      // A mailbox that can actually send — never an unordered pick over every
-      // row, which could land on a credential-less placeholder (see mailbox.ts).
       const emailAcct = await sendableMailboxes(db, workspaceId).select('id').executeTakeFirst();
 
       const createdJobs: any[] = [];
 
-      // Schedule in the ACCOUNT's timezone + working hours (NOT the server clock).
-      // Old code hardcoded setHours(9) which, on a UTC server, meant 9am UTC =
-      // 2:30pm IST and ignored the account's hours_start entirely.
-      //
-      // Each day's quota is now released AT the window open, all of it, rather
-      // than pinned to a slot grid stepped across [hours_start, hours_end]. The
-      // grid assumed a cloud executor that is always up. Ours is the user's
-      // LAPTOP: a job pinned to 15:40 only sends if the laptop happens to be open
-      // at 15:40, so a grid across a 9-hour window demands a 9-hour session, and
-      // across a 23-hour window it demands sends at 3am. Releasing the quota at
-      // the open instead lets pacing drain it whenever the machine is actually on
-      // — open the laptop once, the queue empties, close it again.
-      //
-      // Nothing is uncapped by this: pacing still enforces the daily limit, the
-      // weekly invite cap, the working-hours window and the per-action gap at
-      // send time. This only decides when a job becomes ELIGIBLE.
+      // Schedule in the account's timezone. Each day's whole quota becomes due at the
+      // window open (not a slot grid): the executor is the user's laptop, so the
+      // queue drains whenever it is on. Pacing still enforces every limit at send time.
       const tz = (kind === 'linkedin' && linkedinAcct?.timezone) || 'UTC';
       const parseMin = (hhmm: any, def: number) => {
         const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm || ''));
         return m ? Number(m[1]) * 60 + Number(m[2]) : def;
       };
-      // Only the OPEN matters here — the close is pacing's business. That also
-      // means a window that wraps past midnight (22:00 → 06:00) needs no special
-      // case at this layer, where the old slot-grid math had to clamp it.
+      // Only the open matters here; pacing handles the close (and midnight wraps).
       const startMin = kind === 'linkedin' ? parseMin(linkedinAcct?.hours_start, 9 * 60) : 9 * 60;
 
-      // Ensure every LinkedIn target URL carries a protocol. A bare
-      // "linkedin.com/in/x" is treated as a RELATIVE path — the UI "Open" link
-      // resolves it against the app domain (→ Vercel 404) and the driver's goto
-      // fails (→ profile_gone / no_connect_button). Normalize once at job-create.
+      // A bare "linkedin.com/in/x" is a relative path to the UI and the driver.
       const withProtocol = (u: any): string => {
         const s = String(u || '').trim();
         if (!s) return '';
         return /^https?:\/\//i.test(s) ? s : `https://${s.replace(/^\/+/, '')}`;
       };
 
-      // "Today" as a calendar date in the account timezone (YYYY-MM-DD).
+      // Today in the account timezone (en-CA formats as YYYY-MM-DD).
       const [ty, tm, td] = new Intl.DateTimeFormat('en-CA', {
         timeZone: tz,
         year: 'numeric',
@@ -419,8 +355,7 @@ export class JobsService {
         .split('-')
         .map(Number);
 
-      // Wall-clock (account tz) → UTC instant. One-pass offset correction; at most
-      // ~1h off across a DST edge, which pacing re-checks and self-corrects.
+      // Account wall-clock → UTC. Up to ~1h off across DST; pacing re-checks.
       const wallToUtc = (dayOffset: number, minsFromMidnight: number): Date => {
         const guess = Date.UTC(ty, tm - 1, td + dayOffset, 0, minsFromMidnight, 0);
         const p: any = new Intl.DateTimeFormat('en-US', {
@@ -449,8 +384,6 @@ export class JobsService {
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
         const dayOffset = Math.floor(i / perDay);
-        // The day's whole quota becomes DUE at the window open; pacing decides the
-        // actual send times from there. See the note above `tz` for why.
         const scheduledFor = wallToUtc(dayOffset, startMin);
 
         const isToday = dayOffset === 0;
@@ -465,8 +398,7 @@ export class JobsService {
               : row.target || row.linkedinUrl || row.email || '',
           company: row.company || '',
           role: row.role || row.title || '',
-          // Template is always filled as the fallback; when AI is on the worker
-          // generates the real note at send time (and Apify enriches it).
+          // Template fallback; with AI on, the worker writes the real note at send time.
           message: this.fillTemplate(template, row),
           subject: this.fillTemplate(subject || '', row),
           ...(kind === 'linkedin' && personalization.useAi
@@ -476,8 +408,7 @@ export class JobsService {
                 aiGuidance: personalization.aiGuidance || '',
               }
             : {}),
-          // "Send without a note" — independent of AI; the worker drops the note
-          // entirely (direct note-less connect, skips the note-cap check).
+          // Send without a note: the worker skips the note entirely.
           ...(kind === 'linkedin' && personalization.noNote ? { noNote: true } : {}),
         };
 
@@ -503,7 +434,6 @@ export class JobsService {
 
         createdJobs.push(jobData);
 
-        // Day-one sends go to BullMQ — but only AFTER this transaction commits.
         if (isToday) toEnqueue.push({ jobId, leadId: row.leadId, payload });
       }
 
@@ -511,7 +441,6 @@ export class JobsService {
       const totalCount = createdJobs.length;
       const queuedDays = Math.ceil(totalCount / perDay);
 
-      // Log Activity
       await db
         .insertInto('activity')
         .values({
@@ -526,8 +455,7 @@ export class JobsService {
       return { batchId, total: totalCount, today: todayCount, queuedDays, skipped };
     });
 
-    // Transaction has committed — the rows are now visible to the worker's
-    // separate connection, so it's safe to enqueue without the race above.
+    // Committed: rows are now visible to the worker.
     if (toEnqueue.length) {
       const queueObj = getQueue(kind === 'linkedin' ? 'linkedin-actions' : 'email-send');
       for (const e of toEnqueue) {
@@ -538,8 +466,7 @@ export class JobsService {
             jobId: e.jobId,
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
-            // A finished BullMQ job left in Redis blocks a later re-add with the
-            // same jobId (silent dedupe) — deferred jobs would never rerun.
+            // A finished job left in Redis would block a re-add with the same jobId.
             removeOnComplete: true,
             removeOnFail: true,
           },
@@ -550,11 +477,7 @@ export class JobsService {
     return result;
   }
 
-  /**
-   * Fill {{firstName}}/{{company}}/{{role}} placeholders from a row's fields,
-   * then resolve spintax groups (`{Hi|Hey|Hello}`) so each recipient gets a
-   * unique variation. Variables first, spin second — see spintax.ts.
-   */
+  /** Fill {{firstName}}/{{company}}/{{role}}, then resolve spintax (see spintax.ts). */
   private fillTemplate(tpl: string, row: any): string {
     const firstName = String(row.name || '').trim().split(/\s+/)[0] || 'there';
     const filled = String(tpl || '')

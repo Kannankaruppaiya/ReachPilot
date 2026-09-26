@@ -19,20 +19,10 @@ export interface CrawleeFetchOptions {
 }
 
 /**
- * Crawlee-based Google SERP fetcher (M1 of the lead-engine re-architecture).
- *
- * Drives Crawlee's PlaywrightCrawler with the **patchright** stealth launcher.
- * Crawlee gives us — for free, battle-tested — a RequestQueue (dedup), pagination,
- * a BrowserPool, a SessionPool (rotate/retire on block) and retry/backoff. We only
- * seed the query pages and parse each SERP, returning the same
- * `{title,href,snippet}[]` the legacy fetch produced, so the downstream
- * extract + validate pipeline is completely unchanged.
- *
- * M1 keeps storage IN-MEMORY (a fresh, isolated queue per call). M2 will swap in a
- * persistent, per-workspace RequestQueue to become the rerun cursor.
- *
- * Crawlee + patchright are required lazily so the legacy engine never loads them,
- * and so CRAWLEE_PERSIST_STORAGE is set before Crawlee's storage client initializes.
+ * Google SERP fetcher on Crawlee's PlaywrightCrawler with patchright (queue
+ * dedup, pagination, session rotation, retries). Returns the same rows as the
+ * legacy fetcher. Storage is in-memory per call. Required lazily so the legacy
+ * engine never loads Crawlee.
  */
 export class CrawleeGoogleFetcher {
   private readonly logger = new Logger(CrawleeGoogleFetcher.name);
@@ -48,15 +38,13 @@ export class CrawleeGoogleFetcher {
     const { chromium } = require('patchright');
     const env = getEnv();
 
-    // Cursor-driven page window: fetch pages [startPage, startPage+pages). The
-    // worker advances the cursor between runs so a rerun sweeps fresh pages.
+    // Fetch pages [startPage, startPage + pages); the worker advances the cursor.
     const startPage = Math.max(opts.startPage ?? 0, 0);
     const pages = Math.min(Math.max(opts.pages ?? 3, 1), 10);
     const results: SerpRaw[] = [];
     let blockedPages = 0;
 
-    // A uniquely-named queue keeps each call isolated; cross-run continuity comes
-    // from the Redis cursor (ScrapeCursorService), not from queue persistence.
+    // A unique queue per call; cross-run continuity comes from ScrapeCursorService.
     const queueName = `serp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const queue = await RequestQueue.open(queueName);
     for (let p = startPage; p < startPage + pages; p++) {
@@ -65,8 +53,7 @@ export class CrawleeGoogleFetcher {
 
     const crawler = new PlaywrightCrawler({
       requestQueue: queue,
-      // Swap Crawlee's default playwright for the patchright stealth fork, and let
-      // patchright own the stealth (don't layer Crawlee's fingerprints on top).
+      // Use patchright's stealth, not Crawlee's fingerprints on top.
       launchContext: {
         launcher: chromium,
         launchOptions: { headless: env.SCRAPER_HEADLESS, channel: 'chrome' },

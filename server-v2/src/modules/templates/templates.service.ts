@@ -33,7 +33,6 @@ export class TemplatesService {
   }
 
   async getTemplate(workspaceId: string, id: string): Promise<any> {
-    // templates is RLS-scoped — read under the workspace context.
     return withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('templates')

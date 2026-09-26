@@ -18,9 +18,7 @@ function getWebhookQueue(): Queue {
 
 @Injectable()
 export class WebhooksService {
-  // webhook_endpoints is RLS-scoped — every access runs under the workspace
-  // context (webhook_deliveries is not tenant-scoped; it rides along in the
-  // same transaction).
+  // webhook_endpoints is RLS-scoped; webhook_deliveries isn't but shares the transaction.
   async list(workspaceId: string): Promise<any[]> {
     return withWorkspace(workspaceId, (db) =>
       db
@@ -74,13 +72,9 @@ export class WebhooksService {
     });
   }
 
-  /**
-   * Triggers a webhook event. Finds all matching endpoints, creates delivery rows
-   * in database, and schedules them in BullMQ for asynchronous HMAC-signed post.
-   */
+  /** Queue an event for every subscribed endpoint (HMAC-signed POST via BullMQ). */
   async triggerEvent(workspaceId: string, eventType: string, payload: any): Promise<void> {
-    // Delivery rows are written in the workspace transaction; BullMQ is only
-    // told about them after it commits.
+    // Enqueue deliveries only after the transaction commits.
     const toSend = await withWorkspace(workspaceId, async (db) => {
       const endpoints = await db
         .selectFrom('webhook_endpoints')
@@ -91,7 +85,6 @@ export class WebhooksService {
 
       const out: { deliveryId: string; url: string; secret: string }[] = [];
       for (const ep of endpoints) {
-        // Check if endpoint is subscribed to this event (or all events '*')
         const match = ep.events.includes(eventType) || ep.events.includes('*');
         if (!match) continue;
 

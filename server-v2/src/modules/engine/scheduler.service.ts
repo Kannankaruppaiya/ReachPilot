@@ -6,35 +6,13 @@ import { getDb } from '@/db';
 import { withWorkspace } from '@/db/rls';
 import { profileKey, invitedProfileKeys } from '@/modules/jobs/profile-key';
 
-/**
- * The missing heart of the outreach engine.
- *
- * Jobs are inserted as `status='scheduled'` with a `scheduled_for` timestamp by
- * the batch/graph executors — but only the ones due *right now* get pushed to
- * BullMQ immediately. Everything with a future `scheduled_for` (follow-ups,
- * next-day drips, pacing-deferred retries) just sits in Postgres.
- *
- * This service is what drains that backlog: on each tick it finds jobs whose
- * time has come, gates them (account health + suppression), and hands them to
- * the right BullMQ queue. Without it, a multi-day sequence never advances past
- * day one.
- *
- * `jobs` is RLS-scoped, so we enumerate workspaces (not RLS'd) and scan each
- * under its own tenant context — the same pattern the Gmail inbox sync uses.
- */
-
 /** LinkedIn account statuses that must NOT send. Jobs for these are re-deferred. */
 const NON_SENDABLE_STATUSES = new Set(['checkpoint', 'paused', 'disconnected']);
 /** Lead statuses that suppress all outreach (opt-out / do-not-contact). */
 const SUPPRESSED_LEAD_STATUSES = new Set(['blacklisted', 'unqualified']);
 /**
- * Why a CAMPAIGN job must not go out now, or null.
- *
- * The returned string becomes the job's `last_error`, and the campaign executor
- * reads it back to decide what the cancel means (graph-executor.ts,
- * onCanceledJob): a paused campaign or lead gets the job re-created on resume, a
- * replied lead ends its sequence. Auto Connect / Auto Mail jobs carry no
- * campaign or enrollment and are never held here.
+ * Why a campaign job must not go out now, or null. The string becomes the job's
+ * `last_error`, which graph-executor's onCanceledJob reads on resume.
  */
 export function sequenceHold(campaignStatus?: string, enrollmentStatus?: string): string | null {
   if (campaignStatus && campaignStatus !== 'active') return 'campaign_paused';
@@ -44,11 +22,17 @@ export function sequenceHold(campaignStatus?: string, enrollmentStatus?: string)
   return null;
 }
 
-/** How long to hold a job whose desktop agent is offline. Recovery does NOT wait
- *  this out: AgentController pulls these forward the moment the agent reappears,
- *  so the value only decides how often we re-check a laptop that stays shut. */
+/**
+ * Re-check interval for jobs whose desktop agent is offline. AgentController
+ * pulls them forward as soon as the agent reconnects.
+ */
 const AGENT_OFFLINE_DEFER_MS = 5 * 60_000;
 
+/**
+ * Drains due `scheduled` jobs into BullMQ after the sequence, suppression,
+ * duplicate-invite, account-health and desktop-agent gates. Without it, sequences
+ * never advance past day one. Scans each workspace under its own RLS context.
+ */
 @Injectable()
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
@@ -77,10 +61,7 @@ export class SchedulerService {
     return this.emailQueue;
   }
 
-  /**
-   * One pass over all workspaces. Re-entrancy guarded so a slow tick never
-   * overlaps the next interval (which would double-enqueue).
-   */
+  /** One pass over all workspaces; guarded so a slow tick never overlaps the next. */
   async tick(): Promise<{ enqueued: number; deferred: number; suppressed: number }> {
     if (this.ticking) {
       this.logger.debug('Tick still running — skipping this interval');
@@ -118,18 +99,15 @@ export class SchedulerService {
     let enqueued = 0;
     let deferred = 0;
     let suppressed = 0;
-    // One heartbeat read per ACCOUNT per tick, not per job — a 100-job backlog on
-    // one account is the normal shape here, and it needs one Redis GET, not 100.
+    // One heartbeat read per account per tick, not per job.
     const agentOnline = new Map<string, boolean>();
 
-    // Pull a bounded batch of due jobs. Ordered oldest-first so backlog drains fairly.
+    // A bounded batch of due jobs, oldest first.
     const due = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('jobs')
         .selectAll()
-        // Explicit workspace scope: under the BYPASSRLS production role each
-        // workspace's drain otherwise picked up EVERY tenant's due jobs and
-        // enqueued them under the wrong workspace id.
+        // Explicit scope: the BYPASSRLS production role would otherwise see every tenant.
         .where('workspace_id', '=', workspaceId)
         .where('status', '=', 'scheduled')
         .where('scheduled_for', '<=', nowIso as any)
@@ -150,8 +128,7 @@ export class SchedulerService {
       }
     };
 
-    // Built once per drain, and only when something in this batch could need it —
-    // not once per job, which would re-read the whole sent history each time.
+    // Built once per drain, only if a job in this batch needs it.
     let invited: Set<string> | null = null;
     const invitedKeys = async (): Promise<Set<string>> => {
       if (!invited) {
@@ -159,8 +136,7 @@ export class SchedulerService {
           db
             .selectFrom('jobs')
             .select('payload')
-            // This workspace's invites only — another tenant having invited the
-            // same person is no reason to cancel ours.
+            // This workspace's invites only.
             .where('workspace_id', '=', workspaceId)
             .where('action', '=', 'connect_request')
             .where('status', '=', 'sent')
@@ -171,8 +147,7 @@ export class SchedulerService {
       return invited;
     };
 
-    // Campaign + enrollment state for every campaign job in this batch, read once
-    // per drain rather than once per job.
+    // Campaign + enrollment states for this batch, read once per drain.
     const campaignIds = [...new Set(due.map((j) => j.campaign_id).filter(Boolean))] as string[];
     const enrollmentIds = [...new Set(due.map((j) => j.enrollment_id).filter(Boolean))] as string[];
     const { campaignStatus, enrollmentStatus } = await withWorkspace(workspaceId, async (db) => {
@@ -201,9 +176,7 @@ export class SchedulerService {
     for (const job of due) {
       const kind = (job.kind === 'email' ? 'email' : 'linkedin') as 'linkedin' | 'email';
 
-      // --- Sequence gate: a paused campaign / paused or replied lead sends
-      //     nothing. Pausing a campaign used to update only its enrollments, so
-      //     the jobs already materialised for it kept draining through here. ---
+      // --- Sequence gate: a paused campaign or paused/replied lead sends nothing. ---
       const hold = sequenceHold(
         job.campaign_id ? campaignStatus.get(job.campaign_id) : undefined,
         job.enrollment_id ? enrollmentStatus.get(job.enrollment_id) : undefined,
@@ -240,16 +213,8 @@ export class SchedulerService {
 
       }
 
-      // --- Duplicate-invite guard: never send a second connection request to
-      //     someone we've already invited (a double-touch that annoys prospects
-      //     and wastes weekly-invite quota).
-      //
-      // 🔴 Deliberately OUTSIDE the `job.lead_id` block above. This used to live
-      // inside it and look the lead up by id — but connect jobs carry `lead_id`
-      // NULL (366 of 366 on live data), so the block was skipped entirely and the
-      // guard never fired once. Dinesh M ended up with three jobs on one target;
-      // one sent, and a later duplicate still ran. The profile key is always in
-      // the payload, so match on that. ---
+      // --- Duplicate-invite guard: never invite the same person twice. Matched on
+      //     the profile key in the payload, because connect jobs carry no lead_id. ---
       if (job.action === 'connect_request') {
         const key = profileKey(payloadOf(job).target);
         if (key && (await invitedKeys()).has(key)) {
@@ -271,7 +236,7 @@ export class SchedulerService {
             .executeTakeFirst(),
         );
         if (acct && NON_SENDABLE_STATUSES.has(acct.status as string)) {
-          // Hold the job — retry in an hour once the account recovers.
+          // Hold the job; retry in an hour.
           const retryAt = new Date(Date.now() + 3600_000).toISOString();
           await withWorkspace(workspaceId, (db) =>
             db
@@ -285,17 +250,10 @@ export class SchedulerService {
         }
       }
 
-      // --- Desktop-agent gate: in remote mode the executor is the USER'S LAPTOP.
-      //     With it closed there is nobody to run the action, so stop here rather
-      //     than dragging the job through BullMQ → worker → pacing → driver only
-      //     to have the driver miss the same heartbeat and defer it anyway. That
-      //     round trip costs a queue add, a worker slot, a pacing register and its
-      //     rollback, and several DB writes — repeated every few minutes, all
-      //     night, for every job in the backlog.
-      //
-      //     `last_error` MUST stay 'agent_unavailable': that is the marker
-      //     AgentController's wake-on-reconnect matches on to pull the backlog
-      //     forward when the laptop comes back. ---
+      // --- Desktop-agent gate: with the laptop closed nobody can run the action, so
+      //     defer here instead of cycling the job through BullMQ and the worker.
+      //     `last_error` MUST stay 'agent_unavailable': AgentController's
+      //     wake-on-reconnect matches on it. ---
       if (kind === 'linkedin' && job.linkedin_account_id && getEnv().LINKEDIN_DRIVER === 'remote') {
         const acctId = job.linkedin_account_id;
         let online = agentOnline.get(acctId);
@@ -317,8 +275,8 @@ export class SchedulerService {
         }
       }
 
-      // --- Enqueue. Claim the row first (status→queued) so a concurrent tick
-      //     or restart can't double-enqueue; jobId dedupes at the BullMQ layer. ---
+      // --- Enqueue. Claim the row first (status → queued) so a concurrent tick can't
+      //     double-enqueue; the jobId also dedupes in BullMQ. ---
       await withWorkspace(workspaceId, (db) =>
         db.updateTable('jobs').set({ status: 'queued' }).where('id', '=', job.id).execute(),
       );
@@ -334,9 +292,8 @@ export class SchedulerService {
         await this.queue(kind).add(
           kind === 'linkedin' ? 'linkedin-connect' : 'email-send',
           { jobId: job.id, workspaceId, leadId: job.lead_id, payload },
-          // removeOnComplete/Fail: a finished BullMQ job left in Redis blocks a
-          // later re-add with the same jobId (silent dedupe), which strands a
-          // deferred row in "queued" forever.
+          // A finished job left in Redis would block a re-add with the same jobId and
+          // strand the row in "queued".
           {
             jobId: job.id,
             attempts: 3,
@@ -347,7 +304,7 @@ export class SchedulerService {
         );
         enqueued++;
       } catch (err: any) {
-        // Couldn't reach Redis — roll the claim back so the next tick retries.
+        // Redis unreachable: roll back the claim so the next tick retries.
         await withWorkspace(workspaceId, (db) =>
           db.updateTable('jobs').set({ status: 'scheduled' }).where('id', '=', job.id).execute(),
         );

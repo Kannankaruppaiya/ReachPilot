@@ -26,7 +26,7 @@ export class ApiKeysService {
       throw new BadRequestException('API key name is required.');
     }
 
-    // Carries its workspace so the guard can scope the lookup — see api-key-token.ts.
+    // Embeds the workspace so the guard can scope the lookup (api-key-token.ts).
     const token = mintApiKeyToken(workspaceId);
     const prefix = token.substring(0, 12);
     const hash = hashApiKey(token);

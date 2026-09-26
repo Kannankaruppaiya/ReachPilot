@@ -7,11 +7,7 @@ const IMPORT_CHUNK = 500;
 
 @Injectable()
 export class LeadsService {
-  /**
-   * List leads. Backward-compatible: with no options it returns every lead (as
-   * before, so callers like Campaigns keep working). With pagination/filter/sort
-   * options it returns just that page — how the Leads screen handles large sets.
-   */
+  /** List leads: all of them with no options, or one page with pagination/filter/sort. */
   async list(
     workspaceId: string,
     opts: {
@@ -25,8 +21,7 @@ export class LeadsService {
     } = {},
   ): Promise<any[]> {
     const rows = await withWorkspace(workspaceId, async (db) => {
-      // Explicit workspace scope: production connects as a role that bypasses
-      // RLS, so without it this listed EVERY tenant's leads on the Leads screen.
+      // Explicit workspace scope: the DB role bypasses RLS.
       let query = db.selectFrom('leads').selectAll().where('workspace_id', '=', workspaceId);
 
       if (opts.scrapeJobId) query = query.where('scrape_job_id', '=', opts.scrapeJobId);
@@ -97,10 +92,8 @@ export class LeadsService {
   }
 
   /**
-   * Import scraped/CSV leads at scale. Bulk ON CONFLICT upsert (one round-trip per
-   * chunk, not per row) keyed on the normalized `linkedin_slug` so in./www. forms
-   * of the same profile collapse to one row; email-only rows upsert on email.
-   * Race-safe (relies on the DB unique indexes, not a read-then-write check).
+   * Bulk-import leads: ON CONFLICT upsert per chunk, keyed on the normalised
+   * `linkedin_slug` (email-only rows on email). Race-safe via the unique indexes.
    */
   async importLeads(
     workspaceId: string,
@@ -116,8 +109,7 @@ export class LeadsService {
         const name = String(row.name || '').trim();
         if (!name) continue;
         const rawTarget = String(row.target || row.linkedinUrl || '').trim();
-        // Add a protocol if a bare linkedin.com URL slipped in, so a lead never
-        // stores/serves a relative URL (→ app-domain 404 on "Open").
+        // Add a protocol to a bare linkedin.com URL so "Open" never hits a relative path.
         const target =
           rawTarget && !/^https?:\/\//i.test(rawTarget) && rawTarget.includes('linkedin.com')
             ? `https://${rawTarget.replace(/^\/+/, '')}`
@@ -146,19 +138,12 @@ export class LeadsService {
           last_activity: 'Imported',
         };
         if (slug) bySlug.set(slug, data);
-        // Keyed by email for the same reason bySlug is keyed by slug: one upsert
-        // statement may not touch a row twice ("ON CONFLICT DO UPDATE command
-        // cannot affect row a second time"), so a list naming the same address
-        // twice aborted the WHOLE import.
+        // Keyed by email so one upsert never touches a row twice (Postgres rejects that).
         else emailOnly.set(email, data);
       }
 
-      // `leads_dedup_email` makes an email unique per workspace, but a LinkedIn
-      // row upserts on its SLUG — so a LinkedIn row carrying an email that
-      // another lead already owns (a different profile, or an email-only lead)
-      // violated the email index and rolled back the entire import. The same
-      // happened for two profiles in one file sharing an address. The profile is
-      // still imported; it just does not claim an email that is already taken.
+      // Emails are unique per workspace, but LinkedIn rows upsert on the slug. A row
+      // whose email another lead already owns is still imported, just without the email.
       const slugEmails = [...new Set([...bySlug.values()].map((r) => r.email).filter(Boolean))] as string[];
       const emailOwner = new Map<string, string | null>(); // email → slug of the lead holding it
       for (let i = 0; i < slugEmails.length; i += IMPORT_CHUNK) {
@@ -183,8 +168,7 @@ export class LeadsService {
 
       let affected = 0;
 
-      // Upsert LinkedIn rows on the slug index. doUpdateSet refreshes the mutable
-      // fields but preserves the user's own status/tags on an existing lead.
+      // Upsert on the slug; keep the user's own status/tags on existing leads.
       const slugRows = [...bySlug.values()];
       for (let i = 0; i < slugRows.length; i += IMPORT_CHUNK) {
         const res = await db

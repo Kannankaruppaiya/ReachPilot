@@ -1,19 +1,9 @@
 import * as crypto from 'crypto';
 
 /**
- * API key token format.
- *
- * `api_keys` is RLS-scoped, but a request authenticated by an API key arrives
- * with no workspace context — the key IS what names the workspace. Looking the
- * hash up with raw getDb() only worked because production connected as a
- * BYPASSRLS role; under a role subject to RLS every key read as invalid.
- *
- * So new keys carry their workspace:  rp_live_<48 hex random>_<32 hex workspace>
- * The guard reads the workspace from the token, then looks the hash up UNDER
- * that workspace's context. The stored hash covers the whole token, so editing
- * the workspace part yields a different hash and matches nothing — the embedded
- * id is a routing hint, never a credential. The random part stays first so the
- * stored display prefix (first 12 chars) still tells keys apart.
+ * Format: rp_live_<48 hex random>_<32 hex workspace>. The workspace part lets the
+ * guard look the key up under RLS; the stored hash covers the whole token, so the
+ * embedded id is a routing hint, never a credential.
  */
 const TOKEN_RE = /^rp_live_[0-9a-f]{48}_([0-9a-f]{32})$/;
 

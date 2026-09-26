@@ -7,12 +7,8 @@ import pino from 'pino';
 
 const logger = pino({ name: 'api-bootstrap' });
 
-// Keep this long-running service alive through transient infra blips. A Supabase
-// pooler drop mid-query rejects the in-flight query (→ unhandledRejection) or
-// fires an 'error' on the active client (→ uncaughtException); without these
-// handlers either one exits the process (the "Connection terminated unexpectedly"
-// exit-1 crash). The failed query is already surfaced to its caller / retried by
-// the scheduler, so logging and staying up is the correct behaviour here.
+// Stay up through transient DB blips (e.g. the pooler dropping a connection);
+// the failed query is already reported to its caller.
 process.on('unhandledRejection', (reason: any) => {
   logger.warn(`Unhandled rejection (non-fatal): ${reason?.message || reason}`);
 });
@@ -33,15 +29,13 @@ async function bootstrap() {
     credentials: true,
   });
 
-  // Call ensureBypassUser if AUTH_BYPASS is active
   if (env.AUTH_BYPASS) {
     logger.info('AUTH_BYPASS is enabled. Provisioning dev user + workspace context...');
     const authService = app.get(AuthService);
     await authService.ensureBypassUser();
   }
 
-  // Verify tenant isolation actually bites for the role we connect with. It did
-  // not, silently, for the whole life of this deployment — see tenant-isolation.ts.
+  // Verify tenant isolation holds for the role we connect as (see tenant-isolation.ts).
   await assertTenantIsolation(getDb());
 
   await app.listen(env.PORT);

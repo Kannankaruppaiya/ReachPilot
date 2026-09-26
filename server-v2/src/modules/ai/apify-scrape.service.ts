@@ -4,13 +4,9 @@ import { withWorkspace } from '@/db/rls';
 import { SecretsService } from '@/modules/vault/secrets.service';
 
 /**
- * Runs the workspace's Apify LinkedIn profile scraper (default
- * `harvestapi/linkedin-profile-scraper`) to enrich a prospect before the AI
- * writes their connection note. Direct Apify REST (not MCP) because this runs in
- * the worker, per connect job — a synchronous actor run that returns the dataset.
- *
- * Best-effort by design: any failure (no token, actor error, timeout) returns
- * null so the caller falls back to a name/role/company note. Never throws.
+ * Scrapes a prospect's LinkedIn profile with the workspace's Apify actor (REST,
+ * synchronous run) to ground the AI note. Never throws: any failure returns null
+ * and the caller writes a name/role/company note.
  */
 @Injectable()
 export class ApifyScrapeService {
@@ -24,8 +20,7 @@ export class ApifyScrapeService {
       db
         .selectFrom('integrations')
         .select('credentials_secret_id')
-        // Explicit workspace scope: under the BYPASSRLS role a lookup by
-        // provider alone could decrypt and spend ANOTHER tenant's Apify token.
+        // Explicit workspace scope: never decrypt another tenant's token.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .where('active', '=', true)
@@ -35,10 +30,7 @@ export class ApifyScrapeService {
     return this.secrets.decrypt(row.credentials_secret_id, { workspaceId }).catch(() => null);
   }
 
-  /**
-   * Scrape one LinkedIn profile and return a compact, model-ready summary
-   * (headline, about, location, current role, skills). Null on any failure.
-   */
+  /** Scrape one profile into a short, model-ready summary; null on any failure. */
   async scrapeLinkedInProfile(workspaceId: string, profileUrl: string): Promise<string | null> {
     const url = (profileUrl || '').trim();
     if (!/\/in\//i.test(url)) return null; // only real profile URLs

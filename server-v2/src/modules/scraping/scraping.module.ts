@@ -6,12 +6,7 @@ import { ScrapeCursorService } from './scrape-cursor.service';
 import { ScrapeJobsService } from './scrape-jobs.service';
 import { ScrapingController } from './scraping.controller';
 
-/**
- * Free local lead sourcing: a headful stealth (patchright) browser scrapes
- * Google for LinkedIn profiles and imports them via LeadsService. The scrape job
- * itself runs in the worker (browser home); this module wires the API endpoint
- * and exposes LeadScraperService for the worker to resolve.
- */
+/** Lead scraping: the API endpoint here, the scrape itself in the worker. */
 @Module({
   imports: [LeadsModule, AiModule],
   controllers: [ScrapingController],

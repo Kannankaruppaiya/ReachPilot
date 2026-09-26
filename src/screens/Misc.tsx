@@ -532,8 +532,7 @@ export function Integrations() {
 
 const tabs = ["Profile", "LinkedIn limits", "Blacklist", "Billing"] as const
 
-// Common timezones offered in the working-hours picker (working hours are
-// evaluated in the account's timezone by the pacing engine).
+// Timezones for the working-hours picker (pacing uses the account's timezone).
 const TZ_OPTIONS = [
   "UTC",
   "Asia/Kolkata",
@@ -558,7 +557,6 @@ export function Settings() {
   const [sendWeekends, setSendWeekends] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  // Real profile + account limits — nothing hardcoded.
   useEffect(() => {
     let alive = true
     api.me().then((m) => alive && setMe(m)).catch(() => {})
@@ -582,8 +580,7 @@ export function Settings() {
 
   const safeToday = account?.warmup?.todayLimit ?? 5
 
-  // Persist the limits — this page is the ONLY place limits are set; the
-  // backend stores them on the account and the pacing engine enforces them.
+  // Save limits (the only place they're set); pacing enforces them.
   const saveLimits = async () => {
     if (!account?.connected) {
       toast("Connect a LinkedIn account before setting limits.")

@@ -6,12 +6,8 @@ import { GraphExecutor } from './graph-executor';
 export class EngineService {
   constructor(private readonly executor: GraphExecutor) {}
 
-  /**
-   * Enroll a lead into a campaign sequence at its entry step.
-   */
+  /** Enroll a lead at the campaign's entry step. */
   async enrollLead(workspaceId: string, campaignId: string, leadId: string): Promise<void> {
-    // campaigns and enrollments are RLS-scoped — read and write under the
-    // workspace context, not raw getDb().
     const enrollment = await withWorkspace(workspaceId, async (db) => {
       const campaign = await db
         .selectFrom('campaigns')
@@ -41,7 +37,6 @@ export class EngineService {
 
     if (!enrollment) return;
 
-    // Trigger execution
     await this.executor.executeStep(workspaceId, enrollment.id);
   }
 }

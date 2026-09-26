@@ -5,11 +5,9 @@ import { getEnv } from '@/config/env';
 import { withWorkspace } from '@/db/rls';
 
 /**
- * Bridge between the server-side RemoteAgentDriver (which pushes actions to Redis
- * `agent:inbox:<accountId>`) and the user's DESKTOP AGENT (which runs the real
- * driver on the user's own IP). The agent authenticates with the user's normal
- * Bearer token; the account is derived from the authenticated workspace, so the
- * agent can never poll another workspace's queue.
+ * Endpoints the desktop agent polls. It authenticates with the user's Bearer
+ * token, and the account comes from that workspace, so it can't poll another
+ * workspace's queue.
  */
 @Controller('api/agent')
 export class AgentController {
@@ -20,13 +18,8 @@ export class AgentController {
     const user = (req as any).user as { workspaceId?: string; role?: string } | undefined;
     const ws = user?.workspaceId || (req as any).workspaceId;
     if (!ws) throw new UnauthorizedException('agent not authenticated');
-    // next-job returns the raw decrypted job payload (li_at cookie for an
-    // action, or email/password/TOTP for a login), and job-result accepts an
-    // outcome for it — this must be reachable only by whoever is meant to run
-    // the desktop agent, not by every credential that happens to authenticate
-    // to this workspace. In particular a 'member'-role API key (meant for
-    // read-only integrations) could otherwise race the real desktop client
-    // for this data. Restrict to the account-management roles.
+    // Jobs carry decrypted credentials, so only owners/admins may run the agent
+    // (not, e.g., a member-role API key).
     if (user?.role !== 'owner' && user?.role !== 'admin') {
       throw new ForbiddenException('Only a workspace owner/admin can act as the desktop agent.');
     }
@@ -34,11 +27,8 @@ export class AgentController {
   }
 
   /**
-   * The account the desktop agent should log in AS. The desktop keys its
-   * persistent LinkedIn profile by this id (reachpilot-profiles/<accountId>),
-   * which is the SAME id the dispatched jobs carry — so the one-time login and
-   * the later actions share one session. Sendable accounts win over
-   * paused/disconnected ones, newest first.
+   * The account the desktop agent logs in as; its persistent profile is keyed by
+   * this id. Sendable accounts first, newest first.
    */
   @Get('account')
   async account(@Req() req: Request) {
@@ -48,7 +38,6 @@ export class AgentController {
         .selectFrom('linkedin_accounts')
         .select(['id', 'email', 'status'])
         .where('workspace_id', '=', ws)
-        // sendable (active/warming_up) first, then most recently connected.
         .orderBy((eb) =>
           eb.case().when('status', 'in', ['paused', 'disconnected', 'checkpoint']).then(1).else(0).end(),
         )
@@ -67,9 +56,7 @@ export class AgentController {
     const accounts = await withWorkspace(ws, (db) =>
       db.selectFrom('linkedin_accounts').select('id').where('workspace_id', '=', ws).execute(),
     );
-    // Which desktop build is this? Sent only by 0.1.1+ (the first build that can
-    // update itself); anything older cannot be changed to send it, so an absent
-    // header identifies an install that needs one manual reinstall.
+    // Sent by 0.1.1+; a missing header means a build that needs a manual reinstall.
     const agentVersion = String((req.headers as any)['x-agent-version'] || '').slice(0, 32);
 
     // TEMP DIAG: which workspace/accounts is a desktop agent polling for?
@@ -77,26 +64,12 @@ export class AgentController {
       `agent poll ws=${ws.slice(0, 8)} v=${agentVersion || 'legacy(pre-0.1.1, needs manual update)'} accounts=[${accounts.map((a) => a.id.slice(0, 8)).join(',')}]`,
     );
 
-    // Heartbeat + wake-on-reconnect. This poll proves a live desktop agent is
-    // online for every account in the workspace right now (the worker's
-    // RemoteAgentDriver reads `agent:hb:<accountId>` to skip dispatching to an
-    // offline agent). Short TTL (agent polls ~every 5s), so the key is only absent
-    // when the app was closed / laptop was off for >30s. Absent-then-present = a
-    // WAKE: pull that account's agent-offline-deferred jobs forward to now so the
-    // scheduler runs them on its next tick (~30s) instead of waiting out the
-    // backoff. Pacing still caps them at the daily warm-up limit.
+    // Heartbeat for every account in the workspace (30s TTL). If the key was
+    // missing, the agent just came back: pull its deferred jobs forward.
     for (const a of accounts) {
       const wasOnline = await this.redis.get(`agent:hb:${a.id}`);
-      // Carry the agent's build version AS the heartbeat value rather than in a
-      // second key: both readers of this key (RemoteAgentDriver, SchedulerService)
-      // only test truthiness, so a version string works exactly as '1' did, and
-      // "is it online" and "which build" stay one write and one read.
-      //
-      // 🔴 A MISSING header is the signal that matters. Builds before 0.1.1 have
-      // no auto-updater and cannot be changed, so they never send one — meaning
-      // this is how a stuck install is identified and told to reinstall once.
-      // 'legacy' is deliberately not a version number so it can never be mistaken
-      // for one, or compared as one.
+      // The heartbeat value is the agent version ('legacy' when absent); readers
+      // only test truthiness.
       await this.redis.set(`agent:hb:${a.id}`, agentVersion || 'legacy', 'EX', 30);
       if (!wasOnline) {
         const nowIso = new Date().toISOString();
@@ -120,14 +93,8 @@ export class AgentController {
       const raw = await this.redis.rpop(`agent:inbox:${a.id}`);
       if (raw) {
         const job = JSON.parse(raw);
-        // Mark the job ACCEPTED so the server-side RemoteAgentDriver can tell a job
-        // the agent actually took (and is now running on this machine) apart from
-        // one that was never picked up. This is what stops a slow-but-successful
-        // send being misreported as agent_unavailable: once accepted, the driver
-        // waits patiently for the result instead of giving up and rescheduling an
-        // already-sent invite. TTL covers the longest realistic action (incl. a
-        // login with a 2FA/checkpoint step). Best-effort — a lost marker just
-        // degrades to the old give-up behaviour, never a wrong send.
+        // Mark the job accepted so RemoteAgentDriver waits for its result instead of
+        // rescheduling an already-sent action.
         if (job?.token) {
           await this.redis.set(`agent:accepted:${job.token}`, '1', 'EX', 900).catch(() => undefined);
         }

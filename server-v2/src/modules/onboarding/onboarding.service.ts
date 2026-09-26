@@ -67,8 +67,7 @@ export class OnboardingService {
       db
         .updateTable('linkedin_accounts')
         .set({ warmup_daily_limit: dailyLimit, hours_start: hoursStart, hours_end: hoursEnd, send_weekends: weekends })
-        // 🔴 No WHERE here either — under the BYPASSRLS role this set every
-        // tenant's LinkedIn limits and working hours.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .execute(),
     );

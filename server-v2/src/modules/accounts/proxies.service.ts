@@ -4,13 +4,8 @@ import { getDb } from '@/db';
 @Injectable()
 export class ProxiesService {
   /**
-   * Assign a REAL, country-matched proxy to an account. The dev seed proxies
-   * (provider = 'simulator') are ignored — they're fake/unroutable, and in
-   * local-IP mode we want NO proxy so egress uses the machine's own IP.
-   *
-   * Returns null when no real proxy exists → the account gets proxy_id = null
-   * (multiple nulls are allowed by the unique constraint) and the driver routes
-   * directly. Wire a residential proxy provider for production/scale.
+   * Assign a real, country-matched proxy (fake 'simulator' ones are ignored).
+   * Returns null when there is none, and the account egresses directly.
    */
   async assignProxy(country: string): Promise<{ id: string; ip: string; country: string } | null> {
     const db = getDb();

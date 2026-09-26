@@ -15,35 +15,24 @@ const envSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(32),
   JWT_ACCESS_EXPIRY: z.string().default('15m'),
   JWT_REFRESH_EXPIRY: z.string().default('7d'),
-  // Grace window in which a just-rotated refresh token presented again by a
-  // concurrent tab is treated as a race (issue fresh tokens) instead of a
-  // reuse/theft (401 + logout). Keep short — the cross-tab race resolves in ms.
+  // Grace window where a just-rotated refresh token reused by a concurrent tab is
+  // treated as a race (fresh tokens), not theft (401 + logout).
   REFRESH_ROTATION_GRACE_MS: z.coerce.number().int().nonnegative().default(30_000),
 
-  // Local lead scraper (LeadScraperService). Persistent Chrome profile dir for
-  // the stealth (patchright) browser; empty = an OS-temp default. Headful by
-  // default — headless is easily bot-flagged by Google.
+  // Lead scraper's persistent Chrome profile dir (empty = OS temp). Headful by
+  // default; headless gets flagged by Google.
   SCRAPER_PROFILE_DIR: z.string().optional(),
   SCRAPER_HEADLESS: z.coerce.boolean().default(false),
-  // Lead-scraper engine: 'legacy' (single-page patchright), 'crawlee' (Crawlee
-  // PlaywrightCrawler — RequestQueue pagination + dedup + session rotation), or
-  // 'multi' (MultiEngineFetcher — rotates across several search engines with
-  // per-engine block-aware cooldown, so one engine's CAPTCHA can't kill a run).
-  // Default legacy until the newer engines reach parity in production.
+  // Lead-scraper engine: 'legacy' (single-page patchright), 'crawlee' (pagination +
+  // session rotation) or 'multi' (rotates search engines with block cooldowns).
   SCRAPER_ENGINE: z.enum(['legacy', 'crawlee', 'multi']).default('legacy'),
-  // Multi-engine order (comma list). The fetcher tries them left-to-right,
-  // skipping any currently cooling down, and aggregates results across all.
-  // Supported: google, bing, duckduckgo, brave, mojeek.
+  // Engines for 'multi', tried left to right: google, bing, duckduckgo, brave, mojeek.
   SCRAPER_ENGINES: z.string().default('google,bing,duckduckgo,brave'),
-  // How long (ms) to stop querying an engine after it returns a block/CAPTCHA.
+  // Pause an engine this long (ms) after it returns a block/CAPTCHA.
   SCRAPER_ENGINE_COOLDOWN_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
 
-  // Standalone lead-scraper microservice (src/scraper-service.ts). Lets the
-  // browser scrape run on a cheap Linux VPS (headful Chrome under Xvfb) instead
-  // of an always-on PC — the service holds no DB/Redis and returns leads as JSON.
-  //   • On the VPS: `npm run start:scraper` (uses SCRAPER_SERVICE_PORT + _TOKEN).
-  //   • On the main worker: set SCRAPER_SERVICE_URL to offload scraping to that
-  //     VPS; leave it empty to scrape locally in-process (the original path).
+  // Standalone scraper service (src/scraper-service.ts, `npm run start:scraper`).
+  // Set SCRAPER_SERVICE_URL on the worker to offload to it; empty = scrape locally.
   SCRAPER_SERVICE_PORT: z.coerce.number().int().positive().default(4100),
   SCRAPER_SERVICE_TOKEN: z.string().default(''),
   SCRAPER_SERVICE_URL: z.string().default(''),
@@ -70,7 +59,7 @@ const envSchema = z.object({
   SMTP_PORT: z.coerce.number().default(1025),
   SMTP_FROM: z.string().default('noreply@reachpilot.dev'),
 
-  // LinkedIn automation driver: 'simulator' (fake) or 'playwright' (real browser).
+  // LinkedIn driver: 'simulator' (fake), 'playwright' (local browser) or 'remote' (desktop agent).
   LINKEDIN_DRIVER: z.enum(['simulator', 'playwright', 'remote']).default('simulator'),
   PLAYWRIGHT_HEADLESS: z
     .string()
@@ -81,8 +70,7 @@ const envSchema = z.object({
   // How often the worker drains due `scheduled` jobs into the queues (ms).
   SCHEDULER_TICK_MS: z.coerce.number().int().positive().default(30_000),
 
-  // Campaign runner: drives enrollments through their campaign_steps sequence.
-  // Off means enrolled leads never advance past the step the enroll kicked off.
+  // Campaign runner; off means enrollments never advance past their first step.
   CAMPAIGN_RUNNER_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
@@ -90,42 +78,32 @@ const envSchema = z.object({
   CAMPAIGN_RUNNER_TICK_MS: z.coerce.number().int().positive().default(60_000),
 
   // ── Background loop switches ────────────────────────────────────────────
-  // The LinkedIn sync opens a REAL browser every few minutes (reads the
-  // connections list + messaging, and withdraws stale invites). That's the
-  // "pages keep opening by themselves" behaviour, and every extra automated
-  // session is avoidable account risk while testing — so it can be switched off.
-  // Off means: no acceptance/reply detection and no stale-invite withdrawal.
+  // LinkedIn sync opens a real browser every tick; switch it off while testing.
+  // Off = no acceptance/reply detection and no stale-invite withdrawal.
   LINKEDIN_SYNC_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
-  // Withdrawing invites older than WITHDRAW_AFTER_DAYS is destructive (it can
-  // retract real, human-sent invitations), so it gets its own switch.
+  // Withdrawing old invites is destructive, so it has its own switch.
   LINKEDIN_WITHDRAW_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
   WITHDRAW_AFTER_DAYS: z.coerce.number().int().positive().default(21),
-  // How often the LinkedIn sync opens a browser to read accepted invites / replies.
-  // Each tick opens a REAL browser per sendable account, so keep it infrequent — a
-  // long interval is safer (fewer automated sessions) and multi-day sequences don't
-  // need minute-level granularity. Default 45 min (was a hardcoded 5 min).
+  // LinkedIn sync interval. Each tick opens a real browser per account, so keep it long.
   LINKEDIN_SYNC_TICK_MS: z.coerce.number().int().positive().default(45 * 60 * 1000),
   // Gmail inbox polling (API only — opens no browser).
   GMAIL_SYNC_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
-  // The scheduler drains due `scheduled` jobs. Off means multi-day sequences and
-  // pacing-deferred retries never advance — only immediate day-0 sends run.
+  // Scheduler; off means only immediate day-0 sends run.
   SCHEDULER_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
     .default('true'),
-  // Email warm-up loop: the workspace's connected Gmail mailboxes exchange
-  // natural-looking mails and open/read/star/reply on the receiving side —
-  // rescuing any that land in spam — to build sender reputation. Needs ≥2
-  // connected mailboxes and the gmail.modify scope. API only, no browser.
+  // Email warm-up between the workspace's mailboxes (needs ≥2 mailboxes and the
+  // gmail.modify scope). API only.
   EMAIL_WARMUP_ENABLED: z
     .string()
     .transform((v) => v !== 'false' && v !== '0')
@@ -134,30 +112,22 @@ const envSchema = z.object({
   // Ceiling for the per-mailbox daily warm-up send budget (ramp: 2 + age/2 days).
   EMAIL_WARMUP_MAX_PER_DAY: z.coerce.number().int().positive().default(8),
 
-  // Residential/mobile proxy for LinkedIn egress (one dedicated IP per account).
-  // Either a provider gateway (PROXY_SERVER + creds) or per-account IPs in the DB.
+  // LinkedIn egress proxy: a provider gateway here, or per-account IPs in the DB.
   PROXY_SERVER: z.string().default(''),
   PROXY_USERNAME: z.string().default(''),
   PROXY_PASSWORD: z.string().default(''),
 
-  // AI personalization (Google Gemini). Free tier: gemini-2.5-flash, ~10 RPM /
-  // 250 req/day. Empty key → the AI endpoints report "not configured" and callers
-  // fall back to plain templates.
+  // Gemini for AI personalisation. Empty → AI endpoints report "not configured" and
+  // callers use plain templates.
   GEMINI_API_KEY: z.string().default(''),
   GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
 
-  // Apify MCP: the hosted Model Context Protocol server. The user's per-workspace
-  // Apify API token (stored encrypted in the vault, referenced from `integrations`)
-  // is what actually authorizes tool calls; this is just the endpoint + the default
-  // tool set offered when connecting. See https://mcp.apify.com.
+  // Apify MCP endpoint; each workspace's own Apify token (vault) authorises calls.
   APIFY_MCP_URL: z.string().default('https://mcp.apify.com'),
   APIFY_MCP_DEFAULT_TOOLS: z.string().default('actors,docs,apify/rag-web-browser'),
 
-  // Apify LinkedIn profile scraper actor used by Auto Connect's "AI + Apify"
-  // personalization (scrape the prospect's profile → feed it to the note writer).
-  // harvestapi handles LinkedIn auth server-side (no cookie needed). Actor id uses
-  // `~` in the API path (owner~name). The input key + scraper mode are actor-
-  // specific — configurable so a different actor can be dropped in via .env.
+  // Apify actor for "AI + Apify" connect notes (scrapes the prospect's profile).
+  // Input key and mode are actor-specific, so a different actor can be set in .env.
   APIFY_LINKEDIN_ACTOR: z.string().default('harvestapi/linkedin-profile-scraper'),
   APIFY_LINKEDIN_INPUT_KEY: z.string().default('queries'),
   APIFY_LINKEDIN_MODE: z.string().default('Profile details no email ($4 per 1k)'),

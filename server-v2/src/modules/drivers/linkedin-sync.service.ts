@@ -18,15 +18,10 @@ const profileSlug = (url?: string | null): string =>
 const SENDABLE_ACCT = ['warming_up', 'active', 'connecting'];
 
 /**
- * The LinkedIn counterpart to the Gmail inbox sync — this is B4.
- *
- * For every sendable account it asks the driver (read-only) which invites were
- * accepted and which replies arrived, then applies those observations to lead
- * state: invited → accepted, accepted → replied (+ inbox thread, auto-pause of
- * the sequence). It also withdraws stale pending invites.
- *
- * The `apply()` step is deliberately separate from the polling loop so it can be
- * unit-verified with a hand-built sync result, independent of any browser.
+ * LinkedIn acceptance/reply sync: per sendable account, reads accepted invites and
+ * replies from the driver and applies them (invited → accepted → replied, inbox
+ * thread, stop the sequence), then withdraws stale invites. `apply()` is separate
+ * so it can be tested with a hand-built result.
  */
 @Injectable()
 export class LinkedInSyncService {
@@ -55,8 +50,7 @@ export class LinkedInSyncService {
           db
             .selectFrom('linkedin_accounts')
             .select('id')
-            // Explicit workspace scope — the DB role bypasses RLS, so without it
-            // every workspace's pass re-synced every tenant's accounts.
+            // Explicit workspace scope: the DB role bypasses RLS.
             .where('workspace_id', '=', ws.id)
             .where('status', 'in', SENDABLE_ACCT as any)
             .execute(),
@@ -87,8 +81,7 @@ export class LinkedInSyncService {
         totals.accepted += applied.accepted;
         totals.replies += applied.replies;
 
-        // Withdrawing is destructive — it retracts real invitations, including
-        // ones a human sent by hand — so it only runs when explicitly enabled.
+        // Withdrawing retracts real invites (even hand-sent ones), so it's opt-in.
         const env = getEnv();
         if (env.LINKEDIN_WITHDRAW_ENABLED) {
           try {
@@ -108,9 +101,8 @@ export class LinkedInSyncService {
   }
 
   /**
-   * Apply a sync result to the DB for one account. Idempotent: an accepted lead
-   * won't be re-accepted (matched only while `status='invited'`), and a reply
-   * with a known `externalId` is skipped if already ingested.
+   * Apply a sync result for one account. Idempotent: only `invited` leads are
+   * accepted, and replies with a known `externalId` are skipped.
    */
   async apply(
     workspaceId: string,

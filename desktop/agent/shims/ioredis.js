@@ -1,7 +1,5 @@
-// Minimal in-memory ioredis shim. The desktop agent is a SINGLE process running a
-// SINGLE user's account, so an in-process lock correctly serializes concurrent
-// browser opens (the only thing the driver uses Redis for). Supports the exact
-// commands the driver calls: set (NX/PX/EX), get, del, eval (compare-and-delete).
+// In-memory ioredis shim: one process, one user, so an in-process lock is enough.
+// Supports only what the driver calls: set (NX/PX/EX), get, del, eval.
 class Redis {
   constructor() { this.store = new Map(); }
 

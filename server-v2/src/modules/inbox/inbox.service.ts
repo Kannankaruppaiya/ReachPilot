@@ -102,16 +102,11 @@ export class InboxService {
     });
   }
 
-  /**
-   * Reply in a thread. For email threads this sends a REAL email via the
-   * connected mailbox; for LinkedIn it goes through the LinkedIn driver.
-   * The outgoing message is recorded only after a successful send.
-   */
+  /** Reply in a thread (real email or LinkedIn send); recorded only after it succeeds. */
   async sendMessage(workspaceId: string, threadId: string, text: string): Promise<any> {
     const body = (text || '').trim();
     if (!body) throw new BadRequestException("Message can't be empty.");
 
-    // Load the thread + lead under RLS.
     const thread = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('threads')
@@ -144,7 +139,6 @@ export class InboxService {
     const baseSubject = lastInbound?.subject || `Message from ${thread.full_name || 'us'}`;
     const subject = /^re:/i.test(baseSubject) ? baseSubject : `Re: ${baseSubject}`;
 
-    // Perform the real send.
     let externalId: string | undefined;
     if (thread.channel === 'email') {
       if (!thread.email) throw new BadRequestException('This lead has no email address.');
@@ -157,7 +151,7 @@ export class InboxService {
       externalId = await this.sendLinkedInReply(workspaceId, thread.lead_id, thread.linkedin_url, body);
     }
 
-    // Record the outgoing message + mark the thread read.
+    // Record the outgoing message and mark the thread read.
     const now = new Date().toISOString();
     await withWorkspace(workspaceId, async (db) => {
       await db
@@ -179,7 +173,6 @@ export class InboxService {
         .execute();
     });
 
-    // Return the refreshed thread's messages for immediate UI update.
     const messages = await withWorkspace(workspaceId, (db) =>
       db
         .selectFrom('messages')
@@ -203,16 +196,7 @@ export class InboxService {
     };
   }
 
-  /**
-   * Send a LinkedIn reply AS one of the workspace's accounts, or throw.
-   *
-   * 🔴 This used to call the driver with no account at all and ignore the
-   * result, then record the message as sent. In production (remote driver) a
-   * call without an account returns `failed: no_account_id` at once — so every
-   * LinkedIn reply from the inbox showed as sent while nothing reached the
-   * prospect. Now the reply goes out through a real account session, and only a
-   * confirmed `sent` is recorded; anything else is reported to the user.
-   */
+  /** Send a LinkedIn reply from a real account session; record only a confirmed `sent`. */
   private async sendLinkedInReply(
     workspaceId: string,
     leadId: string,
@@ -253,9 +237,8 @@ export class InboxService {
   }
 
   /**
-   * The account to reply from: the one that last reached this lead (the
-   * conversation lives in that account's inbox), else the workspace's most
-   * recently connected account that may send.
+   * Reply from the account that last reached this lead, else the newest account
+   * that may send.
    */
   private async replyAccountFor(workspaceId: string, leadId: string): Promise<string | null> {
     return withWorkspace(workspaceId, async (db) => {

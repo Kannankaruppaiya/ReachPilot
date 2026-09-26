@@ -19,14 +19,9 @@ function getRedis(): Redis {
 @Injectable()
 export class PacingService {
   /**
-   * Evaluates if a job can be sent right now based on pacing rules:
-   * 1. Daily limit counters in Redis (warmup_daily_limit, email daily_limit).
-   * 2. Weekly invite cap (~100 / week for LinkedIn).
-   * 3. Working hours (e.g., 09:00 - 18:00) in account timezone.
-   * 4. Weekend flag (send_weekends).
-   *
-   * If blocked, returns the timestamp when it should be retried.
-   * If allowed, increments daily counters and returns null.
+   * Can this job send now? Checks spacing, daily and weekly caps, the campaign
+   * cap, working hours and weekends in the account timezone. Blocked → returns
+   * when to retry; allowed → registers the slot.
    */
   async checkPacingAndRegister(
     accountId: string,
@@ -35,22 +30,17 @@ export class PacingService {
     isInvite = true,
     campaignId?: string | null,
   ): Promise<{ allowed: boolean; nextScheduledAt?: string }> {
-    // No account linked → nothing to pace against (defensive; an empty string
-    // would otherwise be sent to Postgres as an invalid uuid).
+    // No account: nothing to pace (and '' would be an invalid uuid).
     if (!accountId) return { allowed: true };
 
     const redis = getRedis();
-    // Account reads are RLS-scoped when a workspace is known (worker context).
     const read = <T>(fn: (db: Kysely<DatabaseSchema>) => Promise<T>): Promise<T> =>
       workspaceId ? withWorkspace(workspaceId, fn) : fn(getDb());
 
     const now = new Date();
 
-    // ---- Per-campaign daily cap ----------------------------------------------
-    // A job that belongs to a campaign is ALSO capped by that campaign's own
-    // daily_cap (on top of the account safety limits). Campaign-scoped: Auto
-    // Connect / Auto Mail jobs carry no campaign_id, so they're never affected.
-    // Uses a UTC calendar day so a mixed LinkedIn+email campaign shares one count.
+    // Campaign jobs are also capped by the campaign's daily_cap (UTC day, so a
+    // mixed LinkedIn + email campaign shares one count).
     let campaignCap = 0;
     const campDateIso = now.toLocaleDateString('en-US');
     if (campaignId) {
@@ -59,8 +49,7 @@ export class PacingService {
       ).catch(() => undefined);
       campaignCap = Number(camp?.daily_cap || 0);
     }
-    // Consume + check the campaign slot AFTER the account gates pass, then roll
-    // it back if an account gate blocks — see the helper used in each branch.
+    // Take the campaign slot after the account gates pass; roll back if blocked.
     const takeCampaignSlot = async (accountDailyKey: string, deferAt: string) => {
       if (!campaignId || campaignCap <= 0) return null;
       const campKey = `pacing:campaign:${campaignId}:date:${campDateIso}:daily`;
@@ -95,7 +84,6 @@ export class PacingService {
 
       if (!account) return { allowed: true };
 
-      // Timezone-based evaluation
       const tz = account.timezone || 'UTC';
       const localTimeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour12: false });
       const localDay = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'short' });
@@ -104,49 +92,36 @@ export class PacingService {
       const hoursStart = account.hours_start || '09:00';
       const hoursEnd = account.hours_end || '18:00';
 
-      // Weekend check → resume at next day's opening (scheduler re-checks and
-      // re-defers if it's still the weekend, so a single day hop is enough).
+      // Weekend: retry at the next day's open (the scheduler re-defers if needed).
       const isWeekend = localDay === 'Sat' || localDay === 'Sun';
       if (isWeekend && !account.send_weekends) {
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, 1) };
       }
 
-      // Business hours check (all comparisons in the account's local wall clock).
-      // An end earlier than the start means the window wraps past midnight
-      // (e.g. 06:00 → 03:00 keeps sending into the small hours of the next day).
+      // Working hours in the account's local time; end < start wraps past midnight.
       const wrapsMidnight = hoursEnd < hoursStart;
       const inWindow = wrapsMidnight
         ? localTimeStr >= hoursStart || localTimeStr <= hoursEnd
         : localTimeStr >= hoursStart && localTimeStr <= hoursEnd;
       if (!inWindow) {
-        // Resume at the opening hour: later today if we're before the start
-        // (including the wrapped gap, e.g. 03:00–06:00), otherwise tomorrow.
+        // Retry at the open: later today if before it, otherwise tomorrow.
         const dayOffset = localTimeStr < hoursStart ? 0 : 1;
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, dayOffset) };
       }
 
-      // ---- Inter-action spacing (pace the session, don't burst) ----
-      // Expandi-style: a fresh cold account firing its whole daily quota in a
-      // 3-minute window is a bot signal. Enforce a minimum gap between actions on
-      // this account; the gap is re-rolled for EVERY action (see interactionGapMs)
-      // so the account never settles onto one metronome. Checked BEFORE the daily
-      // counter so a spacing defer doesn't consume a slot.
-      // Stored as the ABSOLUTE instant the next action may run, not as the last
-      // action's timestamp. That distinction is what lets the gap be re-rolled per
-      // action (see interactionGapMs) while a blocked job re-checked minutes later
-      // still gets the same answer instead of a target that drifts on every retry.
+      // Minimum gap between actions, re-rolled for every action (see
+      // interactionGapMs). Stored as the absolute next-allowed instant so a re-checked
+      // job gets the same answer. Checked before the daily counter so a spacing defer
+      // doesn't use a slot.
       const nextAllowedKey = `pacing:linkedin:${accountId}:nextallowed`;
       const nextAllowedMs = Number((await redis.get(nextAllowedKey)) || 0);
       if (nextAllowedMs && now.getTime() < nextAllowedMs) {
         return { allowed: false, nextScheduledAt: new Date(nextAllowedMs).toISOString() };
       }
 
-      // ---- Warm-up ramp + daily randomization ----
-      // The ramp curve lives in computeWarmup() (shared with the accounts API so
-      // the UI shows the same number we enforce). Then jitter the cap ±15%
-      // deterministically per day so it isn't a robotic constant.
-      // Anchor to the EARLIER of the two: connected_at is rewritten on every
-      // credential update, so on its own it restarts the ramp at day zero.
+      // Warm-up ramp (computeWarmup, shared with the UI) plus ±15% daily jitter.
+      // Ramp from the earlier of connected_at/created_at: connected_at resets on
+      // every credential update.
       const connectedAt = warmupOrigin(account.connected_at, account.created_at);
       const baseLimit = computeWarmup(
         connectedAt,
@@ -156,20 +131,17 @@ export class PacingService {
       ).todayLimit;
       const effectiveDailyLimit = this.jitterDailyLimit(baseLimit, accountId, localDateIso);
 
-      // Daily limit counter
       const dailyKey = `pacing:linkedin:${accountId}:date:${localDateIso}:daily`;
       const dailyCount = await redis.incr(dailyKey);
       await redis.expire(dailyKey, 86400 * 2); // 2 days expiry
 
       if (dailyCount > effectiveDailyLimit) {
-        // Rollback incr
         await redis.decr(dailyKey);
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, 1) };
       }
 
-      // Passed the daily gate → roll THIS action's cool-down and store when the
-      // next one may run (2-day TTL). dailyCount is the day's action sequence, so
-      // every action draws a different gap.
+      // Passed: roll this action's cool-down. dailyCount is the sequence number, so
+      // each action gets a different gap.
       await redis.set(
         nextAllowedKey,
         String(now.getTime() + this.interactionGapMs(accountId, localDateIso, dailyCount)),
@@ -177,16 +149,13 @@ export class PacingService {
         86400 * 2,
       );
 
-      // Per-campaign daily cap (rolls back the account slot if over).
       const campBlocked = await takeCampaignSlot(
         dailyKey,
         this.localWallClockToUtc(tz, hoursStart, 1),
       );
       if (campBlocked) return campBlocked;
 
-      // Weekly cap applies to INVITES only — profile views, follows, likes and
-      // endorsements are paced by the daily counter above but don't burn the
-      // weekly connection-request allowance.
+      // The weekly cap applies to invites only.
       if (!isInvite) return { allowed: true };
 
       const weeklyKey = `pacing:linkedin:${accountId}:weekly`;
@@ -197,13 +166,11 @@ export class PacingService {
 
       if (weeklyCount > account.weekly_invite_cap) {
         await redis.decr(weeklyKey);
-        // Weekly cap: resume at the next day's opening hour; the scheduler keeps
-        // re-deferring until the rolling weekly window frees up a slot.
+        // Retry at the next day's open until the weekly window frees a slot.
         return { allowed: false, nextScheduledAt: this.localWallClockToUtc(tz, hoursStart, 1) };
       }
 
     } else {
-      // Email pacing
       const account = await read((db) =>
         db
           .selectFrom('email_accounts')
@@ -214,8 +181,7 @@ export class PacingService {
 
       if (!account) return { allowed: true };
 
-      // Warm-up ramp: a fresh mailbox sending its full quota on day one is a
-      // spam signal. Start at 5/day and add 5/day until it reaches daily_limit.
+      // Warm-up: start at 5/day, add 5/day up to daily_limit.
       const connectedAt = account.connected_at || account.created_at;
       const ageDays = connectedAt
         ? Math.floor((now.getTime() - new Date(connectedAt).getTime()) / 86400000)
@@ -246,9 +212,7 @@ export class PacingService {
     return { allowed: true };
   }
 
-  /**
-   * Generates a random jitter between 30 and 180 seconds.
-   */
+  /** Random jitter between 30 and 180 seconds. */
   getRandomJitterMs(): number {
     const min = 30;
     const max = 180;
@@ -257,11 +221,8 @@ export class PacingService {
   }
 
   /**
-   * Releases a pacing slot that was registered but not spent — e.g. the send
-   * failed, or the account turned out to be unusable after the counter was
-   * incremented. Without this, a failed-then-retried job would consume the
-   * daily quota twice. Best-effort; safe to call more than once (decr floors
-   * are re-corrected on the next tick).
+   * Give back a registered slot that wasn't spent (send failed or account
+   * unusable), so a retry doesn't count twice. Best-effort and idempotent.
    */
   async release(
     accountId: string,
@@ -291,11 +252,8 @@ export class PacingService {
       const tz = account?.timezone || 'UTC';
       const localDateIso = now.toLocaleDateString('en-US', { timeZone: tz });
       await redis.decr(`pacing:linkedin:${accountId}:date:${localDateIso}:daily`).catch(() => undefined);
-      // The action never happened, so its cool-down must not be charged either —
-      // otherwise a deferred job silently spends the spacing budget of a send that
-      // was never made, and the next real action waits for nothing.
+      // The action never happened, so don't charge its cool-down either.
       await redis.del(`pacing:linkedin:${accountId}:nextallowed`).catch(() => undefined);
-      // Only give back a weekly-invite slot if we consumed one.
       if (isInvite) await redis.decr(`pacing:linkedin:${accountId}:weekly`).catch(() => undefined);
     } else {
       const localDateIso = now.toLocaleDateString('en-US');
@@ -303,41 +261,23 @@ export class PacingService {
     }
   }
 
-  /**
-   * UTC ISO for wall-clock `hhmm` in timezone `tz`, `dayOffset` days from today.
-   *
-   * Timezone-correct without a date library: a wall-clock instant T in `tz`
-   * equals `T − offset` in UTC, where `offset` is how far ahead of UTC the zone
-   * is right now. Approximate across a DST boundary (at most an hour off), which
-   * is fine — the scheduler re-checks pacing when the job comes due and simply
-   * re-defers if the window still isn't open, so any estimate self-corrects.
-   */
-  /** Small stable hash → [0,1). Same account+day always yields the same value. */
+  /** Stable hash → [0,1): same inputs, same value. */
   private seed01(...parts: string[]): number {
     let h = 2166136261;
     for (const p of parts.join('|')) h = (h ^ p.charCodeAt(0)) * 16777619;
     return ((h >>> 0) % 100000) / 100000;
   }
 
-  /**
-   * Jitter the daily cap ±15% deterministically per account/day, so the number
-   * of actions varies day-to-day (12, then 14, then 11…) instead of a robotic
-   * constant. Deterministic so repeated pacing checks the same day agree.
-   */
+  /** ±15% daily cap jitter, deterministic per account and day. */
   public jitterDailyLimit(base: number, accountId: string, dateIso: string): number {
     const factor = 0.85 + this.seed01(accountId, dateIso, 'daily') * 0.3; // 0.85–1.15
     return Math.max(1, Math.round(base * factor));
   }
 
   /**
-   * Cool-down before this account's NEXT action, re-rolled for EVERY action.
-   *
-   * A gap held constant for a whole day is its own fingerprint: every action on
-   * the account lands on the same metronome, which no human produces. Real
-   * sessions are lumpy — two sends inside two minutes, then a quarter of an hour
-   * away from the keyboard. `seq` (the day's action counter) makes each roll
-   * different while keeping the result deterministic, so re-checking a blocked
-   * job never moves its target time.
+   * Cool-down before this account's next action, re-rolled per action: a constant
+   * gap is a fingerprint. `seq` keeps each roll deterministic, so re-checking a
+   * blocked job never moves its target time.
    */
   private interactionGapMs(accountId: string, dateIso: string, seq: number): number {
     const s = String(seq);
@@ -351,6 +291,10 @@ export class PacingService {
     return Math.round(mins * 60_000);
   }
 
+  /**
+   * UTC ISO for wall-clock `hhmm` in `tz`, `dayOffset` days ahead. Up to an hour
+   * off across DST; the scheduler re-checks when the job comes due.
+   */
   private localWallClockToUtc(tz: string, hhmm: string, dayOffset: number): string {
     const [hh, mm] = hhmm.split(':').map((n) => parseInt(n, 10) || 0);
     const now = new Date();

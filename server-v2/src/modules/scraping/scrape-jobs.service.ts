@@ -8,12 +8,7 @@ export interface ScrapeJobCounts {
   imported?: number;
 }
 
-/**
- * Tracks each lead-scrape RUN so the UI can show live progress and a history of
- * past scrapes (titles, status, how many leads landed) — the same way the
- * Assistant lists past conversations. The row is created by the controller,
- * advanced by the worker, and read by the Leads screen.
- */
+/** Scrape-run history and live progress for the Leads screen. */
 @Injectable()
 export class ScrapeJobsService {
   async create(
@@ -69,8 +64,7 @@ export class ScrapeJobsService {
       db
         .selectFrom('scrape_jobs')
         .selectAll()
-        // Explicit workspace scope — the DB role bypasses RLS, so without it the
-        // scrape history listed every tenant's searches.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .orderBy('created_at', 'desc')
         .limit(Math.min(Math.max(limit, 1), 50))

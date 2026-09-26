@@ -12,9 +12,7 @@ export interface ApifyToolSet {
   dispose: () => Promise<void>;
 }
 
-/** Gemini function declarations accept only a subset of JSON Schema. We rebuild
- *  each MCP tool's inputSchema keeping only fields Gemini understands, so a tool
- *  with `$ref`/`additionalProperties`/etc. can't 400 the whole generate call. */
+/** JSON Schema keys Gemini accepts; everything else is dropped from MCP schemas. */
 const ALLOWED_SCHEMA_KEYS = new Set([
   'type',
   'description',
@@ -61,20 +59,14 @@ function cleanSchema(input: unknown): Record<string, unknown> {
   return out;
 }
 
-/** Gemini function names: letters/digits/_/./- only. Apify names carry slashes
- *  (e.g. `apify/rag-web-browser`), so sanitize for the model and map back on call. */
+/** Gemini function names allow only letters, digits, _ . -; mapped back on call. */
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 63);
 }
 
 /**
- * Bridges the hosted Apify MCP server (https://mcp.apify.com) into the ReachPilot
- * agent's tool registry. Each MCP tool is wrapped as an {@link AgentTool}, so the
- * agent loop treats Apify scrapers/actors exactly like the built-in local tools.
- *
- * The per-workspace Apify API token lives encrypted in the vault, referenced from
- * the `integrations` row (provider='apify'). Nothing here is global — a workspace
- * with no token connected simply contributes no tools.
+ * Exposes the hosted Apify MCP server's tools to the agent as {@link AgentTool}s,
+ * using the workspace's own encrypted Apify token. No token, no tools.
  */
 @Injectable()
 export class ApifyMcpService {
@@ -95,11 +87,7 @@ export class ApifyMcpService {
     return client;
   }
 
-  /**
-   * Validate a token by connecting and listing tools. Used by the connect flow so
-   * the UI can reject a bad token immediately. Returns the count of exposed tools.
-   * Throws a readable error on failure.
-   */
+  /** Validate a token by listing tools; throws a readable error on failure. */
   async verifyToken(token: string, enabledTools: string): Promise<{ toolCount: number }> {
     let client: Client | undefined;
     try {
@@ -114,12 +102,8 @@ export class ApifyMcpService {
   }
 
   /**
-   * Build the Apify tool set for a workspace. Reads the encrypted token from the
-   * `integrations` row, opens one MCP session, and wraps every exposed tool. All
-   * returned tools share the session; call `dispose()` once the agent run ends.
-   *
-   * Returns an empty set (no-op dispose) when Apify isn't connected or the session
-   * can't be established — the assistant then just runs with its local tools.
+   * The workspace's Apify tools, sharing one MCP session (call `dispose()` when the
+   * run ends). Empty set when Apify isn't connected or unreachable.
    */
   async toolsFor(workspaceId: string): Promise<ApifyToolSet> {
     const empty: ApifyToolSet = { tools: [], dispose: async () => undefined };
@@ -128,8 +112,7 @@ export class ApifyMcpService {
       db
         .selectFrom('integrations')
         .select(['credentials_secret_id', 'config', 'active'])
-        // Explicit workspace scope: under the BYPASSRLS role a lookup by
-        // provider alone could decrypt and spend ANOTHER tenant's Apify token.
+        // Explicit workspace scope: never decrypt another tenant's token.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .where('active', '=', true)

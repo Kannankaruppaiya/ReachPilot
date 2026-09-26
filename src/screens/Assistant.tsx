@@ -526,7 +526,7 @@ function Markdown({ text }: { text: string }) {
   return <div className="space-y-2 leading-relaxed">{blocks}</div>
 }
 
-/** Collapsible tool-call trace (name + args + result), Claude-style. */
+/** Collapsible tool-call trace (name + args + result). */
 function ToolCard({ tool }: { tool: ToolTrace }) {
   const [open, setOpen] = useState(false)
   return (

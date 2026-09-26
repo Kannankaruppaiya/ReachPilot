@@ -4,16 +4,8 @@ import { getEnv } from '@/config/env';
 import { getDb } from '@/db';
 
 /**
- * Manages data encryption keys (DEKs) using envelope encryption.
- *
- * Architecture:
- * - A master key (from MASTER_KEY env var) wraps/unwraps DEKs.
- * - DEKs are stored in the encryption_keys table, wrapped by the master key.
- * - This class provides the abstraction layer so a real KMS (AWS KMS, GCP KMS)
- *   can be swapped in by implementing the same interface.
- *
- * The master key is AES-256 (32 bytes) and the DEKs are also AES-256.
- * Wrapping uses AES-256-GCM with a random IV per wrap operation.
+ * Envelope-encryption DEKs: AES-256 keys stored in encryption_keys, wrapped by
+ * MASTER_KEY with AES-256-GCM. A real KMS can replace this behind the same API.
  */
 @Injectable()
 export class KeyManagementService {
@@ -22,10 +14,7 @@ export class KeyManagementService {
     return Buffer.from(env.MASTER_KEY, 'hex');
   }
 
-  /**
-   * Wraps (encrypts) a DEK with the master key using AES-256-GCM.
-   * Returns the wrapped key as a single buffer: [12-byte IV][ciphertext][16-byte auth tag]
-   */
+  /** Wrap a DEK with the master key: [12-byte IV][ciphertext][16-byte tag]. */
   wrapKey(plaintextKey: Buffer): Buffer {
     const masterKey = this.getMasterKey();
     const iv = crypto.randomBytes(12);
@@ -35,10 +24,7 @@ export class KeyManagementService {
     return Buffer.concat([iv, encrypted, authTag]);
   }
 
-  /**
-   * Unwraps (decrypts) a DEK using the master key.
-   * Expects the format: [12-byte IV][ciphertext][16-byte auth tag]
-   */
+  /** Unwrap a DEK in the [IV][ciphertext][tag] format. */
   unwrapKey(wrappedKey: Buffer): Buffer {
     const masterKey = this.getMasterKey();
     const iv = wrappedKey.subarray(0, 12);
@@ -49,10 +35,7 @@ export class KeyManagementService {
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   }
 
-  /**
-   * Generates a new DEK, wraps it with the master key, stores it in the
-   * encryption_keys table, and returns both the plaintext DEK and its row ID.
-   */
+  /** Create, wrap and store a new DEK; returns its row id and plaintext. */
   async generateDataKey(): Promise<{ keyId: string; plaintextKey: Buffer }> {
     const plaintextKey = crypto.randomBytes(32);
     const wrappedKey = this.wrapKey(plaintextKey);
@@ -70,9 +53,6 @@ export class KeyManagementService {
     return { keyId: row.id, plaintextKey };
   }
 
-  /**
-   * Retrieves and unwraps a DEK by its row ID.
-   */
   async getDataKey(keyId: string): Promise<Buffer> {
     const db = getDb();
     const row = await db

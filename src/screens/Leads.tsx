@@ -35,7 +35,7 @@ function relTime(iso: string) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-// Status → a leading dot + tinted pill, the scannable pattern outreach tools use.
+// Status → dot + tinted pill.
 const STATUS_STYLE: Record<string, { dot: string; text: string; bg: string; label: string }> = {
   new: { dot: "bg-slate-400", text: "text-sub", bg: "bg-mutedbg", label: "New" },
   contacted: { dot: "bg-warn", text: "text-warn", bg: "bg-warn/10", label: "Contacted" },
@@ -60,7 +60,7 @@ function StatusPill({ status }: { status: string }) {
   )
 }
 
-// Fit score graded green/blue/amber, like Clay's match indicators.
+// Fit score graded green/blue/amber.
 function ScorePill({ score }: { score: number }) {
   const tone =
     score >= 80 ? "bg-success/10 text-success" : score >= 55 ? "bg-accent/10 text-accent" : "bg-warn/10 text-warn"
@@ -71,8 +71,7 @@ function ScorePill({ score }: { score: number }) {
   )
 }
 
-// Compact filter chip — a native select styled as a pill with a custom chevron,
-// the pattern Linear / Attio / Apollo use instead of full-width form selects.
+// Compact filter chip: a native select styled as a pill.
 function FilterSelect({
   value,
   onChange,
@@ -102,7 +101,7 @@ function FilterSelect({
   )
 }
 
-// Skeleton row — product-grade loading (never a lone spinner over content).
+// Skeleton row shown while loading.
 function RowSkeleton() {
   return (
     <tr className="border-b border-line last:border-0">
@@ -262,8 +261,7 @@ export function Leads() {
     api
       .getLeads({ limit: PAGE, offset, q: debouncedQ || undefined, status: status || undefined, source: source || undefined, sort, scrapeJobId: viewJob?.id })
       .then((rows) => {
-        // Dedupe on append — offset pagination can overlap when rows shift under
-        // it, and duplicate lead ids would collide as React keys.
+        // Dedupe on append: offset pages can overlap, and duplicate ids collide as keys.
         setLeads((prev) => {
           const seen = new Set(prev.map((l) => l.id))
           return [...prev, ...rows.filter((r) => !seen.has(r.id))]
@@ -345,8 +343,7 @@ export function Leads() {
     try {
       const res = await api.scrapeLeads({ titles: titleList, location: location.trim() || undefined, maxResults: count, startFresh })
       setScrapeOpen(false)
-      // Track this run live — a big scrape can take a couple of minutes, and the
-      // progress banner shows it working until the leads land.
+      // Track this run live; a big scrape can take a few minutes.
       setActiveJob({
         id: res.scrapeJobId,
         titles: titleList,
@@ -403,7 +400,7 @@ export function Leads() {
         </div>
       </div>
 
-      {/* Live scrape progress — a run can take a minute or two on large counts. */}
+      {/* Live scrape progress */}
       {activeJob && (
         <Card className={cx("flex items-center gap-3 px-4 py-3", running ? "border-accent bg-accent/5" : "border-line")}>
           {running ? (
@@ -431,7 +428,7 @@ export function Leads() {
         </Card>
       )}
 
-      {/* Toolbar — search + compact filter chips + count, one clean control row. */}
+      {/* Toolbar: search, filter chips, count */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative min-w-[11rem] flex-1 sm:max-w-xs">
           <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sub" />
@@ -696,7 +693,7 @@ export function Leads() {
         )}
       </Card>
 
-      {/* Floating bulk-action bar — appears on selection (Linear / Gmail pattern). */}
+      {/* Floating bulk-action bar on selection */}
       {sel.length > 0 && (
         <div className="pointer-events-none fixed inset-x-0 bottom-6 z-30 flex justify-center px-4">
           <div className="toast-in pointer-events-auto flex items-center gap-1 rounded-full border border-line bg-card/95 py-1.5 pl-4 pr-2 shadow-lg backdrop-blur">
@@ -723,7 +720,7 @@ export function Leads() {
         </div>
       )}
 
-      {/* Scrape history — like the Assistant's conversation history. */}
+      {/* Scrape history */}
       {historyOpen && (
         <div className="fixed inset-0 z-40 bg-black/40" onClick={() => setHistoryOpen(false)}>
           <aside

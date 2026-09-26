@@ -55,38 +55,23 @@ const CHANNEL_OF: Record<string, 'linkedin' | 'email'> = {
 const IN_FLIGHT = new Set(['scheduled', 'queued', 'running']);
 
 /**
- * How long to leave an enrollment alone while its job is in flight. Only the
- * re-check cadence: the worker pulls the enrollment forward the moment the job
- * finishes (advanceEnrollment) or is deferred (it writes next_run_at itself).
- * Without it, an enrollment whose job the scheduler keeps deferring (agent
- * offline, account paused) is re-visited on EVERY runner tick, and a few hundred
- * of those crowd newer enrollments out of the runner's per-tick batch.
+ * Re-check interval for an enrollment whose job is in flight. The worker pulls it
+ * forward when the job finishes or defers, so this only stops endlessly deferred
+ * jobs from crowding the runner's per-tick batch.
  */
 const IN_FLIGHT_RECHECK_MS = 5 * 60_000;
 
-/**
- * Upper bound on steps walked in one call. Conditions, waits and skipped steps
- * advance without creating a job, so a chain of them is walked in a loop; the
- * bound turns a malformed (cyclic) graph into a stopped enrollment instead of a
- * hot loop.
- */
+/** Max steps walked per call, so a cyclic graph stops instead of hot-looping. */
 const MAX_HOPS = 25;
 
 /**
- * What a CANCELED job for the current step means for the enrollment.
- *
- * 🔴 Previously any existing job — canceled included — made executeStep return
- * without doing anything. Pausing a lead cancels its pending job, so resuming it
- * left the enrollment `active` on a step whose only job was canceled: it was
- * re-visited every tick and never moved again. The cancel REASON decides:
- *   - the step is already satisfied  → advance to the next step
- *   - the lead must not be contacted → end the enrollment
- *   - the job was only paused away   → create a fresh job (the resume path)
+ * What a canceled job for the current step means, by its cancel reason: goal
+ * already met → advance; lead must not be contacted → stop; sequence was only
+ * on hold → recreate the job (the resume path).
  */
 function onCanceledJob(lastError: string | null): 'advance' | 'stop' | 'replied' | 'recreate' {
   const reason = lastError || '';
-  // The scheduler found an invite to this person already sent — the step's goal
-  // is met, exactly like the worker's pending/already_connected skip.
+  // An invite to this person was already sent: the step's goal is met.
   if (reason === 'duplicate_invite') return 'advance';
   if (reason === 'lead_replied') return 'replied';
   if (
@@ -97,8 +82,7 @@ function onCanceledJob(lastError: string | null): 'advance' | 'stop' | 'replied'
   ) {
     return 'stop';
   }
-  // enrollment_paused, campaign_paused, campaign_inactive, enrollment_inactive,
-  // sequence_edited, … — cancelled only because the sequence was on hold.
+  // enrollment_paused, campaign_paused, sequence_edited, …: the sequence was on hold.
   return 'recreate';
 }
 
@@ -116,22 +100,13 @@ export class GraphExecutor {
   constructor(private readonly conditionEvaluator: ConditionEvaluator) {}
 
   /**
-   * Evaluate the enrollment's current step and schedule the next action.
-   *
-   * Safe to call repeatedly (the campaign runner does, on every tick, for any
-   * enrollment that is active or whose wait window has elapsed):
-   *   - CONDITION steps honour the step's delay window (`delay_hours` after the
-   *     lead entered the step) before evaluating, then branch to on_true/on_false.
-   *   - WAIT / internal steps simply advance once their delay has elapsed.
-   *   - OUTBOUND steps materialise exactly one live job per enrollment+step, then
-   *     park the enrollment as `waiting`; the worker's post-send
-   *     `advanceEnrollment` flips it back to `active` for the next step.
-   *
-   * Every read and write runs in ONE `withWorkspace` transaction. It used to use
-   * raw getDb(), which only worked because the production role bypassed RLS —
-   * connected as a role subject to RLS, `enrollments`/`jobs`/`leads` read as empty
-   * and every campaign silently stopped. A due-now job is handed to BullMQ only
-   * after that transaction commits, so the worker can always see its row.
+   * Run the enrollment's current step. Safe to call repeatedly:
+   *   - condition steps wait out `delay_hours`, then branch
+   *   - wait/internal steps advance once their delay has passed
+   *   - outbound steps create exactly one live job, then park the enrollment
+   *     as `waiting` until the worker advances it
+   * Runs in one `withWorkspace` transaction; a due-now job is enqueued after commit
+   * so the worker can always see its row.
    */
   async executeStep(workspaceId: string, enrollmentId: string): Promise<void> {
     const enqueue = await withWorkspace(workspaceId, (db) =>
@@ -153,8 +128,7 @@ export class GraphExecutor {
         },
       );
     } catch (err: any) {
-      // Redis unreachable — hand the row back to the scheduler rather than
-      // leaving it `queued`, a status nothing ever re-drives.
+      // Redis unreachable: hand the row back to the scheduler (nothing re-drives `queued`).
       this.logger.warn({ jobId: enqueue.jobId, err: err.message }, 'Enqueue failed — reverted to scheduled');
       await withWorkspace(workspaceId, (db) =>
         db
@@ -183,7 +157,6 @@ export class GraphExecutor {
         .executeTakeFirst();
 
       if (!enrollment) return null;
-      // Only active/waiting enrollments advance; paused/finished/failed are terminal here.
       if (enrollment.status !== 'active' && enrollment.status !== 'waiting') return null;
 
       const currentStepId = enrollment.current_step_id;
@@ -199,7 +172,7 @@ export class GraphExecutor {
         .executeTakeFirst();
 
       if (!step) {
-        // Dangling step reference — end the sequence rather than loop forever.
+        // Dangling step reference: end the sequence.
         await this.finish(db, enrollmentId);
         return null;
       }
@@ -228,7 +201,7 @@ export class GraphExecutor {
         continue; // evaluate the branch target (may be another condition or an action)
       }
 
-      // ---- Non-outbound action (wait / enrich / tag / webhook): advance. -----
+      // ---- Non-outbound action (wait / enrich / tag / webhook): advance. ----
       if (!OUTBOUND_ACTIONS.has(step.action || '')) {
         if (now < dueAt) {
           await this.park(db, enrollmentId, new Date(dueAt).toISOString());
@@ -238,7 +211,7 @@ export class GraphExecutor {
         continue;
       }
 
-      // ---- OUTBOUND action: at most one live job per enrollment+step. --------
+      // ---- OUTBOUND action: at most one live job per enrollment + step. ----
       const existing = await db
         .selectFrom('jobs')
         .select(['id', 'status', 'last_error', 'scheduled_for'])
@@ -251,20 +224,18 @@ export class GraphExecutor {
 
       if (latest) {
         if (IN_FLIGHT.has(latest.status as string)) {
-          // Still on its way — look again later (see IN_FLIGHT_RECHECK_MS).
           const dueMs = new Date(latest.scheduled_for as any).getTime() || 0;
           await this.park(db, enrollmentId, new Date(Math.max(dueMs, now + IN_FLIGHT_RECHECK_MS)).toISOString());
           return null;
         }
         if (latest.status === 'sent') {
-          // The step is done but the enrollment never moved on (post-send
-          // bookkeeping lost, or it landed while the lead was paused). Move on.
+          // Step done but the enrollment never moved on (lost bookkeeping, or sent while
+          // paused). Move on.
           if (!(await this.moveTo(db, enrollmentId, step.next_step_id || null))) return null;
           continue;
         }
         if (latest.status === 'failed') {
-          // A terminal-failed job means the step can't complete — stop the lead so
-          // it doesn't get stuck retrying forever.
+          // The step can't complete: fail the enrollment instead of retrying forever.
           await db
             .updateTable('enrollments')
             .set({ status: 'failed', finished_at: new Date().toISOString(), next_run_at: null })
@@ -272,7 +243,6 @@ export class GraphExecutor {
             .execute();
           return null;
         }
-        // canceled
         const verdict = onCanceledJob(latest.last_error as string | null);
         if (verdict === 'advance') {
           if (!(await this.moveTo(db, enrollmentId, step.next_step_id || null))) return null;
@@ -336,7 +306,7 @@ export class GraphExecutor {
         subject = tpl.subject || '';
       }
     }
-    // Inline message body (builder message/email steps store it on the step params).
+    // Message/email steps store their body in the step params.
     const params = (typeof step.params === 'string' ? JSON.parse(step.params) : step.params) || {};
     if (!templateBody && params.body) templateBody = String(params.body);
     if (!subject && params.subject) subject = String(params.subject);
@@ -380,12 +350,10 @@ export class GraphExecutor {
         kind: channel,
         action: step.action! as any,
         payload: JSON.stringify(payload),
-        // Due now → hand straight to BullMQ (status queued); future → let the
-        // scheduler pick it up when scheduled_for arrives.
+        // Due now → BullMQ; future → the scheduler picks it up.
         status: dueNow ? 'queued' : 'scheduled',
         scheduled_for: scheduledFor.toISOString(),
-        // idempotency_key is UNIQUE. A step re-materialised after a pause gets
-        // its own key; the first job keeps the original shape.
+        // UNIQUE. A job re-created after a pause gets a suffixed key.
         idempotency_key:
           priorJobs === 0
             ? `enrollment:${enrollment.id}:step:${step.id}`
@@ -393,17 +361,12 @@ export class GraphExecutor {
       })
       .execute();
 
-    // Park the enrollment until the job completes (worker advances it) or the
-    // scheduled_for arrives (scheduler dispatches, worker advances).
     await this.park(db, enrollment.id, scheduledFor.toISOString());
 
     return dueNow ? { jobId, channel, leadId: lead.id, payload } : null;
   }
 
-  /**
-   * Point the enrollment at a new step, resetting the step-entry clock. Returns
-   * false when there is no next step (the enrollment is finished instead).
-   */
+  /** Point the enrollment at a new step. Returns false (and finishes it) when there is none. */
   private async moveTo(
     db: Kysely<DatabaseSchema>,
     enrollmentId: string,
@@ -452,7 +415,7 @@ export class GraphExecutor {
       title: lead.title,
       location: lead.location,
     };
-    // Variables first, then spintax ({Hi|Hey|Hello}) — see spintax.ts.
+    // Variables first, then spintax (see spintax.ts).
     const filled = String(tpl || '').replace(
       /\{\{(\w+)(?:\|([^}]*))?\}\}/g,
       (_, key, fb) => map[key] || fb || `{{${key}}}`,

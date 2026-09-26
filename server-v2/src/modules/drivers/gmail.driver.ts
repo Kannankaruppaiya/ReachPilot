@@ -30,10 +30,7 @@ function escapeHtml(s: string): string {
 // eslint-disable-next-line no-control-regex
 const isAscii = (s: string) => /^[\x00-\x7F]*$/.test(s);
 
-/**
- * Quoted-printable encode (RFC 2045) — the transfer encoding Gmail itself uses
- * for non-ASCII bodies, so our parts look exactly like Gmail-composed ones.
- */
+/** Quoted-printable (RFC 2045), as Gmail itself encodes non-ASCII bodies. */
 function quotedPrintable(text: string): string {
   const bytes = Buffer.from(text.replace(/\r?\n/g, '\r\n'), 'utf8');
   let out = '';
@@ -63,12 +60,7 @@ function quotedPrintable(text: string): string {
   return out + line;
 }
 
-/**
- * Real email sending via the Gmail API, on behalf of the workspace's connected
- * mailbox. Loads the mailbox's encrypted refresh token, mints an access token,
- * and sends a MIME message — from the user's own Gmail, so it inherits Google's
- * sending reputation (no proxy, no browser).
- */
+/** Sends through the Gmail API from the workspace's own mailbox. */
 @Injectable()
 export class GmailDriver implements EmailDriver {
   private readonly logger = new Logger(GmailDriver.name);
@@ -84,7 +76,6 @@ export class GmailDriver implements EmailDriver {
     body: string,
     ctx?: EmailSendContext,
   ): Promise<{ status: 'sent' | 'failed'; externalId?: string; error?: string }> {
-    // Resolve the sending mailbox under the workspace's RLS context.
     const read = <T>(fn: (db: any) => Promise<T>): Promise<T> =>
       ctx?.workspaceId ? withWorkspace(ctx.workspaceId, fn) : fn(getDb());
 
@@ -96,12 +87,8 @@ export class GmailDriver implements EmailDriver {
         return q.executeTakeFirst();
       });
     }
-    // No explicit mailbox on the job — or the one it names can no longer send
-    // (disconnected, or the credential-less placeholder the old onboarding
-    // "Connect Gmail" created, which jobs queued before that fix still point
-    // at) → the workspace's DEFAULT sender: its most recently connected
-    // mailbox that holds credentials. No screen lets a user pick a sender, so
-    // the job's mailbox was always this same implicit default.
+    // The job names no mailbox, or one that can't send: use the workspace's newest
+    // mailbox with credentials.
     if (!(acct?.status === 'active' && acct?.credentials_secret_id) && ctx?.workspaceId) {
       acct = await read((db) => sendableMailboxes(db, ctx.workspaceId!).selectAll().executeTakeFirst());
     }
@@ -135,13 +122,8 @@ export class GmailDriver implements EmailDriver {
   }
 
   /**
-   * Build a base64url-encoded RFC 822 message that is indistinguishable from
-   * one composed in the Gmail UI. Deliberately MINIMAL headers — no Message-ID,
-   * Date, Reply-To, or List-Unsubscribe: Gmail assigns its own Message-ID/Date
-   * on send, and the bulk-mail markers (unsubscribe header + footer, custom
-   * message-id format, `rp_` boundary, styled HTML wrapper) were fingerprinting
-   * us as a sending tool and hurting inbox placement (manual Gmail sends from
-   * the same account landed in the inbox; ours went to spam).
+   * Build a base64url RFC 822 message shaped like one composed in the Gmail UI.
+   * Minimal headers on purpose: bulk-mail markers hurt inbox placement.
    */
   private buildRawMessage(
     from: string,
@@ -153,9 +135,7 @@ export class GmailDriver implements EmailDriver {
     const name = encodeHeader(fromName || displayName(from));
 
     const isHtml = /<[a-z][\s\S]*>/i.test(body);
-    // Derive both representations from whatever we were given. Plain-text
-    // bodies get Gmail's own bare wrapper (`<div dir="ltr">`) — no inline
-    // styles, which read as a mail-tool template.
+    // Plain-text bodies get Gmail's bare `<div dir="ltr">` wrapper, no inline styles.
     const plain = (isHtml ? body.replace(/<[^>]+>/g, '') : body).trim();
     const htmlBody = isHtml
       ? body

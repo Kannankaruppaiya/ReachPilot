@@ -35,11 +35,8 @@ export const auth = {
   },
 }
 
-// Refresh outcome — tri-state so callers don't conflate "session is dead"
-// with "server was briefly unreachable":
-//   ok          → new tokens stored, retry the original request
-//   rejected    → definitive 401/403 → clear tokens, route to login
-//   unavailable → network error / 5xx → keep tokens, surface transient error
+// ok → retry with new tokens; rejected (401/403) → log out;
+// unavailable (network/5xx) → keep tokens and report a transient error.
 type RefreshResult = "ok" | "rejected" | "unavailable"
 
 async function tryRefresh(): Promise<RefreshResult> {
@@ -64,11 +61,8 @@ async function tryRefresh(): Promise<RefreshResult> {
   return "ok"
 }
 
-// Single-flight: when a burst of requests all 401 at once (poller + a screen
-// mount firing together), only ONE /auth/refresh runs. The rest await the same
-// promise and reuse its result, so the rotating refresh token is spent exactly
-// once per burst instead of once per request (the second-onward used the now
-// revoked token → 401 → logout, which was the bug).
+// Single-flight: a burst of 401s shares one /auth/refresh, so the rotating
+// refresh token is spent once per burst.
 let refreshInFlight: Promise<RefreshResult> | null = null
 
 function refreshOnce(): Promise<RefreshResult> {
@@ -114,10 +108,8 @@ async function req<T>(url: string, body?: unknown, retried = false, method?: str
   return data as T
 }
 
-/** PATCH helper (the backend exposes PATCH for campaigns/leads/notifications). */
 const patch = <T>(url: string, body: unknown) => req<T>(url, body, false, "PATCH")
 
-/** DELETE helper. */
 const del = <T>(url: string) => req<T>(url, undefined, false, "DELETE")
 
 export const api = {
@@ -200,9 +192,7 @@ export const api = {
   // Bulk-delete jobs — clear the queue (statuses) or wipe LinkedIn history for a fresh test.
   clearJobs: (statuses?: string[], kind?: string) =>
     req<{ deleted: number }>("/api/send/jobs/clear", { statuses, kind }),
-  // Put back leads burned by a failure that was never their fault (signed-out
-  // account, page never loaded). The server allowlists which failures qualify,
-  // so this can never re-send an invite that already went out.
+  // Re-queue leads whose failure sent nothing (the server decides which qualify).
   requeueFailed: (kind = "linkedin") =>
     req<{ requeued: number; skipped: number }>("/api/send/jobs/requeue-failed", { kind }),
   // Every LinkedIn connection request sent, with delivery + acceptance outcome.
@@ -210,8 +200,7 @@ export const api = {
 
   // Account shell state (status + real warm-up numbers)
   linkedinAccount: () => req<LinkedInAccountState>("/api/linkedin"),
-  // Settings → LinkedIn limits — the ONE place limits are saved. Returns the
-  // refreshed account state so the UI reflects exactly what the engine enforces.
+  // Settings → LinkedIn limits; returns the refreshed account state.
   saveLinkedinLimits: (payload: {
     dailyLimit: number
     weeklyInviteCap: number
@@ -228,8 +217,7 @@ export const api = {
   getAnalyticsDaily: () => req<DailyStat[]>("/api/analytics/daily"),
   getAnalyticsHourly: () => req<HourlyStat[]>("/api/analytics/hourly"),
   getChannels: () => req<{ channel: string; replies: number }[]>("/api/analytics/channels"),
-  // No args → every lead (Campaigns needs the full list). With params → one
-  // filtered/sorted page (the Leads screen paginates large sets this way).
+  // No args → every lead; with params → one filtered, sorted page.
   getLeads: (params?: {
     limit?: number
     offset?: number
@@ -247,9 +235,8 @@ export const api = {
       : ""
     return req<LeadRow[]>(`/api/leads${qs}`)
   },
-  // Free local scrape: Google → LinkedIn profiles by title + location. Enqueues
-  // a worker job; scraped leads appear in the table shortly after. startFresh
-  // re-sweeps a search from page 0 instead of continuing the rerun cursor.
+  // Google → LinkedIn scrape by title + location (worker job). startFresh ignores
+  // the rerun cursor.
   scrapeLeads: (payload: {
     titles: string[]
     location?: string
@@ -344,9 +331,8 @@ export type AgentEvent =
   | { type: "done" }
 
 /**
- * Streaming agent chat over SSE. EventSource can't send an Authorization header
- * or a POST body, so we read the fetch stream manually and dispatch each
- * `data:` line as a parsed AgentEvent. Returns when the stream ends.
+ * Agent chat over SSE. EventSource can't send headers or a POST body, so read the
+ * fetch stream and dispatch each `data:` line.
  */
 async function aiChat(
   messages: { role: "user" | "assistant"; content: string }[],

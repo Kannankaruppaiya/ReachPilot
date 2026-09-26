@@ -19,7 +19,6 @@ export class WorkspacesService {
       .returning(['id', 'name', 'goal', 'created_at'])
       .executeTakeFirstOrThrow();
 
-    // memberships is RLS-scoped — insert under the new workspace's context.
     await withWorkspace(workspace.id, (wdb) =>
       wdb
         .insertInto('memberships')
@@ -62,8 +61,7 @@ export class WorkspacesService {
       .where('id', '=', workspaceId)
       .execute();
 
-    // Both account tables are RLS-scoped: under a role subject to RLS a raw
-    // delete matches nothing and the "reset" silently keeps the accounts.
+    // Both account tables are RLS-scoped; a raw delete would silently match nothing.
     await withWorkspace(workspaceId, async (wdb) => {
       await wdb.deleteFrom('linkedin_accounts').where('workspace_id', '=', workspaceId).execute();
       await wdb.deleteFrom('email_accounts').where('workspace_id', '=', workspaceId).execute();

@@ -51,12 +51,8 @@ export interface DatabaseSchema {
 let dbInstance: Kysely<DatabaseSchema> | null = null;
 
 /**
- * Attach an idle-client error handler to a pool. Pooled Postgres (the Supabase
- * session pooler especially) drops idle connections; `pg` then emits an 'error'
- * event on the Pool for the dropped client. With no listener that surfaces as an
- * uncaught exception and CRASHES the process (the API/worker "exit 1" seen on
- * pooler drops). Logging it — and letting pg evict the dead client so the next
- * query gets a fresh connection — keeps the service alive.
+ * Log pool 'error' events: poolers drop idle clients, and an unhandled 'error'
+ * would crash the process. pg evicts the dead client itself.
  */
 function withPoolErrorHandler(pool: Pool): Pool {
   pool.on('error', (err) => {

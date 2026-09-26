@@ -12,11 +12,7 @@ interface OAuthState {
   userId: string;
 }
 
-/**
- * Google/Gmail connection lifecycle. The Gmail mailbox is stored in
- * `email_accounts` (its refresh token encrypted in the vault) so the email
- * driver can send + the inbox-sync worker can read on the user's behalf.
- */
+/** Google/Gmail connection lifecycle; the refresh token is encrypted in the vault. */
 @Injectable()
 export class IntegrationsService {
   private readonly logger = new Logger(IntegrationsService.name);
@@ -52,7 +48,7 @@ export class IntegrationsService {
 
     const { refreshToken, accessToken } = await this.oauth.exchangeCode(code);
     if (!refreshToken) {
-      // Happens if the user already granted before without offline access.
+      // The user granted access before without offline access.
       throw new BadRequestException(
         'Google did not return a refresh token. Remove ReachPilot from your Google account permissions and reconnect.',
       );
@@ -61,15 +57,13 @@ export class IntegrationsService {
 
     const email = await this.oauth.getUserEmail(accessToken);
 
-    // Encrypt the refresh token — this is the durable credential.
     const secretId = await this.secrets.encrypt(refreshToken, 'email_oauth', { workspaceId });
 
     await withWorkspace(workspaceId, async (db) => {
       const existing = await db
         .selectFrom('email_accounts')
         .select(['id', 'credentials_secret_id'])
-        // Explicit workspace scope — the DB role bypasses RLS, so never rely on
-        // withWorkspace context alone to isolate tenants.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .where('email', '=', email)
         .executeTakeFirst();
@@ -118,16 +112,13 @@ export class IntegrationsService {
   /** Integrations page data: mailbox connection + generic integrations. */
   async list(workspaceId: string): Promise<any> {
     return withWorkspace(workspaceId, async (db) => {
-      // All Gmail mailboxes — the email warm-up loop pairs them, so the page
-      // must show and allow connecting more than one. Active rows first.
+      // All Gmail mailboxes (warm-up pairs them), active first.
       const accounts = await db
         .selectFrom('email_accounts')
         .select(['email', 'provider', 'daily_limit', 'status', 'connected_at', 'spf_status', 'dkim_status', 'dmarc_status', 'credentials_secret_id'])
-        // Explicit workspace scope — the DB role bypasses RLS, so filtering by
-        // provider alone leaks other tenants' mailboxes onto this page.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'gmail')
-        // Mailboxes that can send first (see isConnected below).
         .orderBy((eb) =>
           eb
             .case()
@@ -138,9 +129,7 @@ export class IntegrationsService {
         )
         .orderBy('connected_at', 'desc')
         .execute();
-      // "Connected" means it can send: active AND holding OAuth credentials. The
-      // old onboarding "Connect Gmail" inserted an active row with no
-      // credentials, which this page then showed as connected in every workspace.
+      // "Connected" = can send: active and holding OAuth credentials.
       const isConnected = (a: { status: string; credentials_secret_id: string | null }) =>
         a.status === 'active' && !!a.credentials_secret_id;
       const gmail = accounts[0];
@@ -148,8 +137,7 @@ export class IntegrationsService {
       const others = await db
         .selectFrom('integrations')
         .select(['provider', 'active', 'created_at', 'config'])
-        // Explicit workspace scope — without this the Apify token (and any other
-        // integration) from another tenant leaks onto this page.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .execute();
 
@@ -193,10 +181,8 @@ export class IntegrationsService {
   }
 
   /**
-   * Connect Apify: validate the API token against the hosted MCP server, encrypt
-   * it into the vault, and upsert the `integrations` row (provider='apify') with
-   * the enabled tool set. The AI assistant then gets Apify's tools on its next
-   * chat. Throws if the token can't reach Apify so the UI can reject it inline.
+   * Connect Apify: verify the token against the MCP server, encrypt it, and upsert
+   * the integration with its tool set. Throws if Apify is unreachable.
    */
   async connectApify(
     workspaceId: string,
@@ -207,7 +193,6 @@ export class IntegrationsService {
     if (!clean) throw new BadRequestException('An Apify API token is required.');
     const tools = (enabledTools || '').trim() || getEnv().APIFY_MCP_DEFAULT_TOOLS;
 
-    // Validate before storing — a bad token or unreachable server fails here.
     const { toolCount } = await this.apifyMcp.verifyToken(clean, tools);
 
     const secretId = await this.secrets.encrypt(clean, 'integration_credentials', { workspaceId });
@@ -216,8 +201,7 @@ export class IntegrationsService {
       const existing = await db
         .selectFrom('integrations')
         .select(['id', 'credentials_secret_id'])
-        // Explicit workspace scope — otherwise this can match/overwrite another
-        // tenant's apify row since the DB role bypasses RLS.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .executeTakeFirst();
@@ -261,7 +245,7 @@ export class IntegrationsService {
       const row = await db
         .selectFrom('integrations')
         .select(['id', 'credentials_secret_id'])
-        // Explicit workspace scope — the DB role bypasses RLS.
+        // Explicit workspace scope: the DB role bypasses RLS.
         .where('workspace_id', '=', workspaceId)
         .where('provider', '=', 'apify')
         .executeTakeFirst();
@@ -283,14 +267,13 @@ export class IntegrationsService {
   /** Disconnect Gmail: revoke the token and drop the stored credential. */
   async disconnectGoogle(workspaceId: string): Promise<{ ok: true }> {
     await withWorkspace(workspaceId, async (db) => {
-      // The mailbox that is actually sending — an unordered pick could land on a
-      // credential-less placeholder row and leave the real inbox connected.
+      // The mailbox that is actually sending.
       const acct =
         (await sendableMailboxes(db, workspaceId).select(['id', 'credentials_secret_id']).executeTakeFirst()) ??
         (await db
           .selectFrom('email_accounts')
           .select(['id', 'credentials_secret_id'])
-          // Explicit workspace scope — the DB role bypasses RLS.
+          // Explicit workspace scope: the DB role bypasses RLS.
           .where('workspace_id', '=', workspaceId)
           .where('provider', '=', 'gmail')
           .executeTakeFirst());

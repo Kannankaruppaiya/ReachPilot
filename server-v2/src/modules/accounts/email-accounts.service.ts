@@ -8,15 +8,9 @@ export class EmailAccountsService {
   constructor(private readonly workspaces: WorkspacesService) {}
 
   /**
-   * Onboarding's Gmail step: save the daily sending limit for the mailbox the
-   * user connected through Google OAuth (/api/integrations/google/connect).
-   *
-   * 🔴 This used to BE the "connect": it inserted a mailbox row with a hardcoded
-   * address and no credentials into whatever workspace called it, and reported
-   * success. Nothing could send from that row, and because senders were picked
-   * with an unordered limit(1) it could shadow the user's real inbox. It now
-   * only configures a real, credentialed mailbox — or, with `skip`, lets the user
-   * finish onboarding and connect Gmail later from Integrations.
+   * Onboarding's Gmail step: save the daily limit for the mailbox connected via
+   * Google OAuth. Never creates a mailbox; with `skip`, Gmail can be connected
+   * later from Integrations.
    */
   async saveOnboardingLimit(
     workspaceId: string,

@@ -8,12 +8,9 @@ import { GoogleOAuthService } from './google-oauth.service';
 const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 
 /**
- * Polls each connected Gmail mailbox for inbound replies, matches them to
- * leads we've emailed, and — matching Expandi behaviour — auto-pauses that
- * lead's sequence, records the reply in the unified inbox, and bumps stats.
- *
- * RLS: `workspaces` and `messages` are not tenant-scoped, so they're read
- * directly; every tenant table is accessed inside `withWorkspace`.
+ * Polls each connected mailbox for replies from leads we emailed: records the
+ * reply in the inbox, stops the sequence and bumps stats. Tenant tables are
+ * read inside `withWorkspace`; `workspaces` and `messages` are not RLS-scoped.
  */
 @Injectable()
 export class GmailInboxService {
@@ -60,7 +57,7 @@ export class GmailInboxService {
     const accessToken = await this.oauth.accessTokenFromRefresh(refresh);
     const auth = { Authorization: `Bearer ${accessToken}` };
 
-    // Recent inbound messages only (exclude our own sent mail). Network only.
+    // Recent inbound mail only.
     const q = encodeURIComponent('newer_than:2d -in:sent -in:chats');
     const listRes = await fetch(`${GMAIL_API}/messages?q=${q}&maxResults=25`, { headers: auth });
     if (!listRes.ok) throw new Error(`list ${listRes.status}`);
@@ -69,7 +66,6 @@ export class GmailInboxService {
     if (!ids.length) return;
 
     for (const id of ids) {
-      // messages is not RLS-scoped — dedup read is direct.
       const seen = await getDb()
         .selectFrom('messages')
         .select('id')
@@ -151,11 +147,9 @@ export class GmailInboxService {
         .where('id', '=', lead.id)
         .execute();
 
-      // End the lead's sequences AND withdraw the follow-up already scheduled
-      // for them (Expandi behaviour) — see stopSequencesOnReply.
+      // End the lead's sequences and cancel scheduled follow-ups.
       await stopSequencesOnReply(db, workspaceId, lead.id);
 
-      // Bump reply rollups.
       const liAcct = await db
         .selectFrom('linkedin_accounts')
         .select('id')

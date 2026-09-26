@@ -9,12 +9,8 @@ import { AiChatStoreService } from './ai-chat-store.service';
 import { VaultModule } from '@/modules/vault/vault.module';
 
 /**
- * AI features (Google Gemini):
- *  - AiService: single-shot personalized connection notes (campaign engine).
- *  - AiAgentService: agentic chat with tool-calling (the in-app assistant).
- *  - ApifyMcpService: bridges the hosted Apify MCP server's tools into the agent
- *    (needs the vault to decrypt the workspace's Apify token).
- *  Exported so other modules (e.g. Integrations) can reuse them.
+ * AI features on Gemini: AiService (connection notes), AiAgentService (assistant
+ * chat with tools), ApifyMcpService (Apify tools for the agent).
  */
 @Module({
   imports: [VaultModule],

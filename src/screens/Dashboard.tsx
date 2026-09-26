@@ -182,8 +182,7 @@ export function Dashboard() {
           {(d?.activity.length ?? 0) === 0 ? (
             <p className="py-6 text-center text-sm text-sub">No activity yet.</p>
           ) : (
-            // Bounded scroll: a long history stays inside the card instead of
-            // stretching the whole page. -mr-1/pr-1 keeps the scrollbar off the text.
+            // Scroll inside the card; -mr-1/pr-1 keeps the scrollbar off the text.
             <ul className="-mr-1 flex max-h-80 flex-col divide-y divide-line overflow-y-auto pr-1">
               {d!.activity.map((f) => (
                 <li key={f.id} className="flex items-center justify-between gap-3 py-3">

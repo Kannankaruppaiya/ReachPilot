@@ -1,5 +1,4 @@
-// App-wide constants. Named values instead of magic numbers scattered through
-// the code (see coding-standards: no unexplained literals).
+// App-wide constants (no magic numbers in components).
 
 // ── Auth token storage keys (localStorage) ───────────────────────────
 export const ACCESS_TOKEN_KEY = "rp_access"

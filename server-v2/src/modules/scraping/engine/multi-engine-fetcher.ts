@@ -23,31 +23,10 @@ interface EngineDef {
 }
 
 /**
- * Multi-engine SERP fetcher — the resilient upgrade over the single-Google
- * fetchers.
- *
- * WHY
- * ---
- * A single search engine is a single point of failure: once Google shows its
- * "/sorry/" CAPTCHA (deep pagination + repeated runs from one home IP trip it),
- * the whole scrape dies. Different engines run DIFFERENT anti-bot systems with
- * different thresholds, so when Google blocks, Bing / DuckDuckGo / Brave usually
- * still answer. This fetcher:
- *   • rotates across several engines (order from SCRAPER_ENGINES),
- *   • detects a block/CAPTCHA and puts THAT engine on a cooldown (in-memory, so
- *     it also works on the Redis-free VPS), moving on to the next engine,
- *   • aggregates + dedups results across all engines (more breadth, not just
- *     resilience), and
- *   • hardens each session (persistent profile, human-like delays, a scroll and
- *     mouse move, randomized locale/viewport) to look less automated.
- *
- * It still NEVER touches linkedin.com directly — it only reads public SERPs — so
- * a scrape can never get an outreach account banned. patchright is loaded lazily.
- *
- * NOTE: spreading load across engines and keeping each engine shallow reduces the
- * per-engine request rate that triggers blocks, but every engine still egresses
- * from the same IP — a residential/rotating proxy remains the ultimate fix for
- * high volume. This maximizes what's achievable WITHOUT one.
+ * Fetches SERPs from several search engines: a block/CAPTCHA puts that engine on
+ * an in-memory cooldown and the run moves to the next. Results are merged and
+ * deduped. Sessions are humanised; every engine still shares one IP. Never
+ * touches linkedin.com. patchright is loaded lazily.
  */
 export class MultiEngineFetcher {
   private readonly logger = new Logger(MultiEngineFetcher.name);
@@ -58,7 +37,7 @@ export class MultiEngineFetcher {
     google: {
       name: 'google',
       base: 'https://www.google.com',
-      // `num` is deprecated/ignored by Google and reads as an automation tell — omit it.
+      // Omit `num`: Google ignores it and it reads as automation.
       url: (q, p) => `https://www.google.com/search?q=${encodeURIComponent(q)}&hl=en&gl=in&start=${p * 10}`,
     },
     bing: {
@@ -69,7 +48,7 @@ export class MultiEngineFetcher {
     duckduckgo: {
       name: 'duckduckgo',
       base: 'https://html.duckduckgo.com',
-      // The HTML endpoint has a simple, stable DOM and lighter anti-bot than the JS app.
+      // The HTML endpoint has a stable DOM and lighter anti-bot.
       url: (q, p) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}&kl=in-en&s=${p * 30}`,
     },
     brave: {
@@ -165,8 +144,7 @@ export class MultiEngineFetcher {
       const bodyText = await pg.evaluate(() => document.body?.innerText?.slice(0, 4000) || '').catch(() => '');
       if (this.looksBlocked(url, title, bodyText)) return 'blocked';
 
-      // Generic extraction: every anchor + its container text. We resolve the real
-      // target URL (many engines wrap results in redirect links) in Node below.
+      // Every anchor with its container text; redirect wrappers are resolved below.
       const anchors: { href: string; text: string; snippet: string }[] = await pg
         .evaluate(() => {
           const out: { href: string; text: string; snippet: string }[] = [];

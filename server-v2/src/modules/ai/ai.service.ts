@@ -8,8 +8,7 @@ export interface LeadContext {
   title?: string;
   company?: string;
   location?: string;
-  /** Extra facts scraped from the prospect's profile (Apify) — free-form text
-   *  the model can reference for a genuinely personalized note. */
+  /** Extra facts scraped from the prospect's profile (Apify). */
   profileContext?: string;
 }
 
@@ -45,14 +44,9 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MAX_CHARS = 280; // safely under LinkedIn's ~300-char note limit
 
 /**
- * Personalizes LinkedIn outreach copy with Google Gemini (Flash, free tier).
- *
- * Safety-first by construction:
- *  - never throws to the caller — any failure returns a plain-template note so a
- *    campaign never stalls on the AI;
- *  - hard length cap + unresolved-{{token}} strip so we never send a broken or
- *    over-long note to LinkedIn;
- *  - degrades to templates when GEMINI_API_KEY is unset.
+ * Personalises LinkedIn copy with Gemini. Never throws: on any failure, or with
+ * no GEMINI_API_KEY, it returns a template note. Strips unresolved {{tokens}}
+ * and enforces the length cap.
  */
 @Injectable()
 export class AiService {
@@ -118,23 +112,16 @@ export class AiService {
       .join('\n');
   }
 
-  /** Single generateContent call against the Gemini REST API. */
   /**
-   * Clean structured lead fields out of raw search-engine results. Google SERP
-   * snippets are messy ("Finance Manager · 19 years · Nov 2024 - Present …"), so
-   * a regex parse mislabels company/title. One batched Gemini call (JSON mode)
-   * reads name / title / company / location far more reliably. Returns null on
-   * any failure or when Gemini isn't configured — the caller then falls back to
-   * its own regex parse, so this can only improve results, never break them.
+   * Extract clean lead fields from raw SERP results with batched Gemini JSON calls.
+   * Returns null on failure or without a key; the caller keeps its regex parse.
    */
   async extractProfiles(
     raw: { title: string; snippet: string; url: string }[],
   ): Promise<ExtractedProfile[] | null> {
     if (!getEnv().GEMINI_API_KEY || !raw.length) return null;
 
-    // Chunked: a single call with ~100 results overruns the token budget and
-    // returns NOTHING (whole batch silently falls back to regex — seen at scale).
-    // Small batches, a few in parallel, keep extraction clean at volume.
+    // Chunked: ~100 results in one call overruns the token budget and returns nothing.
     const CHUNK = 20;
     const CONCURRENCY = 3;
     const chunks: { title: string; snippet: string; url: string }[][] = [];
@@ -235,6 +222,7 @@ export class AiService {
     }
   }
 
+  /** One generateContent call to the Gemini REST API. */
   private async callGemini(prompt: string): Promise<string> {
     const env = getEnv();
     const url = `${GEMINI_BASE}/${encodeURIComponent(env.GEMINI_MODEL)}:generateContent?key=${env.GEMINI_API_KEY}`;
@@ -248,9 +236,7 @@ export class AiService {
         signal: controller.signal,
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          // maxOutputTokens must cover Gemini 2.5/3 "thinking" tokens PLUS the note,
-          // or the answer returns empty/truncated (thinking eats the whole budget).
-          // 1024 leaves ample room for a <280-char note after thinking.
+          // Must cover Gemini's "thinking" tokens plus the note, or the answer comes back empty.
           generationConfig: { temperature: 0.9, topP: 0.95, maxOutputTokens: 1024 },
         }),
       });
@@ -276,10 +262,10 @@ export class AiService {
     }
     // Never ship an unresolved template token (e.g. "{{firstName}}").
     if (/\{\{.*?\}\}/.test(t)) t = t.replace(/\{\{.*?\}\}/g, '').replace(/\s{2,}/g, ' ').trim();
-    // Collapse whitespace/newlines to keep it a tidy one-liner-ish note.
+    // Collapse newlines and whitespace.
     t = t.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
     if (t.length > maxChars) {
-      // Trim to the last sentence/word boundary under the cap rather than mid-word.
+      // Cut at the last sentence or word boundary under the cap.
       const cut = t.slice(0, maxChars);
       const lastStop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
       t = (lastStop > maxChars * 0.5 ? cut.slice(0, lastStop + 1) : cut.replace(/\s+\S*$/, '')).trim();

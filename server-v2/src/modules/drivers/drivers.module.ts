@@ -11,11 +11,7 @@ import { getEnv } from '@/config/env';
 import { VaultModule } from '@/modules/vault/vault.module';
 import { IntegrationsModule } from '@/modules/integrations/integrations.module';
 
-/**
- * Provides the automation drivers. The concrete LinkedIn/email drivers are
- * chosen at runtime by env (LINKEDIN_DRIVER / EMAIL_DRIVER), so the worker and
- * services depend only on the tokens, never a class.
- */
+/** Provides the drivers behind DI tokens; LINKEDIN_DRIVER / EMAIL_DRIVER pick the class. */
 @Module({
   imports: [VaultModule, IntegrationsModule],
   providers: [
@@ -28,8 +24,7 @@ import { IntegrationsModule } from '@/modules/integrations/integrations.module';
     EmailWarmupService,
     {
       provide: LINKEDIN_DRIVER,
-      // 'remote' = dispatch to the user's desktop agent (runs on THEIR IP);
-      // 'playwright' = run the browser here; else the safe simulator.
+      // 'remote' = the user's desktop agent; 'playwright' = a browser here; else the simulator.
       useFactory: (sim: SimulatorDriver, pw: PlaywrightLinkedInDriver, remote: RemoteAgentDriver) => {
         const d = getEnv().LINKEDIN_DRIVER;
         return d === 'remote' ? remote : d === 'playwright' ? pw : sim;

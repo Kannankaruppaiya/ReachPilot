@@ -30,10 +30,7 @@ function getRedis(): Redis {
   return redisClient;
 }
 
-/**
- * Redis-backed sliding window rate limiter.
- * Applies to routes decorated with @RateLimit({ max, windowMs }).
- */
+/** Redis sliding-window rate limit for routes with @RateLimit({ max, windowMs }). */
 @Injectable()
 export class RateLimiterGuard implements CanActivate {
   constructor(private reflector: Reflector) {}

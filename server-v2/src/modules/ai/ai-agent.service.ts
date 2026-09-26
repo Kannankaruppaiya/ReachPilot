@@ -7,9 +7,7 @@ import { getEnv } from '@/config/env';
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// Lazy singleton producer for the lead-scrape queue (same pattern as
-// jobs.service / scraping.controller) — lets the scrape_leads tool enqueue a
-// worker job without the agent taking a queue dependency in its constructor.
+// Lazy producer for the lead-scrape queue, used by the scrape_leads tool.
 let scrapeRedis: Redis | null = null;
 let scrapeQueue: Queue | null = null;
 function getScrapeQueue(): Queue {
@@ -29,9 +27,7 @@ function safeJson(s: string): any {
   }
 }
 
-/** One callable tool the agent can invoke. `parameters` is a JSON Schema object.
- *  Local tools read ReachPilot data; Apify MCP tools (Phase 3) implement the
- *  same shape, so the agent loop never needs to know where a tool came from. */
+/** A tool the agent can call. `parameters` is a JSON Schema object. */
 export interface AgentTool {
   name: string;
   description: string;
@@ -50,8 +46,7 @@ export interface ChatMessage {
   content: string;
 }
 
-/** A tool call + its result, persisted with the assistant turn and re-rendered
- *  as a collapsible card in the UI. */
+/** A tool call and its result, saved with the assistant turn. */
 export interface ToolTrace {
   name: string;
   args?: unknown;
@@ -78,13 +73,8 @@ const SYSTEM_PREAMBLE = [
 ].join(' ');
 
 /**
- * Agentic chat over Google Gemini with function-calling. Runs the tool loop:
- * user turn → model (may emit functionCalls) → execute tools → feed results back
- * → repeat until the model returns a final text answer. Events are pushed to the
- * caller as they happen so the UI can show tool calls live (Claude-style).
- *
- * The tool set is injectable: today it's local ReachPilot lookups; Phase 3 adds
- * Apify MCP tools to the same list with zero loop changes.
+ * Agentic chat over Gemini function calling: model → tool calls → results →
+ * repeat until a final answer. Events stream to the caller as they happen.
  */
 @Injectable()
 export class AiAgentService {
@@ -94,7 +84,7 @@ export class AiAgentService {
     return !!getEnv().GEMINI_API_KEY;
   }
 
-  /** The built-in ReachPilot tools. Apify MCP tools get appended in Phase 3. */
+  /** The built-in ReachPilot tools. */
   localTools(): AgentTool[] {
     return [
       {
@@ -301,9 +291,8 @@ export class AiAgentService {
   }
 
   /**
-   * Run the agent for one user turn. `history` is the prior conversation; `tools`
-   * defaults to the local set. `emit` is called for every event. Returns when the
-   * model produces a final answer (or the tool-call budget is exhausted).
+   * Run the agent for one user turn, emitting every event. Returns on a final
+   * answer or when the tool-call budget runs out.
    */
   async run(
     history: ChatMessage[],
@@ -345,9 +334,7 @@ export class AiAgentService {
           return;
         }
 
-        // Echo the model's function-call turn back VERBATIM — the original parts
-        // carry a `thoughtSignature` (Gemini 3+) that must be preserved, or the
-        // next call is rejected. Reconstructing `{functionCall}` drops it.
+        // Echo the function-call turn verbatim: its `thoughtSignature` must be kept.
         contents.push({ role: 'model', parts: callParts });
         const responseParts: any[] = [];
         for (const call of calls) {
@@ -365,9 +352,7 @@ export class AiAgentService {
           emit({ type: 'tool_result', name: call.name, ok, result });
           responseParts.push({ functionResponse: { name: call.name, response: this.wrap(result) } });
         }
-        // Function responses go in a USER turn. (Older Gemini docs show role
-        // "function", but the current models reject it — valid roles are
-        // USER/MODEL/etc. — so the functionResponse parts ride a user turn.)
+        // Function responses go in a user turn; current models reject role "function".
         contents.push({ role: 'user', parts: responseParts });
       }
       // Budget exhausted — ask for a plain summary with tools disabled.

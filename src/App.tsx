@@ -97,18 +97,15 @@ export default function App() {
       })
   }, [])
 
-  // Returning from the Google OAuth redirect (`/?gmail=connected|error`) — land
-  // the user on the Integrations page, where the connection lives and where
-  // Integrations shows the result toast. Runs once on mount, before Integrations
-  // reads + clears the query param.
+  // Back from Google OAuth (`/?gmail=connected|error`): open Integrations, which
+  // shows the result toast and clears the param.
   useEffect(() => {
     if (new URLSearchParams(window.location.search).has("gmail")) {
       setView("integrations")
     }
   }, [])
 
-  // Once in the app, load the real account/warm-up state + unread notifications,
-  // and refresh them periodically so the shell reflects live data.
+  // In the app: load account/warm-up state and notifications, then refresh periodically.
   useEffect(() => {
     if (phase !== "app") return
     let alive = true
@@ -133,7 +130,7 @@ export default function App() {
     setPhase("auth")
   }
 
-  // Real LinkedIn status pill for the header — reflects the actual account state.
+  // Header status pill from the real account state.
   const accountBadge = (): { text: string; cls: string } | null => {
     if (!account) return null
     if (!account.connected) return { text: "LinkedIn not connected", cls: "border-line bg-mutedbg text-sub" }

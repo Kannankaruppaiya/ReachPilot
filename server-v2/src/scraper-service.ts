@@ -1,19 +1,9 @@
 /**
- * Standalone lead-scraper microservice.
- *
- * Runs ONLY the free Google → LinkedIn scraper as a tiny HTTP service, so the
- * browser work can live on a cheap Linux VPS (headful Chrome under Xvfb) instead
- * of an always-on PC. It holds NO database / Redis / vault — it takes a scrape
- * request, drives the stealth (patchright) browser, and returns clean leads as
- * JSON. The main worker calls this over HTTP (when SCRAPER_SERVICE_URL is set)
- * and imports the results through the normal LeadsService dedup path.
- *
- * Safe to move off the PC: this path reads Google only — it never touches a
- * LinkedIn account session, so running it from a datacenter IP can't ban an
- * outreach account (unlike the LinkedIn driver, which must keep its home IP).
- *
- * Auth: a shared bearer token (SCRAPER_SERVICE_TOKEN). Keep the port behind the
- * VPS firewall or a tunnel; never expose it unauthenticated to the internet.
+ * Standalone lead-scraper service: runs only the Google → LinkedIn scraper over
+ * HTTP so it can live on a VPS (headful Chrome under Xvfb). No DB or Redis; the
+ * worker calls it when SCRAPER_SERVICE_URL is set. It never touches a LinkedIn
+ * session. Auth is a shared bearer token (SCRAPER_SERVICE_TOKEN); keep the port
+ * firewalled.
  */
 import * as http from 'http';
 import { Logger } from '@nestjs/common';
@@ -26,8 +16,7 @@ const env = getEnv();
 const PORT = env.SCRAPER_SERVICE_PORT;
 const TOKEN = env.SCRAPER_SERVICE_TOKEN;
 
-// LeadScraperService's only dependency is AiService, which itself has no injected
-// deps — so we can wire them by hand without booting the whole Nest app.
+// Its only dependency (AiService) has none, so wire by hand without Nest.
 const scraper = new LeadScraperService(new AiService());
 
 /** Read + JSON-parse a request body, capped so a huge payload can't OOM us. */
@@ -79,8 +68,7 @@ const server = http.createServer(async (req, res) => {
       titles,
       location: body.location ? String(body.location).trim() : undefined,
       maxResults: Math.min(Math.max(Number(body.maxResults) || 15, 1), 100),
-      // Cursor window passed by the worker (the VPS stays stateless — the cursor
-      // lives on the worker's Redis).
+      // The cursor lives on the worker; this service stays stateless.
       startPage: Number.isFinite(Number(body.startPage)) ? Math.max(Number(body.startPage), 0) : undefined,
       pages: Number.isFinite(Number(body.pages)) ? Math.min(Math.max(Number(body.pages), 1), 10) : undefined,
     };

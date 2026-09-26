@@ -30,10 +30,7 @@ export class IntegrationsController {
     return { url };
   }
 
-  /**
-   * Google's OAuth redirect target. Public — the browser arrives here from
-   * Google with no app JWT; the workspace is carried in the signed `state`.
-   */
+  /** Google's OAuth redirect. Public: the workspace comes from the signed `state`. */
   @Public()
   @Get('google/callback')
   async callback(
@@ -54,7 +51,6 @@ export class IntegrationsController {
     }
   }
 
-  /** Disconnect Gmail. */
   @Post('google/disconnect')
   async disconnect(@Req() req: Request) {
     const user = (req as any).user as JwtPayload;
@@ -70,7 +66,6 @@ export class IntegrationsController {
     return this.integrations.connectApify(workspaceId, body?.token || '', body?.enabledTools);
   }
 
-  /** Disconnect Apify. */
   @Post('apify/disconnect')
   async disconnectApify(@Req() req: Request) {
     const user = (req as any).user as JwtPayload;

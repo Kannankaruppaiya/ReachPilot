@@ -24,11 +24,7 @@ export interface JwtPayload {
   exp?: number;
 }
 
-/**
- * Guard that validates JWT access tokens from the Authorization header.
- * Also supports API key auth via X-API-Key header.
- * Routes decorated with @Public() bypass authentication.
- */
+/** JWT (Authorization header) or API key (X-API-Key) auth; @Public() routes skip it. */
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(private reflector: Reflector) {}
@@ -78,11 +74,8 @@ export class AuthGuard implements CanActivate {
   private async validateApiKey(key: string, request: any): Promise<boolean> {
     const hash = hashApiKey(key);
 
-    // api_keys is RLS-scoped, and a key-authenticated request has no workspace
-    // context yet. A raw getDb() lookup only worked while production connected
-    // as a BYPASSRLS role. Current keys name their workspace (api-key-token.ts);
-    // keys minted before that are found by probing each workspace — the same
-    // approach login uses for memberships.
+    // api_keys is RLS-scoped and this request has no workspace yet. Current keys
+    // embed theirs (api-key-token.ts); legacy keys are found by probing workspaces.
     const findIn = (workspaceId: string) =>
       withWorkspace(workspaceId, async (db) => {
         const found = await db

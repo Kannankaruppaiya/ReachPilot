@@ -19,12 +19,7 @@ export interface StoredMessage {
 /** Longest a conversation title derived from the first message may be. */
 const TITLE_MAX = 60;
 
-/**
- * Persistence for the AI Assistant's chat history. Conversations + their
- * messages are workspace-scoped (RLS-enforced via {@link withWorkspace}); the
- * agent generation itself stays stateless — this just records what was said so
- * it survives refresh and follows the user across devices.
- */
+/** Persists the Assistant's conversations (workspace-scoped); the agent itself is stateless. */
 @Injectable()
 export class AiChatStoreService {
   /** Conversations for the workspace, most-recently-updated first. */

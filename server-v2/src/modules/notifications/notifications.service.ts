@@ -13,9 +13,7 @@ export interface SseEvent {
 export class NotificationsService {
   private readonly eventBus$ = new Subject<SseEvent>();
 
-  /**
-   * Subscribes to SSE stream for a specific workspace.
-   */
+  /** SSE stream for one workspace. */
   getEventStream(workspaceId: string): Observable<{ data: string }> {
     return this.eventBus$.asObservable().pipe(
       filter((event) => event.workspaceId === workspaceId),
@@ -28,9 +26,7 @@ export class NotificationsService {
     );
   }
 
-  /**
-   * Emit a real-time event to the event stream, optionally storing it in notifications table.
-   */
+  /** Emit a real-time event, optionally also storing it as a notification. */
   async emitEvent(
     workspaceId: string,
     type: string,
@@ -38,7 +34,6 @@ export class NotificationsService {
     storeInDb = false,
     text?: string,
   ): Promise<void> {
-    // notifications is RLS-scoped — every access runs under the workspace context.
     if (storeInDb && text) {
       await withWorkspace(workspaceId, (db) =>
         db
@@ -53,7 +48,6 @@ export class NotificationsService {
       );
     }
 
-    // Push to active SSE clients
     this.eventBus$.next({
       workspaceId,
       type,
